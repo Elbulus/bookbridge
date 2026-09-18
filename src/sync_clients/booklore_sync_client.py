@@ -1,3 +1,4 @@
+import inspect
 import os
 from typing import Optional
 import logging
@@ -308,25 +309,70 @@ class BookloreSyncClient(SyncClient):
         book_id = self._mapped_book_id(book) or self._resolve_legacy_book_id(book, epub)
         if book_id is None and callable(getattr(self.booklore_client, "find_book_by_filename_exact", None)):
             return SyncResult(None, False)
+        # Grimmory stores EPUB progress rounded to one decimal, so the position it
+        # reports back is never exactly what we sent. Persisting the sent value
+        # leaves a standing delta (24.5598% written, 24.6000% read) that the next
+        # cycle reads as a fresh change on Grimmory's side — which either re-writes
+        # the same position forever, or, once the own-write marker has expired or
+        # been lost to a restart, promotes that rounding artefact to leader and
+        # drags the audiobook position backwards. Persist what the service holds.
+        observed: dict = {}
         if book_id and hasattr(self.booklore_client, "update_progress_by_book_id"):
-            outcome = self.booklore_client.update_progress_by_book_id(book_id, pct, locator)
+            outcome = self._write_progress(
+                self.booklore_client.update_progress_by_book_id, book_id, pct, locator, observed
+            )
         else:
-            outcome = self.booklore_client.update_progress(epub, pct, locator)
+            outcome = self._write_progress(
+                self.booklore_client.update_progress, epub, pct, locator, observed
+            )
         if outcome is ProgressWriteOutcome.SKIPPED:
             current = request.current_state.current if request.current_state else {"pct": pct}
             return SyncResult(current.get("pct"), True, dict(current), skipped=True)
         success = bool(outcome)
+        stored_pct = self._reported_pct(observed, pct)
         if success:
             try:
                 from src.services.write_tracker import record_write
-                record_write('BookLore', book.abs_id, pct)
+                record_write('BookLore', book.abs_id, stored_pct)
             except ImportError:
                 pass
         updated_state = {
-            'pct': pct
+            'pct': stored_pct
         }
         if self._is_cbz_book(book) and locator and locator.page is not None:
             updated_state['page'] = locator.page
         elif locator and locator.cfi:
             updated_state['cfi'] = locator.cfi
-        return SyncResult(pct, success, updated_state)
+        return SyncResult(stored_pct, success, updated_state)
+
+    @staticmethod
+    def _write_progress(writer, target, pct, locator, observed: dict):
+        """Call a Grimmory write, asking for the post-write position when supported.
+
+        Support is decided from the signature rather than by catching TypeError:
+        a TypeError raised *inside* the write would otherwise be retried, turning
+        one failed write into two. Only a writer that names the parameter is given
+        it — a bare (*args, **kwargs) writer (a spec'd mock, a thin wrapper) would
+        accept the keyword but never fill the dict in, so there is nothing to gain.
+        Either way the caller falls back to the requested percentage."""
+        try:
+            accepts_observed = 'observed' in inspect.signature(writer).parameters
+        except (TypeError, ValueError):
+            # Unintrospectable callables (some builtins/C functions): the real
+            # clients are both introspectable and declare `observed`.
+            accepts_observed = False
+        if accepts_observed:
+            return writer(target, pct, locator, observed=observed)
+        return writer(target, pct, locator)
+
+    @staticmethod
+    def _reported_pct(observed: dict, requested):
+        """The percentage Grimmory reports after the write, else what we requested.
+
+        The write path already refuses any readback further than 0.5% from the
+        target, so a reported value is always the same position at the service's
+        own precision — never a different one."""
+        reported = observed.get('pct') if isinstance(observed, dict) else None
+        if isinstance(reported, bool) or not isinstance(reported, (int, float)):
+            return requested
+        return float(reported)
