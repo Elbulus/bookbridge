@@ -582,6 +582,7 @@ Found under **Settings -> Sync**, alongside instant-sync options and Alignment H
 | Min Ebook Change (Words) | `SYNC_DELTA_KOSYNC_WORDS` | `400` | Extra guardrail for ebook movement. |
 | Client Diff Threshold (%) | `SYNC_DELTA_BETWEEN_CLIENTS_PERCENT` | `0.5` | Minimum gap between clients before propagation begins. |
 | Fuzzy Match Threshold | `FUZZY_MATCH_THRESHOLD` | `80` | Matching threshold used by several book and text lookups. |
+| Ebook Source Priority | `EBOOK_SOURCE_PRIORITY` | _(blank)_ | Comma-separated ebook sources, highest priority first (e.g. `BookOrbit, Grimmory`). When two libraries index the same file, the first one listed owns the match and the rest are skipped for that file. Sources you omit keep their usual order behind the ones you list. Blank keeps the default: Grimmory, BookOrbit, BookFusion, Kavita, ABS, CWA, Local File. |
 | Job Max Retries | `JOB_MAX_RETRIES` | `5` | Retry count for failed background jobs. |
 | Job Retry Delay (Minutes) | `JOB_RETRY_DELAY_MINS` | `15` | Delay before retrying failed jobs. |
 | Reading Session Merge Gap (Minutes) | `READING_SESSION_MERGE_MINUTES` | `5` | Groups non-KOReader progress into one session. The effective idle gap is at least twice the sync period and at most 30 minutes. |
