@@ -119,6 +119,12 @@ MATERIAL_ROLLBACK_SECONDS: float = 30.0
 # falling back to `pct * total_len`. `_normalize_for_cross_format_comparison`
 # records the source per client; leader selection and the deadband already refuse
 # to act on a `_normalized_ts` derived from the percentage fallback.
+# How far behind the last agreed audio position a text client's resolved
+# position must sit before it counts as a backward move. The text->audio
+# conversion loses a few seconds each way (5-7s observed on a live book), so a
+# tighter bound would call a reader who has not moved a rewinder.
+_NORMALIZED_BACKWARD_TOLERANCE_SECONDS: float = 30.0
+
 _HIGH_CONFIDENCE_NORMALIZATION_SOURCES: frozenset[str] = frozenset({
     "xpath",
     "cfi",
@@ -570,6 +576,54 @@ class SyncManager:
         except (TypeError, ValueError):
             return 300.0
 
+    @staticmethod
+    def _backward_move(config: dict, client_name: str, leader_pct,
+                       primary_audio_client: str | None = None):
+        """Whether `client_name`'s report is a backward move, and how it was judged.
+
+        Returns `(backward, description)`, or None when there is nothing to judge.
+
+        The obvious test, the client's percentage against its previous one, is
+        only as fine as the percentage. A Kobo reports whole numbers: 45% and 45%
+        can be eight minutes of audio apart, and a reader who turns into the next
+        chapter can report 44% -> 43% while moving FORWARD, because the device's
+        figure snaps to the chapter start. Both were observed live: the first
+        slipped a stale bookmark straight through to Audiobookshelf, the second
+        held a genuine forward read for the full hold window.
+
+        So when the client's position resolved through a real locator, judge it
+        where leader selection already does, on the audio timeline, against the
+        primary audio client — which, on the paths that reach this, has not moved
+        since the bridge last wrote it and so holds the last agreed position.
+        Anything without that (an audio leader, a low-confidence resolution, a
+        book with no transcript, an unstarted audiobook) keeps the percentage test.
+        """
+        state = config.get(client_name) if config else None
+        if state is None:
+            return None
+        current = getattr(state, "current", None)
+        current = current if isinstance(current, dict) else {}
+
+        audio_state = config.get(primary_audio_client) if primary_audio_client else None
+        audio_current = getattr(audio_state, "current", None) if audio_state is not None else None
+        audio_ts = audio_current.get("ts") if isinstance(audio_current, dict) else None
+        leader_ts = current.get("_normalized_ts")
+        if (
+            client_name != primary_audio_client
+            and current.get("_normalization_source") in _HIGH_CONFIDENCE_NORMALIZATION_SOURCES
+            and isinstance(leader_ts, (int, float)) and not isinstance(leader_ts, bool)
+            and isinstance(audio_ts, (int, float)) and not isinstance(audio_ts, bool)
+        ):
+            backward = float(leader_ts) < float(audio_ts) - _NORMALIZED_BACKWARD_TOLERANCE_SECONDS
+            return backward, (
+                f"{float(audio_ts):.1f}s -> {float(leader_ts):.1f}s on the audio timeline"
+            )
+
+        previous_pct = getattr(state, "previous_pct", None)
+        if previous_pct is None or leader_pct is None:
+            return None
+        return leader_pct < previous_pct - 1e-9, f"{previous_pct:.4%} -> {leader_pct:.4%}"
+
     def _should_hold_backward_leader(
         self, abs_id: str, title_snip: str, config: dict, client_name: str,
         leader_pct, echo_clients=None, primary_audio_client: str | None = None,
@@ -604,11 +658,11 @@ class SyncManager:
 
         if not self._trust_corroborated_rewind_enabled():
             return False
-        state = config.get(client_name) if config else None
-        previous_pct = getattr(state, "previous_pct", None)
-        if previous_pct is None or leader_pct is None:
+        verdict = self._backward_move(config, client_name, leader_pct, primary_audio_client)
+        if verdict is None:
             return False
-        if leader_pct >= previous_pct - 1e-9:
+        backward, movement = verdict
+        if not backward:
             return False                      # not a backward move
         if len(config) < 2:
             return False                      # nobody to protect the position from
@@ -630,14 +684,14 @@ class SyncManager:
         if age > window:
             logger.info(
                 f"⌛ '{abs_id}' '{title_snip}' Accepting '{client_name}' backward move "
-                f"{previous_pct:.4%} -> {leader_pct:.4%}: uncorroborated but quiet for "
+                f"{movement}: uncorroborated but quiet for "
                 f"{age:.0f}s (> {window:.0f}s) — treating it as where the reader meant to be"
             )
             return False
 
         logger.info(
             f"⏳ '{abs_id}' '{title_snip}' Holding '{client_name}' backward move "
-            f"{previous_pct:.4%} -> {leader_pct:.4%} for up to {window - age:.0f}s more: "
+            f"{movement} for up to {window - age:.0f}s more: "
             f"{evidence} — not propagating it and not overwriting it until it is "
             f"corroborated or goes quiet"
         )
@@ -4103,13 +4157,32 @@ class SyncManager:
                     name: pct for name, pct in candidates.items() if name not in echo_clients
                 }
                 if genuine_candidates:
-                    if len(genuine_candidates) != len(candidates):
+                    echo_excluded = len(genuine_candidates) != len(candidates)
+                    if echo_excluded:
                         excluded = sorted(set(candidates) - set(genuine_candidates))
                         logger.info(
                             f"🪞 '{abs_id}' '{title_snip}' Excluding own write-back "
                             f"candidate(s) {excluded} from leader selection"
                         )
                     candidates = genuine_candidates
+                    # Dropping our own write-back can leave one client standing,
+                    # which makes this the single-mover case in all but name — and
+                    # furthest-wins then crowns it without the backward check the
+                    # single-mover branch applies. A stale Kobo bookmark reached
+                    # Audiobookshelf eight minutes behind exactly this way.
+                    if echo_excluded and len(candidates) == 1:
+                        (sole_name, sole_pct), = candidates.items()
+                        try:
+                            if self._should_hold_backward_leader(
+                                abs_id, title_snip, config, sole_name, sole_pct,
+                                echo_clients, primary_audio_client,
+                            ):
+                                return None, None
+                        except Exception as hold_err:
+                            logger.debug(
+                                f"'{abs_id}' Backward-leader hold check failed: {hold_err}",
+                                exc_info=True,
+                            )
                 else:
                     logger.info(
                         f"🪞 '{abs_id}' '{title_snip}' No leader: every candidate holds "
