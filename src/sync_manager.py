@@ -1052,6 +1052,51 @@ class SyncManager:
         window = period_mins * 120.0 + 60.0
         return int(max(600.0, min(window, 3600.0)))
 
+    @staticmethod
+    def _audio_echo_tolerance_seconds() -> float:
+        """How close, in seconds, an audio position must be to BookBridge's own
+        write to count as that write coming back. Read per call so the setting
+        applies without a restart."""
+        try:
+            value = float(os.environ.get("SYNC_AUDIO_ECHO_TOLERANCE_SECONDS", "10") or 10)
+        except (TypeError, ValueError):
+            return 10.0
+        return value if value > 0 else 10.0
+
+    def _audio_echo_margin(self, state, book, fallback: float) -> float:
+        """The own-write echo margin for the primary audio client, as a fraction.
+
+        The shared margin is the cross-client sync threshold, 0.5% of the book.
+        On an audiobook that is minutes, not rounding: 6 min 15 s on a 21-hour
+        title. Audiobookshelf stores the timestamp it is sent, so a genuine echo of
+        our write comes back to the second, and anything wider mistakes real
+        listening for that echo. Observed live: a Kobo sync wrote ABS at the start
+        of a chapter, the reader then listened for five minutes, and every report
+        in that time was discarded as our own write while the Kobo's position led
+        and pulled ABS back to the chapter start, re-arming the marker each cycle.
+        It let go at 0.51%. The echo marker lives only in memory, which is also why
+        restarting BookBridge used to "fix" a stuck sync.
+
+        Scaled by the audio client's own ts/pct, so it is in exactly the units the
+        marker was recorded in; the book's duration is the fallback. Never wider
+        than `fallback`, so this can only narrow what counts as an echo.
+        """
+        seconds = self._audio_echo_tolerance_seconds()
+        current = getattr(state, "current", None)
+        current = current if isinstance(current, dict) else {}
+        ts, pct = current.get("ts"), current.get("pct")
+        duration = None
+        if (isinstance(ts, (int, float)) and not isinstance(ts, bool)
+                and isinstance(pct, (int, float)) and not isinstance(pct, bool) and pct > 0):
+            duration = float(ts) / float(pct)
+        if not duration or duration <= 0:
+            book_duration = getattr(book, "duration", None) or getattr(book, "audio_duration", None)
+            if isinstance(book_duration, (int, float)) and not isinstance(book_duration, bool):
+                duration = float(book_duration)
+        if not duration or duration <= 0:
+            return fallback
+        return min(fallback, seconds / duration)
+
     def _peer_position_is_own_writeback(
         self, abs_id: str, client_name: str, observed_pct: float, margin: float,
         observed_marker: object = None, title_snip: str = "",
@@ -3946,10 +3991,14 @@ class SyncManager:
             # of how close the two percentages land.
             echo_margin = getattr(self, "sync_delta_between_clients", 0.005)
             for client_name, observed_pct in vals.items():
-                client_echo_margin = (
-                    1e-9 if self._has_fixed_page_delta(client_name, config[client_name], book)
-                    else echo_margin
-                )
+                if self._has_fixed_page_delta(client_name, config[client_name], book):
+                    client_echo_margin = 1e-9
+                elif client_name == primary_audio_client:
+                    client_echo_margin = self._audio_echo_margin(
+                        config[client_name], book, echo_margin
+                    )
+                else:
+                    client_echo_margin = echo_margin
                 if self._peer_position_is_own_writeback(
                     abs_id, client_name, observed_pct, client_echo_margin,
                     observed_marker=config[client_name].current.get('_position_marker'),
