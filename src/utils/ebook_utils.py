@@ -39,6 +39,28 @@ logger = logging.getLogger(__name__)
 # Import epubcfi library for accurate CFI parsing
 import epubcfi
 
+# Names the bridge writes into the epub cache when it acquires an ebook for an
+# ABS item: ``<item_id>_direct.<ext>``, ``<item_id>_cwa.<ext>`` and
+# ``<item_id>_abs_search.<ext>`` (see LibraryService.acquire_ebook).
+_GENERATED_CACHE_FILENAME_RE = re.compile(r"^.+_(?:direct|cwa|abs_search)\.[A-Za-z0-9]+$")
+
+
+def is_managed_cache_filename(filename: str) -> bool:
+    """True when ``filename`` is one the bridge generates into the epub cache.
+
+    Covers provider downloads (``bookfusion_*``, ``storyteller_*``) and the
+    ABS-item acquisition names. Such a file lives in the cache, not the library,
+    so ``EbookParser.resolve_book_path`` checks the cache before walking the
+    library for it.
+    """
+    name = str(filename or "")
+    return (
+        name.startswith("bookfusion_")
+        or name.startswith("storyteller_")
+        or bool(_GENERATED_CACHE_FILENAME_RE.match(name))
+    )
+
+
 class LRUCache:
     def __init__(self, capacity: int = 3):
         self.cache = OrderedDict()
@@ -179,10 +201,12 @@ class EbookParser:
                 self._path_cache.pop(filename, None)
 
         # 2. Managed cache files bypass recursive library scans. These are
-        #    provider-downloaded EPUBs (BookFusion, Storyteller) that live in
-        #    the cache directory, not in the library. Checking here avoids a
-        #    6-7s rglob against a 40 MB library tree for every hydration.
-        if filename.startswith("bookfusion_") or filename.startswith("storyteller_"):
+        #    provider-downloaded EPUBs (BookFusion, Storyteller) and the ebooks
+        #    acquired for ABS items (<item_id>_direct/_cwa/_abs_search), all of
+        #    which live in the cache directory, not in the library. A miss on
+        #    the library costs two full walks — over a minute on a network
+        #    share, past the device-sync download stall timeout (#454).
+        if is_managed_cache_filename(filename):
             if self.epub_cache_dir.exists():
                 cached_path = safe_cache_path(self.epub_cache_dir, filename)
                 if cached_path and cached_path.exists():

@@ -32,6 +32,13 @@ All notable changes to BookBridge will be documented in this file.
 
 ### Fixed
 
+- **BridgeSync book downloads no longer time out on network-mounted libraries
+  (#454).** Books whose ebook the bridge fetched from Audiobookshelf were looked
+  for across the whole library twice before the bridge checked its own copy. On
+  an SMB/CIFS or NFS share that took longer than KOReader waits for a download
+  to start, so the downloads failed with `Request interrupted: wantread`. They
+  now start at once.
+
 - **Positions no longer jump back to near the start of some books.** In EPUBs
   that put quotation marks in their own formatting, a position read from
   KOReader, BookOrbit, Grimmory or the ABS reader could be matched to an
