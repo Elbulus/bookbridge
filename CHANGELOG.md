@@ -25,6 +25,9 @@ All notable changes to BookBridge will be documented in this file.
 
 ### Changed
 
+- **Collapsed series cards keep their per-service progress visible.** The lead
+  book's progress grid stays on the card while its series is closed.
+
 - **Library cards pack together instead of lining up in rows.** Each card keeps its
   own height and the next one sits directly under it, so short cards no longer stretch
   to match a tall neighbour and no gaps open up below them. Opening a series, or a

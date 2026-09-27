@@ -498,11 +498,8 @@ class TestSingleCardSeriesTemplate(unittest.TestCase):
         self.assertIn("grid.classList.add('masonry')", script)
         self.assertIn(".observe(grid, { childList: true })", script)
 
-    def test_collapsed_lead_card_hides_its_per_service_grid(self):
-        self.assertIn(
-            ".series-group:not(.expanded) .has-series-strip .service-progress { display: none; }",
-            self.source,
-        )
+    def test_collapsed_lead_card_keeps_its_per_service_grid(self):
+        self.assertNotIn(".has-series-strip .service-progress", self.source)
 
     def test_new_branch_is_gated_by_the_setting_and_a_lead_book(self):
         macro_start = self.source.index("{% macro render_series_card(group, integrations) %}")
