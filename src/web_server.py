@@ -2901,7 +2901,7 @@ def get_searchable_audiobooks(search_term):
     try:
         clients = uc()
         if clients.abs_client and clients.abs_client.is_configured():
-            adapters["ABS"] = ABSAudioSourceAdapter(clients.abs_client)
+            adapters["ABS"] = ABSAudioSourceAdapter(clients.abs_client, container.data_dir())
         if clients.booklore_client and clients.booklore_client.is_configured():
             adapters["BookLore"] = BookLoreAudioSourceAdapter(clients.booklore_client, container.data_dir())
         _bo_client = getattr(clients, "bookorbit_client", None)

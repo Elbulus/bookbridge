@@ -413,7 +413,7 @@ class ABSClient:
         """Download file from stream_url to output_path."""
         self._update_session_headers()
         try:
-            logger.info(f"⬇️ ABS: Downloading file from {stream_url}...")
+            logger.info(f"⬇️ ABS: Downloading file from {stream_url.split('?', 1)[0]}...")
             # identity encoding keeps Content-Length comparable with the bytes written.
             headers = {"Accept-Encoding": "identity"}
             with self.session.get(stream_url, headers=headers, stream=True, timeout=120) as r:
@@ -434,7 +434,10 @@ class ABSClient:
                     )
                     return False
         except Exception as e:
-            logger.error(f"❌ ABS Download failed: {e}", exc_info=True)
+            error = str(e).replace(stream_url, stream_url.split("?", 1)[0])
+            if self.token:
+                error = error.replace(self.token, "[redacted]")
+            logger.error("❌ ABS Download failed: %s", error)
             # A failed transfer must not destroy a previously valid destination; the
             # staged-file publication path only replaces the final file after success.
             return False

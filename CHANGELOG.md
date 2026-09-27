@@ -32,6 +32,12 @@ All notable changes to BookBridge will be documented in this file.
 
 ### Fixed
 
+- **CTC alignment can use Audiobookshelf audio (#455).** When forced alignment is
+  enabled, BookBridge now caches ABS tracks locally so CTC can read them. A failed
+  track download still leaves the stream available for transcription, and download
+  logs no longer expose the stream token. The 7.8.0 `:latest` image does not ship
+  QuartzNet; that backend requires a newer `:dev` image or release.
+
 - **BridgeSync book downloads no longer time out on network-mounted libraries
   (#454).** Books whose ebook the bridge fetched from Audiobookshelf were looked
   for across the whole library twice before the bridge checked its own copy. On
