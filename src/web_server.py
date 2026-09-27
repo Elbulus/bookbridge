@@ -2940,13 +2940,27 @@ def get_searchable_audiobooks(search_term):
     return results
 
 
+def _punctuation_search_key(value):
+    """Compare title text without punctuation or whitespace."""
+    return ''.join(char.lower() for char in (value or '') if char.isalnum())
+
+
+def _punctuation_search_fragment(term):
+    """Return a short phrase shared by punctuated and plain long titles."""
+    if ' - ' in (term or ''):
+        return ''
+    words = re.findall(r'[^\W\d_]+', term or '')
+    if words and words[0].lower() in ('the', 'a', 'an'):
+        words = words[1:]
+    return ' '.join(words[:2]) if len(words) >= 4 else ''
+
+
 def _audiobook_search_variants(term):
     """Progressive query relaxations for a (possibly filename-derived) term.
 
-    Yields the raw term, then with the file extension and trailing edition/year
-    markers removed, then just the title before " - <author>". ABS title search
-    is strict, so reviewing a suggestion whose title is a filename stem
-    ("Title - Author (2026)") needs the bare title to match.
+    Yields the raw term, then removes filename suffixes and punctuation.
+    Long titles also get a short phrase so strict provider searches can find
+    editions that differ by punctuation within the title.
     """
     term = (term or "").strip()
     variants = []
@@ -2990,18 +3004,31 @@ def _audiobook_search_variants(term):
         _add_hyphen_space_variants(title_part)
     else:
         _add_hyphen_space_variants(no_edition)
+    search_title = no_edition.split(' - ')[0]
+    _add(' '.join(re.findall(r'\w+', search_title)))
+    if ' - ' not in no_edition:
+        _add(_punctuation_search_fragment(search_title))
     return variants
 
 
 def _search_audiobooks_with_fallback(term):
-    """Search audiobooks, relaxing a filename-style term until something matches."""
+    """Merge audiobook hits across title spellings and source catalogs."""
     results = []
+    seen = set()
+    fragment = _punctuation_search_fragment(term)
+    query_key = _punctuation_search_key(term)
     for index, variant in enumerate(_audiobook_search_variants(term)):
-        results = get_searchable_audiobooks(variant)
-        if results:
-            if index > 0:
-                logger.debug("Audiobook search matched on relaxed term %r (from %r)", variant, term)
-            break
+        for result in get_searchable_audiobooks(variant):
+            if (fragment and variant == fragment and variant != term
+                    and query_key not in _punctuation_search_key(result.title)):
+                continue
+            key = (result.source, result.source_id)
+            if key not in seen:
+                seen.add(key)
+                results.append(result)
+                if index > 0:
+                    logger.debug("Audiobook search matched on relaxed term %r (from %r)", variant, term)
+    results.sort(key=lambda item: (item.title or item.display_name or '').lower())
     return results
 
 
@@ -3021,8 +3048,14 @@ def _search_ebooks_with_fallback(term):
     """
     by_name = {}
     order = []
+    fragment = _punctuation_search_fragment(term)
+    query_key = _punctuation_search_key(term)
     for variant in _audiobook_search_variants(term):
         for ebook in get_searchable_ebooks(variant):
+            if (fragment and variant == fragment and variant != term
+                    and query_key not in _punctuation_search_key(
+                        getattr(ebook, 'title', None) or ebook.name)):
+                continue
             key = (getattr(ebook, "name", "") or "").lower()
             if not key:
                 continue

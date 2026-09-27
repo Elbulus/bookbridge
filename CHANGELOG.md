@@ -35,6 +35,12 @@ All notable changes to BookBridge will be documented in this file.
 
 ### Fixed
 
+- **Add Book finds editions whose titles differ only in punctuation.** A quoted
+  ebook title and its unquoted audiobook title now appear together when you
+  search for either spelling. Long-title searches use a short shared phrase
+  and check the full title before showing matches, so other volumes stay out
+  of a specific volume's results.
+
 - **CTC alignment can use Audiobookshelf audio (#455).** When forced alignment is
   enabled, BookBridge now caches ABS tracks locally so CTC can read them. A failed
   track download still leaves the stream available for transcription, and download
