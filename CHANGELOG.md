@@ -35,6 +35,10 @@ All notable changes to BookBridge will be documented in this file.
 
 ### Fixed
 
+- **Add Book ebook cards show the full title.** Long titles now wrap instead of
+  hiding their ending, so volumes with the same opening words can be told apart
+  on a phone.
+
 - **Add Book finds editions whose titles differ only in punctuation.** A quoted
   ebook title and its unquoted audiobook title now appear together when you
   search for either spelling. Long-title searches use a short shared phrase
