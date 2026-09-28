@@ -35,6 +35,11 @@ All notable changes to BookBridge will be documented in this file.
 
 ### Fixed
 
+- **Built-in KoSync works with an empty server URL (#456).** When KoSync is
+  enabled, the sync client now connects to the built-in server on port 5757 (or
+  `KOSYNC_PORT` in split-port mode) without requiring a Settings page save or an
+  explicit `KOSYNC_SERVER`. Explicit external URLs still work.
+
 - **Add Book ebook cards show the full title.** Long titles now wrap instead of
   hiding their ending, so volumes with the same opening words can be told apart
   on a phone.

@@ -1004,7 +1004,10 @@ class KoSyncClient:
 
     @property
     def base_url(self):
-        url = self._cfg("KOSYNC_SERVER", "").rstrip('/')
+        url = (self._cfg("KOSYNC_SERVER", "") or "").strip().rstrip('/')
+        if not url:
+            port = str(self._cfg("KOSYNC_PORT", "") or "").strip() or "5757"
+            return f"http://127.0.0.1:{port}"
 
         # Ensure scheme is present (case-insensitive check)
         if url and not url.lower().startswith(('http://', 'https://')):
