@@ -186,9 +186,13 @@ class TestStorygraphClient(unittest.TestCase):
 
     @patch("src.api.storygraph_client.requests.get")
     @patch("src.api.storygraph_client.requests.post")
-    def test_update_progress_posts_plugin_payload_to_endpoint(self, mock_post, mock_get):
+    def test_update_progress_defaults_to_pages_when_count_available(self, mock_post, mock_get):
         html = """
         <meta name="csrf-token" content="csrf123" />
+        <select class="read-status-progress-type">
+            <option value="percentage" selected="selected">Percentage</option>
+            <option value="pages">Pages</option>
+        </select>
         <input class="read-status-book-num-of-pages" value="321" />
         """
         mock_get.return_value = Mock(status_code=200, text=html, headers={})
@@ -201,8 +205,8 @@ class TestStorygraphClient(unittest.TestCase):
         self.assertEqual(
             mock_post.call_args.kwargs["data"],
             {
-                "read_status[progress_number]": "42",
-                "read_status[progress_type]": "percentage",
+                "read_status[progress_number]": "135",
+                "read_status[progress_type]": "pages",
                 "read_status[book_num_of_pages]": "321",
                 "book_id": "book-1",
                 "on_book_page": "true",

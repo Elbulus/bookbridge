@@ -25,11 +25,10 @@ All notable changes to BookBridge will be documented in this file.
 
 ### Changed
 
-- **StoryGraph keeps your chosen progress unit (#458).** When you select Pages for
-  a book in StoryGraph, BookBridge sends an estimated page based on the matched
-  edition's page count instead of switching it back to percentage. Books without
-  a page count continue to sync by percentage. EPUB and audiobook positions do
-  not identify an exact print page.
+- **StoryGraph defaults to page progress (#458).** When the matched edition has
+  a page count, BookBridge sends an estimated page and selects Pages in
+  StoryGraph. Books without a page count continue to sync by percentage. EPUB
+  and audiobook positions do not identify an exact print page.
 
 - **Collapsed series cards keep their per-service progress visible.** The lead
   book's progress grid stays on the card while its series is closed.
