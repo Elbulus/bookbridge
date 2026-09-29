@@ -247,13 +247,15 @@ class ABSAudioSourceAdapter(AudioSourceAdapter):
 
         cache_key = str(bridge_key or source_id).replace(":", "_")
         source_cache_dir = self.data_dir / "audio_cache" / cache_key / "source_tracks"
-        source_cache_dir.mkdir(parents=True, exist_ok=True)
         for idx, audio_file in enumerate(files):
+            if audio_file.get("local_path"):
+                continue
             ext = str(audio_file.get("ext") or "mp3").lower().lstrip(".")
             if not ext.isalnum():
                 ext = "mp3"
             local_path = source_cache_dir / f"track_{idx:03d}.{ext}"
             if not local_path.exists() or local_path.stat().st_size == 0:
+                source_cache_dir.mkdir(parents=True, exist_ok=True)
                 if not self.abs_client.download_file(audio_file["stream_url"], local_path):
                     logger.warning(
                         "ABS track download failed for item_id=%s track_index=%s; using stream for transcription",

@@ -291,20 +291,36 @@ class ABSClient:
             if r.status_code == 200:
                 data = r.json()
                 files = []
-                # Return list of dicts with stream_url and ext (for transcriber)
+                # Return stream URLs and any matching mounted audio paths.
                 audio_files = data.get('media', {}).get('audioFiles', [])
                 audio_files.sort(key=lambda x: (x.get('disc', 0) or 0, x.get('track', 0) or 0))
 
                 if not audio_files:
                     logger.warning(f"⚠️ ABS item '{item_id}' returned 200 but media.audioFiles was empty")
 
+                root = os.environ.get("AUDIOBOOKS_DIR", "/audiobooks")
+                mounted_root = os.path.realpath(root) if root and os.path.isabs(root) else None
                 for af in audio_files:
                     stream_url = f"{self.base_url}/api/items/{item_id}/file/{af['ino']}?token={self.token}"
-                    # Return dict with stream URL and extension (default to mp3)
-                    files.append({
+                    entry = {
                         "stream_url": stream_url,
                         "ext": af.get("ext", "mp3")
-                    })
+                    }
+                    metadata = af.get("metadata") or {}
+                    path = metadata.get("path") if isinstance(metadata, dict) else None
+                    size = metadata.get("size") if isinstance(metadata, dict) else None
+                    if isinstance(path, str) and os.path.isabs(path) and mounted_root:
+                        try:
+                            mounted_path = os.path.realpath(path)
+                            expected_size = int(size)
+                            if (expected_size > 0
+                                    and os.path.commonpath((mounted_root, mounted_path)) == mounted_root
+                                    and os.path.isfile(mounted_path)
+                                    and os.path.getsize(mounted_path) == expected_size):
+                                entry["local_path"] = mounted_path
+                        except (TypeError, ValueError, OSError):
+                            pass
+                    files.append(entry)
                 return files
             logger.warning(f"⚠️ ABS: Failed to fetch audio files for item '{item_id}' (status {r.status_code})")
             return []

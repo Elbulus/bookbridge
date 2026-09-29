@@ -616,11 +616,15 @@ Found under **Settings -> System**.
 | Data Directory | `DATA_DIR` | `/data` | Database, cache, and working state. |
 | Books Directory | `BOOKS_DIR` | `/books` | Local ebook library path inside the container. |
 | Extra Ebook Directories | `EXTRA_EBOOK_DIRS` | empty | Additional library folders to search, for multi-library setups where some ebooks live outside `BOOKS_DIR`. Comma- or newline-separated container paths. |
-| Audiobooks Directory | `AUDIOBOOKS_DIR` | `/audiobooks` | Optional local audiobook path. |
+| Audiobooks Directory | `AUDIOBOOKS_DIR` | `/audiobooks` | Local audiobook root. When ABS reports a track path inside this directory and its size matches, BookBridge reads that mounted file directly instead of downloading an audio cache copy. Other tracks keep the existing stream/download path. |
 | Storyteller Library Directory | `STORYTELLER_LIBRARY_DIR` | `/storyteller_library` | Optional local Storyteller library path for fallback/download helpers. |
 | Storyteller Assets Directory | `STORYTELLER_ASSETS_DIR` | empty | Optional transcript asset root. |
 | Storyteller Upload Chunk Size | `STORYTELLER_UPLOAD_CHUNK_SIZE` | `5242880` | TUS upload chunk size in bytes for direct Storyteller uploads. |
 | Ebook Cache Size | `EBOOK_CACHE_SIZE` | `3` | Parsed-ebook cache size. |
+
+For the ABS audio shortcut, mount the same underlying audiobook files at the
+same container paths in ABS and BookBridge. A path and size match cannot detect
+different files of the same size on unrelated mounts.
 
 ### Local ebook sources are confined to these directories
 

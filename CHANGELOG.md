@@ -25,6 +25,11 @@ All notable changes to BookBridge will be documented in this file.
 
 ### Changed
 
+- **Mounted Audiobookshelf audio avoids a duplicate download (#455).** If an ABS
+  track exists inside the configured Audiobooks Directory and its size matches
+  ABS metadata, BookBridge uses it for CTC or transcription. Unavailable or
+  mismatched tracks keep the existing download and stream fallback.
+
 - **StoryGraph defaults to page progress (#458).** When the matched edition has
   a page count, BookBridge sends an estimated page and selects Pages in
   StoryGraph. Books without a page count continue to sync by percentage. EPUB
