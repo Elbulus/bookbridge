@@ -441,6 +441,11 @@ StoryGraph notes:
 - Requires browser cookies for authentication. See the [User Guide](user-guide.md#storygraph-authentication) for instructions on how to retrieve these.
 - Supports **Edition Picking**: Select specific editions (Paperback, Kindle, etc.) to ensure accurate page counts.
 - **Switch Editions**: The bridge can automatically "switch" your tracked edition on StoryGraph to match your selection.
+- To report progress as pages, select **Pages** and save one progress update for
+  that book in StoryGraph. BookBridge keeps that choice and estimates the page
+  from the synced percentage and selected edition's page count. This cannot
+  guarantee the exact print page for a reflowable ebook or audiobook. Books
+  without a page count continue using percent.
 
 #### Progress Trackers
 
