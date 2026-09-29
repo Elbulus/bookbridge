@@ -35,6 +35,14 @@ All notable changes to BookBridge will be documented in this file.
 
 ### Fixed
 
+- **Russian and other non-Latin books are no longer refused by the Content-Match
+  Guard (#460).** The guard only recognised Latin letters, so a Russian book was
+  compared on its page numbers and stray markup and every correct pairing failed
+  at a few percent. It now reads words in any alphabet and ignores accent
+  differences such as `ё`/`е`. Chinese, Japanese and Thai, which don't put spaces
+  between words, are no longer judged by this check. English books score the
+  same or slightly higher than before.
+
 - **Built-in KoSync works with an empty server URL (#456).** When KoSync is
   enabled, the sync client now connects to the built-in server on port 5757 (or
   `KOSYNC_PORT` in split-port mode) without requiring a Settings page save or an
