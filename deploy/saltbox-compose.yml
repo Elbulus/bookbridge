@@ -1,0 +1,74 @@
+# BookBridge on Saltbox, running v7.8.0 with the patches from this fork mounted
+# over the image's own files.
+#
+# Where each mounted file comes from (fetch into /opt/bookbridge/mods/):
+#   R=https://raw.githubusercontent.com/Elbulus/bookbridge
+#   web_server.py, config_loader.py, settings.html, ebook_sources.py
+#       -> $R/claude/ebook-source-priority/src/...           (#2: EBOOK_SOURCE_PRIORITY)
+#   booklore_sync_client.py
+#       -> $R/claude/adoring-cray-sa0ite/src/sync_clients/   (#1: within-chapter position)
+#   sync_manager.py
+#       -> $R/claude/kobo-finish-completion/src/              (#1 + #3 + #4: backward check,
+#                                                              audio echo margin, Kobo finish)
+#   booklore_client.py is 0001 (rounding readback): parked, so its mount is commented out.
+#   gr_progress.py, bo_progress.py, kobo_state.py, cfi_where.py are read-only check scripts.
+#
+# Mounts are read when the container is CREATED, not restarted:
+#   docker compose up -d --force-recreate bookbridge
+---
+services:
+  bookbridge:
+    container_name: "bookbridge"
+    environment: # Change this as needed for your image
+      TZ: "Europe/London"
+      LOG_LEVEL: "INFO"
+      EBOOK_SOURCE_PRIORITY: "BookOrbit, Grimmory"
+
+    hostname: "bookbridge"
+    image: "ghcr.io/cporcellijr/bookbridge:v7.8.0"
+    labels:
+      autoheal: "true"
+      autoheal.stop.timeout: "10"
+      com.github.saltbox.saltbox_controller: "true"
+      com.github.saltbox.saltbox_managed: "true"
+      diun.enable: "true"
+      traefik.enable: "true"
+      traefik.http.routers.bookbridge-http.entrypoints: "web"
+      traefik.http.routers.bookbridge-http.middlewares: "globalHeaders@file,redirect-to-https@docker,robotHeaders@file,cloudflarewarp@docker,authentik@docker"
+      traefik.http.routers.bookbridge-http.priority: "20"
+      traefik.http.routers.bookbridge-http.rule: "Host(`bookbridge.elbulus.uk`)"
+      traefik.http.routers.bookbridge-http.service: "bookbridge-http"
+      traefik.http.routers.bookbridge.entrypoints: "websecure"
+      traefik.http.routers.bookbridge.middlewares: "globalHeaders@file,secureHeaders@file,robotHeaders@file,cloudflarewarp@docker,authentik@docker"
+      traefik.http.routers.bookbridge.priority: "20"
+      traefik.http.routers.bookbridge.rule: "Host(`bookbridge.elbulus.uk`)"
+      traefik.http.routers.bookbridge.service: "bookbridge"
+      traefik.http.routers.bookbridge.tls.certresolver: "cfdns"
+      traefik.http.routers.bookbridge.tls.domains[0].main: "elbulus.uk"
+      traefik.http.routers.bookbridge.tls.domains[0].sans: "*.elbulus.uk"
+      traefik.http.routers.bookbridge.tls.options: "securetls@file"
+      traefik.http.services.bookbridge-http.loadbalancer.server.port: "5757"
+      traefik.http.services.bookbridge.loadbalancer.server.port: "5757"
+    networks:
+      - "saltbox"
+    restart: "unless-stopped"
+    volumes: # Change this as needed for your image
+      - "/opt/bookbridge/data:/data"
+      - "/mnt/unionfs/Media/Books:/books"
+      - "/etc/localtime:/etc/localtime:ro"
+      - /opt/bookbridge/mods/web_server.py:/app/src/web_server.py:ro
+      - /opt/bookbridge/mods/ebook_sources.py:/app/src/utils/ebook_sources.py:ro
+      - /opt/bookbridge/mods/config_loader.py:/app/src/utils/config_loader.py:ro
+      - /opt/bookbridge/mods/settings.html:/app/templates/settings.html:ro
+      #- /opt/bookbridge/mods/booklore_client.py:/app/src/api/booklore_client.py:ro
+      - /opt/bookbridge/mods/booklore_sync_client.py:/app/src/sync_clients/booklore_sync_client.py:ro
+      - /opt/bookbridge/mods/sync_manager.py:/app/src/sync_manager.py:ro
+      - /opt/bookbridge/mods/gr_progress.py:/gr_progress.py:ro
+      - /opt/bookbridge/mods/bo_progress.py:/bo_progress.py:ro
+      - /opt/bookbridge/mods/kobo_state.py:/kobo_state.py:ro
+      - /opt/bookbridge/mods/cfi_where.py:/cfi_where.py:ro
+
+
+networks:
+  saltbox:
+    external: true
