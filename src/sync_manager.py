@@ -372,6 +372,25 @@ class SyncManager:
     def _completion_propagation_enabled(self) -> bool:
         return env_truthy('SYNC_COMPLETION_PROPAGATION')
 
+    def _is_completion_report(self, pct) -> bool:
+        """Whether a client's own reading is a finish rather than a position.
+
+        A Kobo that finishes a book reports 100% and puts its bookmark back on the
+        title page, ready for a re-read. Resolved as a position, that is char 0: a
+        jump from wherever the audio sits to the start of the book, which the
+        rollback guards rightly refuse. Refused, the bridge wrote the listening
+        position back to Grimmory and pulled the reader's Kobo out of the finished
+        state, for about five minutes, until the hold expired and the same report
+        led anyway (observed live). The percentage is the reader's claim; judge it
+        as one. The start-of-book write guard still stops any 0% reaching a peer.
+        """
+        if pct is None or isinstance(pct, bool):
+            return False
+        try:
+            return float(pct) >= self._completion_threshold()
+        except (TypeError, ValueError):
+            return False
+
     def _completion_threshold(self) -> float:
         try:
             value = float(os.environ.get('SYNC_COMPLETION_THRESHOLD', '99'))
@@ -658,6 +677,8 @@ class SyncManager:
 
         if not self._trust_corroborated_rewind_enabled():
             return False
+        if self._is_completion_report(leader_pct):
+            return False                      # a finish, not a rewind
         verdict = self._backward_move(config, client_name, leader_pct, primary_audio_client)
         if verdict is None:
             return False
@@ -4112,6 +4133,13 @@ class SyncManager:
 
                     material_rollback = changed_ts < (max_other_ts - MATERIAL_ROLLBACK_SECONDS)
                     mismatch_not_ahead = has_locator_mismatch and changed_ts <= (max_other_ts + NORMALIZED_LEAD_EPSILON_SECONDS)
+                    if (material_rollback or mismatch_not_ahead) and self._is_completion_report(changed_raw_pct):
+                        logger.info(
+                            f"🏁 '{abs_id}' '{title_snip}' '{changed_client}' reports "
+                            f"{changed_raw_pct:.1%}: a finish, not a rewind to "
+                            f"{changed_ts:.1f}s — keeping it as leader"
+                        )
+                        material_rollback = mismatch_not_ahead = False
                     if material_rollback or mismatch_not_ahead:
                         # A deliberate rewind is indistinguishable from a stale read in
                         # a single sample, so this guard demotes both and furthest-wins
