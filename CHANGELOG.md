@@ -45,6 +45,15 @@ All notable changes to BookBridge will be documented in this file.
 
 ### Fixed
 
+- **CWA Kobo sync finds books whose audiobook title differs from Calibre's
+  (#462).** A CWA book could be skipped every cycle with "Could not unambiguously
+  resolve … to a single book" when its audiobook title carried a subtitle,
+  edition tag, "(Unabridged)" or a translated title that Calibre's catalog
+  title doesn't have. The bridge now also searches CWA for the title stored in
+  the ebook file itself and for the audiobook title without its decoration.
+  The exact Calibre book is still chosen by its id, so a broader search can't
+  bind progress to a different book.
+
 - **Russian and other non-Latin books are no longer refused by the Content-Match
   Guard (#460).** The guard only recognised Latin letters, so a Russian book was
   compared on its page numbers and stray markup and every correct pairing failed
