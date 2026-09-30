@@ -42,7 +42,7 @@ class _Base(unittest.TestCase):
     def setUp(self):
         observation_trail.clear()
         self._env = {k: os.environ.get(k) for k in (
-            "SYNC_COMPLETION_THRESHOLD", "SYNC_TRUST_CORROBORATED_REWIND",
+            "SYNC_COMPLETION_THRESHOLD", "SYNC_COMPLETION_MIN_PRIOR", "SYNC_TRUST_CORROBORATED_REWIND",
             "SYNC_FRESHNESS_GUARDS", "SYNC_REWIND_HOLD_SECONDS")}
         for k in self._env:
             os.environ.pop(k, None)
@@ -80,6 +80,50 @@ class TestWhatCountsAsAFinish(_Base):
                 self.assertFalse(self.manager._is_completion_report(value))
 
 
+class TestOnlyABelievableFinishIsFastTracked(_Base):
+    """A 100% report leads at once only from a reader already known to be well
+    into the book; an early "finished" keeps the ordinary treatment."""
+
+    def _config(self, kobo_prev, abs_pct):
+        return {
+            "BookLore": _state({"pct": 1.0}, previous_pct=kobo_prev),
+            "ABS": _state({"pct": abs_pct, "ts": abs_pct * DURATION}, previous_pct=abs_pct),
+        }
+
+    def _believe(self, kobo_prev, abs_pct):
+        return self.manager._is_believable_finish(
+            self._config(kobo_prev, abs_pct), "BookLore", 1.0)
+
+    def test_tonight(self):
+        """Kobo last at 94.9%, audio at 95.2%."""
+        self.assertTrue(self._believe(0.949, 0.952))
+
+    def test_the_audio_can_vouch_for_a_kobo_that_was_behind(self):
+        """The Kobo had been at 73% before its big jump; the audio was at 95%."""
+        self.assertTrue(self._believe(0.30, 0.952))
+
+    def test_a_finish_from_early_on_is_not_believed(self):
+        self.assertFalse(self._believe(0.30, 0.30))
+
+    def test_the_boundary_is_sixty_percent(self):
+        self.assertTrue(self._believe(0.60, 0.10))
+        self.assertFalse(self._believe(0.599, 0.10))
+
+    def test_the_boundary_is_a_setting(self):
+        os.environ["SYNC_COMPLETION_MIN_PRIOR"] = "0"
+        self.assertTrue(self._believe(0.0, 0.0))
+        os.environ["SYNC_COMPLETION_MIN_PRIOR"] = "90"
+        self.assertFalse(self._believe(0.80, 0.85))
+
+    def test_nothing_known_is_not_believed(self):
+        config = {"BookLore": _state({"pct": 1.0}, previous_pct=None)}
+        self.assertFalse(self.manager._is_believable_finish(config, "BookLore", 1.0))
+
+    def test_below_the_completion_threshold_is_never_a_finish(self):
+        self.assertFalse(self.manager._is_believable_finish(
+            self._config(0.95, 0.95), "BookLore", 0.98))
+
+
 class TestTheHoldLetsAFinishThrough(_Base):
     def _config(self, raw):
         return {
@@ -100,7 +144,7 @@ class TestTheHoldLetsAFinishThrough(_Base):
 
 
 class TestTonightThroughTheLeaderDecision(_Base):
-    def _lead(self, raw):
+    def _lead(self, raw, kobo_prev=0.949, abs_ts=ABS_TS):
         class _Client:
             def can_be_leader(self):
                 return True
@@ -112,14 +156,14 @@ class TestTonightThroughTheLeaderDecision(_Base):
         m.sync_clients = {"BookLore": _Client(), "ABS": _Client()}
         m._has_significant_delta = MagicMock(side_effect=lambda name, cfg, book: name == "BookLore")
         m._normalize_for_cross_format_comparison = MagicMock(
-            return_value={"ABS": ABS_TS, "BookLore": 0.0})
+            return_value={"ABS": abs_ts, "BookLore": 0.0})
         m._get_primary_audio_client_name = MagicMock(return_value="ABS")
         m.sync_delta_between_clients = 0.005
         m.cross_format_deadband_seconds = 2.0
         config = {
             "BookLore": _state({"pct": raw, "_normalized_ts": 0.0,
-                                "_normalization_source": "href_only"}, previous_pct=0.949),
-            "ABS": _state({"pct": ABS_TS / DURATION, "ts": ABS_TS}, previous_pct=ABS_TS / DURATION),
+                                "_normalization_source": "href_only"}, previous_pct=kobo_prev),
+            "ABS": _state({"pct": abs_ts / DURATION, "ts": abs_ts}, previous_pct=abs_ts / DURATION),
         }
         book = SimpleNamespace(duration=DURATION, audio_duration=None, transcript_file="t.json",
                                sync_mode="audiobook", abs_id=ABS_ID)
@@ -133,6 +177,14 @@ class TestTonightThroughTheLeaderDecision(_Base):
         self.assertEqual(pct, 1.0)
         self.assertIn("a finish, not a rewind", logs)
         self.assertNotIn("demoted", logs)
+
+    def test_an_early_finished_is_refused_like_any_jump_to_the_start(self):
+        """Kobo and audio both around 30%: a 100% claim there is not believed at
+        once, so it gets the ordinary treatment - demoted, ABS leads."""
+        leader, _, logs = self._lead(1.0, kobo_prev=0.30, abs_ts=0.30 * DURATION)
+        self.assertEqual(leader, "ABS")
+        self.assertNotIn("a finish, not a rewind", logs)
+        self.assertIn("demoted", logs)
 
     def test_a_real_jump_to_the_start_is_still_refused(self):
         """The same title-page position without the 100% claim: stale, demoted."""
