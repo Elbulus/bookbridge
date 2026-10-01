@@ -402,12 +402,46 @@ class SyncManager:
                 known.append(float(pct))
         return max(known) if known else None
 
+    def _unsupported_finishes(self, config: dict, positions: dict) -> set:
+        """Clients reporting a finish that nothing else in the system supports.
+
+        A finish counts when the reader is known to be well into the book
+        (SYNC_COMPLETION_MIN_PRIOR, default 60%): another client is that far, or
+        this client itself was before it jumped. Anything else is an old "read"
+        mark or a stale end-of-book bookmark resurfacing — a book marked read
+        years ago, re-listened from the start, jumped from 18% to 99% this way and
+        marked the audiobook finished.
+
+        `positions` maps the clients that may lead to their percentage; only they
+        count as evidence. The client's own earlier position counts only while it
+        was not itself a finish, so a stale 100% cannot vouch for itself. With no
+        other client there is no better position to keep, so nothing is refused.
+        """
+        if len(positions) < 2:
+            return set()
+        min_prior = self._completion_min_prior()
+        refused = set()
+        for name, pct in positions.items():
+            if not self._is_completion_report(pct):
+                continue
+            known = [
+                float(other_pct) for other, other_pct in positions.items()
+                if other != name and isinstance(other_pct, (int, float))
+                and not isinstance(other_pct, bool)
+            ]
+            previous = getattr(config.get(name), "previous_pct", None) if config else None
+            if (isinstance(previous, (int, float)) and not isinstance(previous, bool)
+                    and not self._is_completion_report(previous)):
+                known.append(float(previous))
+            if not known or max(known) < min_prior:
+                refused.add(name)
+        return refused
+
     def _is_believable_finish(self, config: dict, client_name: str, pct) -> bool:
         """A completion report worth acting on at once: at or above the completion
         threshold AND from a reader already known to be well into the book
-        (SYNC_COMPLETION_MIN_PRIOR, default 60%). A "finished" from early on — a
-        mis-tap, a device glitch — keeps the ordinary treatment instead: refused as
-        a jump to the start, then accepted only if it persists past the hold."""
+        (SYNC_COMPLETION_MIN_PRIOR, default 60%). A "finished" from early on never
+        gets here: `_unsupported_finishes` drops it from leader selection first."""
         if not self._is_completion_report(pct):
             return False
         prior = self._known_progress(config, client_name)
@@ -3853,10 +3887,18 @@ class SyncManager:
             except (TypeError, ValueError):
                 cooldown_mins = 60
 
+            # A finish leader selection would ignore must not post one here either.
+            refused = self._unsupported_finishes(config, {
+                name: cfg.current.get('pct')
+                for name, cfg in config.items()
+                if cfg and cfg.current.get('pct') is not None
+                and callable(getattr(self.sync_clients.get(name), 'can_be_leader', None))
+                and self.sync_clients[name].can_be_leader()
+            })
             pcts = [
                 cfg.current.get('pct')
-                for cfg in config.values()
-                if cfg and cfg.current.get('pct') is not None
+                for name, cfg in config.items()
+                if cfg and cfg.current.get('pct') is not None and name not in refused
             ]
             if not pcts:
                 return
@@ -3956,6 +3998,20 @@ class SyncManager:
         echo_clients: set[str] = set()
         primary_audio_client = self._get_primary_audio_client_name(book)
         clients_with_delta = {k: v for k, v in vals.items() if self._has_significant_delta(k, config, book)}
+
+        # A "finished" that nothing else supports may not lead, nor sit in the
+        # running as the furthest position or the newer peer that vetoes the real
+        # one. Removed before any guard reads `vals`; the client stays a follower,
+        # so whoever leads writes the reader's real position back over it.
+        for client_name in sorted(self._unsupported_finishes(config, vals)):
+            logger.info(
+                f"🚫 '{abs_id}' '{title_snip}' Ignoring '{client_name}' at "
+                f"{vals[client_name]:.1%}: a finish, but nothing else puts the reader past "
+                f"{self._completion_min_prior():.0%} of the book — an old 'read' mark or a "
+                f"stale bookmark, not reading"
+            )
+            vals.pop(client_name, None)
+            clients_with_delta.pop(client_name, None)
 
         # Suppress raw pct delta when locator-derived position shows no movement from previous state.
         for client_name in list(clients_with_delta.keys()):

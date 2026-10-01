@@ -178,13 +178,13 @@ class TestTonightThroughTheLeaderDecision(_Base):
         self.assertIn("a finish, not a rewind", logs)
         self.assertNotIn("demoted", logs)
 
-    def test_an_early_finished_is_refused_like_any_jump_to_the_start(self):
-        """Kobo and audio both around 30%: a 100% claim there is not believed at
-        once, so it gets the ordinary treatment - demoted, ABS leads."""
+    def test_an_early_finished_is_ignored(self):
+        """Kobo and audio both around 30%: a 100% claim there is not believed,
+        so it never leads (0008 drops it before the rewind guards) - ABS leads."""
         leader, _, logs = self._lead(1.0, kobo_prev=0.30, abs_ts=0.30 * DURATION)
         self.assertEqual(leader, "ABS")
         self.assertNotIn("a finish, not a rewind", logs)
-        self.assertIn("demoted", logs)
+        self.assertIn("Ignoring 'BookLore' at 100.0%", logs)
 
     def test_a_real_jump_to_the_start_is_still_refused(self):
         """The same title-page position without the 100% claim: stale, demoted."""
