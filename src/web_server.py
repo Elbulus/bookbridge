@@ -41,7 +41,12 @@ from src.utils.user_config import SERVICE_ENABLE_KEYS
 from src.utils.config_loader import ConfigLoader, KNOWN_SETTING_KEYS, env_truthy
 from src.utils.cache_paths import safe_cache_path, safe_library_path, is_plain_basename
 from src.utils.ebook_utils import LRUCache
-from src.utils.ebook_sources import is_grimmory_source, local_ebook_filename, normalize_ebook_source
+from src.utils.ebook_sources import (
+    is_grimmory_source,
+    local_ebook_filename,
+    normalize_ebook_source,
+    resolve_ebook_source_order,
+)
 from src.utils.logging_utils import memory_log_handler, LOG_PATH
 from src.utils.logging_utils import sanitize_log_data
 from src.utils.logging_utils import get_persistent_condition_logger
@@ -3111,7 +3116,14 @@ def _build_local_ebook_title_index():
 
 def get_searchable_ebooks(search_term):
     """Get ebooks from Grimmory API, BookOrbit, filesystem, ABS, and CWA.
-    Returns list of EbookResult objects for consistent interface."""
+    Returns list of EbookResult objects for consistent interface.
+
+    Every provider dedupes against one shared filename/stem set, so whichever
+    runs first claims a file the others also hold. That matters on installs
+    where two providers index the same disk: the later one can never contribute
+    a shared book. EBOOK_SOURCE_PRIORITY chooses which provider wins; unset, the
+    order is the historical Grimmory-first one.
+    """
 
     results = []
     found_filenames = set()
@@ -3119,213 +3131,239 @@ def get_searchable_ebooks(search_term):
     clients = uc()
 
     # 1. Grimmory
-    if clients.booklore_client.is_configured():
-        try:
-            if search_term:
-                books = clients.booklore_client.search_books(search_term)
-            else:
-                # For scan workloads, use the broader cache-oriented API to avoid
-                # repeated aggressive refresh behavior from per-query search calls.
-                books = clients.booklore_client.get_all_books()
-            if books:
-                for b in books:
-                    fname = b.get('fileName', '')
-                    if fname.lower().endswith('.epub'):
-                        found_filenames.add(fname.lower())
-                        found_stems.add(Path(fname).stem.lower())
-                        results.append(EbookResult(
-                            name=fname,
-                            title=b.get('title'),
-                            subtitle=_ebook_edition_label(b),
-                            authors=b.get('authors'),
-                            language=b.get('language'),
-                            booklore_id=b.get('id'),
-                            path=b.get('filePath') or b.get('filepath') or b.get('path'),
-                            source='Grimmory'
-                        ))
-        except Exception as e:
-            logger.warning(f"⚠️ Grimmory search failed: {e}", exc_info=True)
+    def _collect_grimmory():
+        if clients.booklore_client.is_configured():
+            try:
+                if search_term:
+                    books = clients.booklore_client.search_books(search_term)
+                else:
+                    # For scan workloads, use the broader cache-oriented API to avoid
+                    # repeated aggressive refresh behavior from per-query search calls.
+                    books = clients.booklore_client.get_all_books()
+                if books:
+                    for b in books:
+                        fname = b.get('fileName', '')
+                        if fname.lower().endswith('.epub'):
+                            if fname.lower() in found_filenames:
+                                continue
+                            found_filenames.add(fname.lower())
+                            found_stems.add(Path(fname).stem.lower())
+                            results.append(EbookResult(
+                                name=fname,
+                                title=b.get('title'),
+                                subtitle=_ebook_edition_label(b),
+                                authors=b.get('authors'),
+                                language=b.get('language'),
+                                booklore_id=b.get('id'),
+                                path=b.get('filePath') or b.get('filepath') or b.get('path'),
+                                source='Grimmory'
+                            ))
+            except Exception as e:
+                logger.warning(f"⚠️ Grimmory search failed: {e}", exc_info=True)
 
     # 1b. BookOrbit
-    if clients.bookorbit_client.is_configured():
-        try:
-            if search_term:
-                # Targeted search returns real filenames (bounded result set).
-                bo_books = clients.bookorbit_client.search_ebooks(search_term)
-                local_index = None
-            else:
-                # Full scan: light candidates (clean title/author, no filename).
-                # Pair each with a real filename from the shared /books disk so we
-                # avoid a throttled detail call per book.
-                bo_books = clients.bookorbit_client.get_all_ebooks()
-                local_index = _build_local_ebook_title_index()
-            for b in bo_books or []:
-                fname = b.get('fileName') or ''
-                if not fname and local_index is not None:
-                    fname = local_index.get(_ebook_title_key(b.get('title'))) or ''
-                if not fname.lower().endswith('.epub'):
-                    continue
-                if fname.lower() in found_filenames:
-                    continue
-                found_filenames.add(fname.lower())
-                found_stems.add(Path(fname).stem.lower())
-                results.append(EbookResult(
-                    name=fname,
-                    title=b.get('title'),
-                    authors=b.get('authors'),
-                    language=b.get('language'),
-                    path=b.get('filePath') or b.get('filepath') or b.get('path'),
-                    source='BookOrbit',
-                    source_id=b.get('id'),
-                    subtitle=_ebook_edition_label(b),
-                ))
-        except Exception as e:
-            logger.warning(f"⚠️ BookOrbit search failed: {e}", exc_info=True)
+    def _collect_bookorbit():
+        if clients.bookorbit_client.is_configured():
+            try:
+                if search_term:
+                    # Targeted search returns real filenames (bounded result set).
+                    bo_books = clients.bookorbit_client.search_ebooks(search_term)
+                    local_index = None
+                else:
+                    # Full scan: light candidates (clean title/author, no filename).
+                    # Pair each with a real filename from the shared /books disk so we
+                    # avoid a throttled detail call per book.
+                    bo_books = clients.bookorbit_client.get_all_ebooks()
+                    local_index = _build_local_ebook_title_index()
+                for b in bo_books or []:
+                    fname = b.get('fileName') or ''
+                    if not fname and local_index is not None:
+                        fname = local_index.get(_ebook_title_key(b.get('title'))) or ''
+                    if not fname.lower().endswith('.epub'):
+                        continue
+                    if fname.lower() in found_filenames:
+                        continue
+                    found_filenames.add(fname.lower())
+                    found_stems.add(Path(fname).stem.lower())
+                    results.append(EbookResult(
+                        name=fname,
+                        title=b.get('title'),
+                        authors=b.get('authors'),
+                        language=b.get('language'),
+                        path=b.get('filePath') or b.get('filepath') or b.get('path'),
+                        source='BookOrbit',
+                        source_id=b.get('id'),
+                        subtitle=_ebook_edition_label(b),
+                    ))
+            except Exception as e:
+                logger.warning(f"⚠️ BookOrbit search failed: {e}", exc_info=True)
 
     # 1c. BookFusion existing user library links. Search-only because BookFusion
     # does not provide a bridge-side EPUB download in Phase 1/3.
-    if search_term and clients.bookfusion_client.is_configured():
-        try:
-            bf_books = clients.bookfusion_client.search_books(page=1, per_page=50, query=search_term)
-            query_lower = search_term.lower()
-            for b in bf_books or []:
-                bf_id = b.get("id") or b.get("book_id")
-                if bf_id in (None, ""):
-                    continue
-                title = str(b.get("title") or b.get("name") or f"BookFusion {bf_id}").strip()
-                authors = _coerce_author_display(b.get("authors") or b.get("author"))
-                haystack = f"{title} {authors}".lower()
-                if query_lower and query_lower not in haystack:
-                    continue
-                fname = f"bookfusion_{bf_id}.epub"
-                results.append(EbookResult(
-                    name=fname,
-                    title=title,
-                    authors=authors,
-                    language=b.get('language'),
-                    path=None,
-                    source='BookFusion',
-                    source_id=bf_id,
-                ))
-        except Exception as e:
-            logger.warning(f"⚠️ BookFusion search failed: {e}", exc_info=True)
+    def _collect_bookfusion():
+        if search_term and clients.bookfusion_client.is_configured():
+            try:
+                bf_books = clients.bookfusion_client.search_books(page=1, per_page=50, query=search_term)
+                query_lower = search_term.lower()
+                for b in bf_books or []:
+                    bf_id = b.get("id") or b.get("book_id")
+                    if bf_id in (None, ""):
+                        continue
+                    title = str(b.get("title") or b.get("name") or f"BookFusion {bf_id}").strip()
+                    authors = _coerce_author_display(b.get("authors") or b.get("author"))
+                    haystack = f"{title} {authors}".lower()
+                    if query_lower and query_lower not in haystack:
+                        continue
+                    fname = f"bookfusion_{bf_id}.epub"
+                    if fname.lower() in found_filenames:
+                        continue
+                    found_filenames.add(fname.lower())
+                    results.append(EbookResult(
+                        name=fname,
+                        title=title,
+                        authors=authors,
+                        language=b.get('language'),
+                        path=None,
+                        source='BookFusion',
+                        source_id=bf_id,
+                    ))
+            except Exception as e:
+                logger.warning(f"⚠️ BookFusion search failed: {e}", exc_info=True)
 
     # 1d. Kavita
-    kavita_client = getattr(clients, "kavita_client", None)
-    if kavita_client and kavita_client.is_configured():
-        try:
-            kavita_books = (
-                kavita_client.search_ebooks(search_term)
-                if search_term
-                else kavita_client.get_all_books()
-            )
-            for book in kavita_books or []:
-                filename = book.get('fileName') or book.get('filename') or ''
-                if not filename.lower().endswith('.epub'):
-                    continue
-                if filename.lower() in found_filenames:
-                    continue
-                found_filenames.add(filename.lower())
-                found_stems.add(Path(filename).stem.lower())
-                results.append(EbookResult(
-                    name=filename,
-                    title=book.get('title'),
-                    subtitle=_ebook_edition_label(book),
-                    authors=book.get('authors') or book.get('author'),
-                    language=book.get('language'),
-                    path=book.get('filePath') or book.get('path'),
-                    source='Kavita',
-                    source_id=book.get('id'),
-                ))
-        except Exception as e:
-            logger.warning("Kavita search failed: %s", e, exc_info=True)
+    def _collect_kavita():
+        kavita_client = getattr(clients, "kavita_client", None)
+        if kavita_client and kavita_client.is_configured():
+            try:
+                kavita_books = (
+                    kavita_client.search_ebooks(search_term)
+                    if search_term
+                    else kavita_client.get_all_books()
+                )
+                for book in kavita_books or []:
+                    filename = book.get('fileName') or book.get('filename') or ''
+                    if not filename.lower().endswith('.epub'):
+                        continue
+                    if filename.lower() in found_filenames:
+                        continue
+                    found_filenames.add(filename.lower())
+                    found_stems.add(Path(filename).stem.lower())
+                    results.append(EbookResult(
+                        name=filename,
+                        title=book.get('title'),
+                        subtitle=_ebook_edition_label(book),
+                        authors=book.get('authors') or book.get('author'),
+                        language=book.get('language'),
+                        path=book.get('filePath') or book.get('path'),
+                        source='Kavita',
+                        source_id=book.get('id'),
+                    ))
+            except Exception as e:
+                logger.warning("Kavita search failed: %s", e, exc_info=True)
 
     # 2. ABS ebook libraries
-    if search_term:
-        try:
-            abs_client = clients.abs_client
-            if abs_client:
-                abs_ebooks = abs_client.search_ebooks(search_term)
-                if abs_ebooks:
-                    for ab in abs_ebooks:
-                        ebook_files = abs_client.get_ebook_files(ab['id'])
-                        if ebook_files:
-                            ef = ebook_files[0]
-                            fname = f"{ab['id']}_abs.{ef['ext']}"
-                            if fname.lower() not in found_filenames:
-                                results.append(EbookResult(
-                                    name=fname,
-                                    title=ab.get('title'),
-                                    authors=ab.get('author'),
-                                    language=ab.get('language'),
-                                    source='ABS',
-                                    source_id=ab.get('id'),
-                                    subtitle=_ebook_edition_label(ab)
-                                ))
-                                found_filenames.add(fname.lower())
-                                if ab.get('title'):
-                                    found_stems.add(ab['title'].lower().strip())
-        except Exception as e:
-            logger.warning(f"⚠️ ABS ebook search failed: {e}", exc_info=True)
+    def _collect_abs():
+        if search_term:
+            try:
+                abs_client = clients.abs_client
+                if abs_client:
+                    abs_ebooks = abs_client.search_ebooks(search_term)
+                    if abs_ebooks:
+                        for ab in abs_ebooks:
+                            ebook_files = abs_client.get_ebook_files(ab['id'])
+                            if ebook_files:
+                                ef = ebook_files[0]
+                                fname = f"{ab['id']}_abs.{ef['ext']}"
+                                if fname.lower() not in found_filenames:
+                                    results.append(EbookResult(
+                                        name=fname,
+                                        title=ab.get('title'),
+                                        authors=ab.get('author'),
+                                        language=ab.get('language'),
+                                        source='ABS',
+                                        source_id=ab.get('id'),
+                                        subtitle=_ebook_edition_label(ab)
+                                    ))
+                                    found_filenames.add(fname.lower())
+                                    if ab.get('title'):
+                                        found_stems.add(ab['title'].lower().strip())
+            except Exception as e:
+                logger.warning(f"⚠️ ABS ebook search failed: {e}", exc_info=True)
 
     # 3. CWA (Calibre-Web Automated)
-    if search_term:
-        try:
-            library_service = clients.library_service
-            if library_service and library_service.cwa_client and library_service.cwa_client.is_configured():
-                cwa_results = library_service.cwa_client.search_ebooks(search_term)
-                if cwa_results:
-                    try:
-                        calibre_resolver = container.calibre_identifier_resolver()
-                    except Exception:
-                        calibre_resolver = None
-                    resolver_enabled = bool(calibre_resolver and calibre_resolver.is_enabled())
+    def _collect_cwa():
+        if search_term:
+            try:
+                library_service = clients.library_service
+                if library_service and library_service.cwa_client and library_service.cwa_client.is_configured():
+                    cwa_results = library_service.cwa_client.search_ebooks(search_term)
+                    if cwa_results:
+                        try:
+                            calibre_resolver = container.calibre_identifier_resolver()
+                        except Exception:
+                            calibre_resolver = None
+                        resolver_enabled = bool(calibre_resolver and calibre_resolver.is_enabled())
 
-                    for cr in cwa_results:
-                        fname = f"cwa_{cr.get('id', 'unknown')}.{cr.get('ext', 'epub')}"
-                        if fname.lower() not in found_filenames:
-                            cwa_id = cr.get('id')
-                            abs_identifier = None
-                            if resolver_enabled and cwa_id:
-                                try:
-                                    abs_identifier = calibre_resolver.get_abs_id(cwa_id)
-                                except Exception as e:
-                                    logger.debug(f"Calibre identifier lookup failed for {cwa_id}: {e}")
-                            results.append(EbookResult(
-                                name=fname,
-                                title=cr.get('title'),
-                                authors=cr.get('author'),
-                                language=cr.get('language'),
-                                path=cr.get('download_url'),
-                                source='CWA',
-                                source_id=cwa_id,
-                                abs_identifier=abs_identifier,
-                            ))
-                            found_filenames.add(fname.lower())
-                            if cr.get('title'):
-                                found_stems.add(cr['title'].lower().strip())
-        except Exception as e:
-            logger.warning(f"⚠️ CWA search failed: {e}", exc_info=True)
+                        for cr in cwa_results:
+                            fname = f"cwa_{cr.get('id', 'unknown')}.{cr.get('ext', 'epub')}"
+                            if fname.lower() not in found_filenames:
+                                cwa_id = cr.get('id')
+                                abs_identifier = None
+                                if resolver_enabled and cwa_id:
+                                    try:
+                                        abs_identifier = calibre_resolver.get_abs_id(cwa_id)
+                                    except Exception as e:
+                                        logger.debug(f"Calibre identifier lookup failed for {cwa_id}: {e}")
+                                results.append(EbookResult(
+                                    name=fname,
+                                    title=cr.get('title'),
+                                    authors=cr.get('author'),
+                                    language=cr.get('language'),
+                                    path=cr.get('download_url'),
+                                    source='CWA',
+                                    source_id=cwa_id,
+                                    abs_identifier=abs_identifier,
+                                ))
+                                found_filenames.add(fname.lower())
+                                if cr.get('title'):
+                                    found_stems.add(cr['title'].lower().strip())
+            except Exception as e:
+                logger.warning(f"⚠️ CWA search failed: {e}", exc_info=True)
 
-    # 4. Search filesystem (Local) - LOW PRIORITY
-    if EBOOK_DIR.exists():
-        try:
-            all_epubs = list(EBOOK_DIR.glob("**/*.epub"))
-            for eb in all_epubs:
-                fname_lower = eb.name.lower()
-                stem_lower = eb.stem.lower()
+    # 4. Search filesystem (Local) - LOW PRIORITY by default
+    def _collect_local():
+        if EBOOK_DIR.exists():
+            try:
+                all_epubs = list(EBOOK_DIR.glob("**/*.epub"))
+                for eb in all_epubs:
+                    fname_lower = eb.name.lower()
+                    stem_lower = eb.stem.lower()
 
-                # Dedupe: if already found in rich source, skip
-                if fname_lower in found_filenames or stem_lower in found_stems:
-                    continue
+                    # Dedupe: if already found in rich source, skip
+                    if fname_lower in found_filenames or stem_lower in found_stems:
+                        continue
 
-                if not search_term or search_term.lower() in fname_lower:
-                    results.append(EbookResult(name=eb.name, path=eb, source='Local File'))
-                    found_filenames.add(fname_lower)
-                    found_stems.add(stem_lower)
+                    if not search_term or search_term.lower() in fname_lower:
+                        results.append(EbookResult(name=eb.name, path=eb, source='Local File'))
+                        found_filenames.add(fname_lower)
+                        found_stems.add(stem_lower)
 
-        except Exception as e:
-            logger.warning(f"⚠️ Filesystem search failed: {e}", exc_info=True)
+            except Exception as e:
+                logger.warning(f"⚠️ Filesystem search failed: {e}", exc_info=True)
+
+    collectors = {
+        "Booklore": _collect_grimmory,
+        "BookOrbit": _collect_bookorbit,
+        "BookFusion": _collect_bookfusion,
+        "Kavita": _collect_kavita,
+        "ABS": _collect_abs,
+        "CWA": _collect_cwa,
+        "Local File": _collect_local,
+    }
+    for source_name in resolve_ebook_source_order(
+        os.environ.get('EBOOK_SOURCE_PRIORITY', ''), available=tuple(collectors)
+    ):
+        collectors[source_name]()
 
     # Check if we have no sources at all
     if (not results and not EBOOK_DIR.exists()
