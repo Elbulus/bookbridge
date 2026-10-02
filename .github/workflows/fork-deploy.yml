@@ -1,0 +1,221 @@
+name: Fork - Deploy Image
+
+# `main` mirrors upstream main, which only moves when upstream releases.
+# `deploy` is upstream main plus this fork's patches. On a schedule, on a manual
+# run and on every push to `deploy`, upstream main is merged into `deploy`, the
+# test suite runs, and only then is the merge pushed and the image published as
+# ghcr.io/elbulus/bookbridge (tags: deploy, deploy-<sha>, <version>-deploy).
+# A merge conflict or a failing test publishes nothing and opens an issue.
+#
+# Scheduled runs only fire from the default branch, so `deploy` must be the
+# default branch. Pushing a merge that touches .github/workflows/ needs more than
+# the built-in GITHUB_TOKEN: add a PAT with `repo` + `workflow` scope as the
+# SYNC_TOKEN secret, or the run fails only when upstream changed a workflow file.
+#
+# Adapted from benjitobz/bookbridge's fork-deploy.yml.
+
+on:
+  push:
+    branches: [deploy]
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Build even if deploy did not change'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: fork-deploy
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/elbulus/bookbridge
+  UPSTREAM_URL: https://github.com/cporcellijr/bookbridge.git
+
+jobs:
+  sync:
+    name: Merge upstream, test, push
+    if: github.repository == 'Elbulus/bookbridge'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+      sha: ${{ steps.decide.outputs.sha }}
+      short_sha: ${{ steps.decide.outputs.short_sha }}
+      version: ${{ steps.decide.outputs.version }}
+    steps:
+      - name: Checkout deploy
+        uses: actions/checkout@v4
+        with:
+          ref: deploy
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Merge upstream main
+        id: merge
+        run: |
+          set -eu
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch --quiet --tags upstream main
+
+          # main: hard mirror of upstream, never edited on this fork
+          git push --quiet --force origin upstream/main:refs/heads/main \
+            || echo "::warning::Could not mirror upstream main to origin/main (a SYNC_TOKEN secret is needed when upstream changed a workflow file)."
+
+          before="$(git rev-parse HEAD)"
+          if ! git merge --no-edit upstream/main; then
+            git merge --abort || true
+            echo "reason=Merging upstream main into \`deploy\` hit a conflict." >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          after="$(git rev-parse HEAD)"
+          echo "before=$before" >> "$GITHUB_OUTPUT"
+          echo "after=$after" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether to build
+        id: decide
+        env:
+          FORCE_BUILD: ${{ inputs.force_build }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_AUTHOR: ${{ github.event.head_commit.author.name }}
+          BEFORE: ${{ steps.merge.outputs.before }}
+          AFTER: ${{ steps.merge.outputs.after }}
+        run: |
+          set -eu
+          human_push=false
+          if [ "$EVENT_NAME" = push ] && [ "$HEAD_AUTHOR" != 'github-actions[bot]' ]; then
+            human_push=true
+          fi
+          build=false
+          if [ "$BEFORE" != "$AFTER" ] || [ "$FORCE_BUILD" = true ] || [ "$human_push" = true ]; then
+            build=true
+          fi
+          base="$(git describe --tags --abbrev=0 --match 'v*' upstream/main 2>/dev/null || echo v0.0.0)"
+          short="$(git rev-parse --short "$AFTER")"
+          {
+            echo "build=$build"
+            echo "sha=$AFTER"
+            echo "short_sha=$short"
+            echo "version=${base#v}"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### deploy"
+            echo
+            echo "| Upstream merged | Build | Commit | Version |"
+            echo "| --- | --- | --- | --- |"
+            echo "| $([ "$BEFORE" != "$AFTER" ] && echo yes || echo no) | $build | \`$short\` | \`${base#v}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up Python
+        if: steps.decide.outputs.build == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Run the test suite
+        id: tests
+        if: steps.decide.outputs.build == 'true'
+        run: |
+          set -eu
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq lua5.4
+          python -m pip install --quiet --upgrade pip
+          pip install --quiet 'pytest>=8,<9'
+          pip install --quiet -r requirements.txt
+          if ! pytest tests/ -q -p no:cacheprovider; then
+            echo "reason=The test suite failed on the merged \`deploy\`." >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      - name: Push the merge
+        if: steps.merge.outputs.before != steps.merge.outputs.after
+        id: push
+        run: |
+          if ! git push --quiet origin deploy; then
+            echo "reason=Pushing the merge to \`deploy\` was refused (a merge touching .github/workflows/ needs the SYNC_TOKEN secret)." >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      - name: Open an issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REASON: ${{ steps.merge.outputs.reason || steps.tests.outputs.reason || steps.push.outputs.reason || 'The deploy run failed.' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="deploy: upstream merge needs attention"
+          body="$REASON Nothing was published; the running image is unchanged.
+
+          Run: $RUN_URL
+
+          To fix locally:
+          \`\`\`
+          git fetch upstream && git checkout deploy && git merge upstream/main
+          # resolve, run the tests, then: git push origin deploy
+          \`\`\`"
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number --jq '.[0].number' 2>/dev/null || true)"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi || echo "::warning::Could not open an issue. Forks start with Issues off: Settings > General > Features > Issues."
+          {
+            echo "### Not published"
+            echo
+            echo "$REASON"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build and push
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # APP_VERSION stays the plain upstream version: the app compares it with
+      # upstream's latest release to show "update available", and keys the
+      # what's-new banner on it. The patches are identified by tag and label.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:deploy
+            ${{ env.IMAGE }}:deploy-${{ needs.sync.outputs.short_sha }}
+            ${{ env.IMAGE }}:${{ needs.sync.outputs.version }}-deploy
+          labels: |
+            org.opencontainers.image.source=https://github.com/Elbulus/bookbridge
+            org.opencontainers.image.revision=${{ needs.sync.outputs.sha }}
+            org.opencontainers.image.version=${{ needs.sync.outputs.version }}
+          cache-from: type=gha,scope=fork-deploy
+          cache-to: type=gha,mode=max,scope=fork-deploy
+          build-args: |
+            APP_VERSION=${{ needs.sync.outputs.version }}
+            INSTALL_GPU=false
