@@ -2545,15 +2545,15 @@ class BookloreClient:
             if pct is not None:
                 progress['percentage'] = float(pct) * 100.0
 
-    def update_progress(self, ebook_filename, percentage, rich_locator: Optional[LocatorResult] = None, observed: Optional[dict] = None):
+    def update_progress(self, ebook_filename, percentage, rich_locator: Optional[LocatorResult] = None):
         book = self.find_book_by_filename(ebook_filename)
         if not book:
             logger.debug(f"Grimmory: Book not found: {ebook_filename}")
             return False
 
-        return self._update_progress_for_book(book, ebook_filename, percentage, rich_locator, observed=observed)
+        return self._update_progress_for_book(book, ebook_filename, percentage, rich_locator)
 
-    def update_progress_by_book_id(self, book_id, percentage, rich_locator: Optional[LocatorResult] = None, observed: Optional[dict] = None):
+    def update_progress_by_book_id(self, book_id, percentage, rich_locator: Optional[LocatorResult] = None):
         """Write progress directly to a mapped Grimmory book id.
 
         A cached hydrated detail avoids an extra GET.  When metadata is absent we
@@ -2565,18 +2565,10 @@ class BookloreClient:
             logger.debug("Grimmory: Book id not found: %s", book_id)
             return False
         display_filename = book.get('fileName') or f"book-id:{book_id}"
-        return self._update_progress_for_book(book, display_filename, percentage, rich_locator, observed=observed)
+        return self._update_progress_for_book(book, display_filename, percentage, rich_locator)
 
-    def _update_progress_for_book(self, book, ebook_filename, percentage, rich_locator=None, observed=None):
-        """Shared write implementation after identity has already been resolved.
-
-        `observed` is an optional caller-owned dict. On a verified EPUB write it
-        receives {'pct': <fraction Grimmory now reports>}, which is NOT the value
-        we sent: Grimmory stores the percentage rounded to one decimal, so a write
-        of 24.5598% comes back as 24.6000%. Callers persist the reported value so
-        the next read sees no change; persisting what we sent instead manufactures
-        a standing delta on every write that later reads as genuine user movement.
-        """
+    def _update_progress_for_book(self, book, ebook_filename, percentage, rich_locator=None):
+        """Shared write implementation after identity has already been resolved."""
 
         safe_filename = sanitize_log_data(ebook_filename)
         book_id = book['id']
@@ -2700,7 +2692,6 @@ class BookloreClient:
 
         last_status = "No response"
         with_cfi_failed = False
-        accepted_verified_pct = None
         for variant_idx, (variant_name, payload) in enumerate(payload_variants, start=1):
             if clear_reset:
                 logger.debug(f"Grimmory: Clearing CFI for 0% reset (variant={variant_name})")
@@ -2769,11 +2760,6 @@ class BookloreClient:
                         )
                         last_status = f"verify_mismatch:{verified_pct * 100:.2f}%"
                         continue
-
-                # Verification passed: this is the value Grimmory actually holds
-                # now, rounded to its own precision. Hand it back to the caller so
-                # the persisted state matches what the next read will report.
-                accepted_verified_pct = verified_pct
 
             if fixed_cbz:
                 verified = None
@@ -2886,14 +2872,7 @@ class BookloreClient:
 
             logger.info(f"Grimmory: {safe_filename} -> {pct_display:.1f}%")
 
-            # Update cache in-place instead of full library refresh. Where the
-            # write was verified, cache what the server reported rather than what
-            # we sent, so a cache hit and a fresh GET agree — otherwise the cache
-            # reintroduces exactly the phantom delta the readback exists to remove.
-            cached_pct_display = (
-                accepted_verified_pct * 100.0 if accepted_verified_pct is not None
-                else pct_display
-            )
+            # Update cache in-place instead of full library refresh
             try:
                 with self._cache_lock:
                     cached = self._book_id_cache.get(book_id)
@@ -2901,7 +2880,7 @@ class BookloreClient:
                         if book_type == 'EPUB':
                             if not cached.get('epubProgress'):
                                 cached['epubProgress'] = {}
-                            cached['epubProgress']['percentage'] = cached_pct_display
+                            cached['epubProgress']['percentage'] = pct_display
                             if clear_reset:
                                 cached['epubProgress']['cfi'] = ""
                             elif 'cfi' in payload.get('epubProgress', {}):
@@ -2923,8 +2902,6 @@ class BookloreClient:
                     "Grimmory: disabling with_cfi retries for book_id=%s after verified no_cfi fallback success",
                     book_id,
                 )
-            if observed is not None and accepted_verified_pct is not None:
-                observed['pct'] = accepted_verified_pct
             return True
 
         logger.debug(
