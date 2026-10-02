@@ -3490,6 +3490,7 @@
                 {% else %}
                 v{{ app_version.lstrip('v') }}
                 {% endif %}
+                {% if app_build_label %}&middot; {{ app_build_label }}{% endif %}
             </span>
             {% if update_available %}
             <a href="https://github.com/cporcellijr/bookbridge/releases/latest" target="_blank" rel="noopener noreferrer"

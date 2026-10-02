@@ -57,7 +57,7 @@ from src.api.kosync_server import kosync_sync_bp, kosync_admin_bp, init_kosync_s
 from src.api.hardcover_routes import hardcover_bp, init_hardcover_routes
 from src.api.storygraph_routes import storygraph_bp, init_storygraph_routes
 from src.api.bookfusion_upload_client import extract_epub_metadata, _S3_TIMEOUT_LARGE
-from src.version import APP_VERSION, get_update_status
+from src.version import APP_BUILD_LABEL, APP_VERSION, get_update_status
 from src.db.models import State, JOB_KIND_ALIGNMENT, JOB_KIND_READALONG
 from src.sync_clients.sync_client_interface import LocatorResult, UpdateProgressRequest
 from src.services.audio_source_adapters import AudioResult, ABSAudioSourceAdapter, BookLoreAudioSourceAdapter, BookOrbitAudioSourceAdapter
@@ -1776,6 +1776,7 @@ def inject_global_vars():
         get_user_bool=get_user_bool,
         match_queue_count=match_queue_count,
         current_user=current_user(),
+        app_build_label=APP_BUILD_LABEL,
     )
 
 # ---------------- BOOK LINKER HELPERS ----------------

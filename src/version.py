@@ -55,6 +55,9 @@ def _get_commit_count():
 
 
 _raw_version = os.environ.get("APP_VERSION", "dev")
+# Display only: marks a build carrying local patches. APP_VERSION stays the
+# upstream version so the update check and what's-new banner keep working.
+APP_BUILD_LABEL = os.environ.get("APP_BUILD_LABEL", "").strip()
 if _raw_version == "dev":
     _commit_count = _get_commit_count()
     APP_VERSION = f"dev {_commit_count}" if _commit_count else "dev"
