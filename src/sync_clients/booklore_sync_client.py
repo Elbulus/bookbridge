@@ -1,3 +1,4 @@
+import inspect
 import os
 from typing import Optional
 import logging
@@ -126,6 +127,38 @@ class BookloreSyncClient(SyncClient):
         target = self.booklore_client.find_book_by_filename(epub, allow_refresh=False)
         return bool(target)
 
+    @staticmethod
+    def _chapter_progress_from_rich(rich: dict) -> Optional[float]:
+        """Grimmory's within-chapter position, as the 0-1 fraction the normalizer wants.
+
+        A Kobo sync clears the CFI and leaves only the href, and
+        `_resolve_href_to_char_offset` can take a bare href no further than the
+        START of that chapter file ('href_only') — so a device three quarters of
+        the way through a chapter lands the audiobook at its opening line.
+        Grimmory also reports how far into the current content source the device
+        is, as contentSourceProgressPercent. Handed that, the same resolver takes
+        its 'href_progression' branch and lands on the real position; and that
+        source, unlike 'href_only', is in _HIGH_CONFIDENCE_NORMALIZATION_SOURCES,
+        so a corroborated device rewind is trusted rather than held.
+
+        Grimmory reports it 0-100 while the sibling `pct` is already a fraction,
+        so the scaling happens here rather than at the API boundary, where the
+        raw field still means exactly what Grimmory says it means. 0.0 is a real
+        value (the start of a chapter), so callers must test it against None and
+        never for truthiness. The range check also rejects NaN and both
+        infinities, since neither compares inside it.
+        """
+        raw = rich.get("content_source_pct")
+        if raw is None or isinstance(raw, bool):
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if not 0.0 <= value <= 100.0:
+            return None
+        return value / 100.0
+
     def get_service_state(self, book: Book, prev_state: Optional[State], title_snip: str = "", bulk_context: dict = None) -> Optional[ServiceState]:
         # Prefer the original filename for tri-links, then fall back to the standard filename.
         epub = self._resolve_epub_filename(book)
@@ -220,6 +253,9 @@ class BookloreSyncClient(SyncClient):
                 current["service_updated_at"] = service_updated_at
             if rich.get("status"):
                 current["status"] = rich["status"]
+            chapter_progress = self._chapter_progress_from_rich(rich)
+            if chapter_progress is not None:
+                current["chapter_progress"] = chapter_progress
 
         return ServiceState(
             current=current,
@@ -308,25 +344,70 @@ class BookloreSyncClient(SyncClient):
         book_id = self._mapped_book_id(book) or self._resolve_legacy_book_id(book, epub)
         if book_id is None and callable(getattr(self.booklore_client, "find_book_by_filename_exact", None)):
             return SyncResult(None, False)
+        # Grimmory stores EPUB progress rounded to one decimal, so the position it
+        # reports back is never exactly what we sent. Persisting the sent value
+        # leaves a standing delta (24.5598% written, 24.6000% read) that the next
+        # cycle reads as a fresh change on Grimmory's side — which either re-writes
+        # the same position forever, or, once the own-write marker has expired or
+        # been lost to a restart, promotes that rounding artefact to leader and
+        # drags the audiobook position backwards. Persist what the service holds.
+        observed: dict = {}
         if book_id and hasattr(self.booklore_client, "update_progress_by_book_id"):
-            outcome = self.booklore_client.update_progress_by_book_id(book_id, pct, locator)
+            outcome = self._write_progress(
+                self.booklore_client.update_progress_by_book_id, book_id, pct, locator, observed
+            )
         else:
-            outcome = self.booklore_client.update_progress(epub, pct, locator)
+            outcome = self._write_progress(
+                self.booklore_client.update_progress, epub, pct, locator, observed
+            )
         if outcome is ProgressWriteOutcome.SKIPPED:
             current = request.current_state.current if request.current_state else {"pct": pct}
             return SyncResult(current.get("pct"), True, dict(current), skipped=True)
         success = bool(outcome)
+        stored_pct = self._reported_pct(observed, pct)
         if success:
             try:
                 from src.services.write_tracker import record_write
-                record_write('BookLore', book.abs_id, pct)
+                record_write('BookLore', book.abs_id, stored_pct)
             except ImportError:
                 pass
         updated_state = {
-            'pct': pct
+            'pct': stored_pct
         }
         if self._is_cbz_book(book) and locator and locator.page is not None:
             updated_state['page'] = locator.page
         elif locator and locator.cfi:
             updated_state['cfi'] = locator.cfi
-        return SyncResult(pct, success, updated_state)
+        return SyncResult(stored_pct, success, updated_state)
+
+    @staticmethod
+    def _write_progress(writer, target, pct, locator, observed: dict):
+        """Call a Grimmory write, asking for the post-write position when supported.
+
+        Support is decided from the signature rather than by catching TypeError:
+        a TypeError raised *inside* the write would otherwise be retried, turning
+        one failed write into two. Only a writer that names the parameter is given
+        it — a bare (*args, **kwargs) writer (a spec'd mock, a thin wrapper) would
+        accept the keyword but never fill the dict in, so there is nothing to gain.
+        Either way the caller falls back to the requested percentage."""
+        try:
+            accepts_observed = 'observed' in inspect.signature(writer).parameters
+        except (TypeError, ValueError):
+            # Unintrospectable callables (some builtins/C functions): the real
+            # clients are both introspectable and declare `observed`.
+            accepts_observed = False
+        if accepts_observed:
+            return writer(target, pct, locator, observed=observed)
+        return writer(target, pct, locator)
+
+    @staticmethod
+    def _reported_pct(observed: dict, requested):
+        """The percentage Grimmory reports after the write, else what we requested.
+
+        The write path already refuses any readback further than 0.5% from the
+        target, so a reported value is always the same position at the service's
+        own precision — never a different one."""
+        reported = observed.get('pct') if isinstance(observed, dict) else None
+        if isinstance(reported, bool) or not isinstance(reported, (int, float)):
+            return requested
+        return float(reported)

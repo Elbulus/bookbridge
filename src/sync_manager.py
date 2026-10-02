@@ -119,6 +119,12 @@ MATERIAL_ROLLBACK_SECONDS: float = 30.0
 # falling back to `pct * total_len`. `_normalize_for_cross_format_comparison`
 # records the source per client; leader selection and the deadband already refuse
 # to act on a `_normalized_ts` derived from the percentage fallback.
+# How far behind the last agreed audio position a text client's resolved
+# position must sit before it counts as a backward move. The text->audio
+# conversion loses a few seconds each way (5-7s observed on a live book), so a
+# tighter bound would call a reader who has not moved a rewinder.
+_NORMALIZED_BACKWARD_TOLERANCE_SECONDS: float = 30.0
+
 _HIGH_CONFIDENCE_NORMALIZATION_SOURCES: frozenset[str] = frozenset({
     "xpath",
     "cfi",
@@ -366,6 +372,100 @@ class SyncManager:
     def _completion_propagation_enabled(self) -> bool:
         return env_truthy('SYNC_COMPLETION_PROPAGATION')
 
+    @staticmethod
+    def _completion_min_prior() -> float:
+        """How far through the book the reader must already be known to be before
+        a 100% report is believed at once. Read per call."""
+        try:
+            value = float(os.environ.get("SYNC_COMPLETION_MIN_PRIOR", "60") or 60)
+        except (TypeError, ValueError):
+            value = 60.0
+        return max(0.0, min(value, 100.0)) / 100.0
+
+    @staticmethod
+    def _known_progress(config: dict, client_name: str):
+        """The furthest the reader is known to have got before this report: the
+        client's own previous position, or any other client's current one. A Kobo
+        that jumps straight to "finished" was often behind itself; the audio being
+        near the end is what makes the finish believable."""
+        known = []
+        state = config.get(client_name) if config else None
+        previous = getattr(state, "previous_pct", None)
+        if isinstance(previous, (int, float)) and not isinstance(previous, bool):
+            known.append(float(previous))
+        for name, other in (config or {}).items():
+            if name == client_name:
+                continue
+            current = getattr(other, "current", None)
+            pct = current.get("pct") if isinstance(current, dict) else None
+            if isinstance(pct, (int, float)) and not isinstance(pct, bool):
+                known.append(float(pct))
+        return max(known) if known else None
+
+    def _unsupported_finishes(self, config: dict, positions: dict) -> set:
+        """Clients reporting a finish that nothing else in the system supports.
+
+        A finish counts when the reader is known to be well into the book
+        (SYNC_COMPLETION_MIN_PRIOR, default 60%): another client is that far, or
+        this client itself was before it jumped. Anything else is an old "read"
+        mark or a stale end-of-book bookmark resurfacing — a book marked read
+        years ago, re-listened from the start, jumped from 18% to 99% this way and
+        marked the audiobook finished.
+
+        `positions` maps the clients that may lead to their percentage; only they
+        count as evidence. The client's own earlier position counts only while it
+        was not itself a finish, so a stale 100% cannot vouch for itself. With no
+        other client there is no better position to keep, so nothing is refused.
+        """
+        if len(positions) < 2:
+            return set()
+        min_prior = self._completion_min_prior()
+        refused = set()
+        for name, pct in positions.items():
+            if not self._is_completion_report(pct):
+                continue
+            known = [
+                float(other_pct) for other, other_pct in positions.items()
+                if other != name and isinstance(other_pct, (int, float))
+                and not isinstance(other_pct, bool)
+            ]
+            previous = getattr(config.get(name), "previous_pct", None) if config else None
+            if (isinstance(previous, (int, float)) and not isinstance(previous, bool)
+                    and not self._is_completion_report(previous)):
+                known.append(float(previous))
+            if not known or max(known) < min_prior:
+                refused.add(name)
+        return refused
+
+    def _is_believable_finish(self, config: dict, client_name: str, pct) -> bool:
+        """A completion report worth acting on at once: at or above the completion
+        threshold AND from a reader already known to be well into the book
+        (SYNC_COMPLETION_MIN_PRIOR, default 60%). A "finished" from early on never
+        gets here: `_unsupported_finishes` drops it from leader selection first."""
+        if not self._is_completion_report(pct):
+            return False
+        prior = self._known_progress(config, client_name)
+        return prior is not None and prior >= self._completion_min_prior()
+
+    def _is_completion_report(self, pct) -> bool:
+        """Whether a client's own reading is a finish rather than a position.
+
+        A Kobo that finishes a book reports 100% and puts its bookmark back on the
+        title page, ready for a re-read. Resolved as a position, that is char 0: a
+        jump from wherever the audio sits to the start of the book, which the
+        rollback guards rightly refuse. Refused, the bridge wrote the listening
+        position back to Grimmory and pulled the reader's Kobo out of the finished
+        state, for about five minutes, until the hold expired and the same report
+        led anyway (observed live). The percentage is the reader's claim; judge it
+        as one. The start-of-book write guard still stops any 0% reaching a peer.
+        """
+        if pct is None or isinstance(pct, bool):
+            return False
+        try:
+            return float(pct) >= self._completion_threshold()
+        except (TypeError, ValueError):
+            return False
+
     def _completion_threshold(self) -> float:
         try:
             value = float(os.environ.get('SYNC_COMPLETION_THRESHOLD', '99'))
@@ -570,6 +670,54 @@ class SyncManager:
         except (TypeError, ValueError):
             return 300.0
 
+    @staticmethod
+    def _backward_move(config: dict, client_name: str, leader_pct,
+                       primary_audio_client: str | None = None):
+        """Whether `client_name`'s report is a backward move, and how it was judged.
+
+        Returns `(backward, description)`, or None when there is nothing to judge.
+
+        The obvious test, the client's percentage against its previous one, is
+        only as fine as the percentage. A Kobo reports whole numbers: 45% and 45%
+        can be eight minutes of audio apart, and a reader who turns into the next
+        chapter can report 44% -> 43% while moving FORWARD, because the device's
+        figure snaps to the chapter start. Both were observed live: the first
+        slipped a stale bookmark straight through to Audiobookshelf, the second
+        held a genuine forward read for the full hold window.
+
+        So when the client's position resolved through a real locator, judge it
+        where leader selection already does, on the audio timeline, against the
+        primary audio client — which, on the paths that reach this, has not moved
+        since the bridge last wrote it and so holds the last agreed position.
+        Anything without that (an audio leader, a low-confidence resolution, a
+        book with no transcript, an unstarted audiobook) keeps the percentage test.
+        """
+        state = config.get(client_name) if config else None
+        if state is None:
+            return None
+        current = getattr(state, "current", None)
+        current = current if isinstance(current, dict) else {}
+
+        audio_state = config.get(primary_audio_client) if primary_audio_client else None
+        audio_current = getattr(audio_state, "current", None) if audio_state is not None else None
+        audio_ts = audio_current.get("ts") if isinstance(audio_current, dict) else None
+        leader_ts = current.get("_normalized_ts")
+        if (
+            client_name != primary_audio_client
+            and current.get("_normalization_source") in _HIGH_CONFIDENCE_NORMALIZATION_SOURCES
+            and isinstance(leader_ts, (int, float)) and not isinstance(leader_ts, bool)
+            and isinstance(audio_ts, (int, float)) and not isinstance(audio_ts, bool)
+        ):
+            backward = float(leader_ts) < float(audio_ts) - _NORMALIZED_BACKWARD_TOLERANCE_SECONDS
+            return backward, (
+                f"{float(audio_ts):.1f}s -> {float(leader_ts):.1f}s on the audio timeline"
+            )
+
+        previous_pct = getattr(state, "previous_pct", None)
+        if previous_pct is None or leader_pct is None:
+            return None
+        return leader_pct < previous_pct - 1e-9, f"{previous_pct:.4%} -> {leader_pct:.4%}"
+
     def _should_hold_backward_leader(
         self, abs_id: str, title_snip: str, config: dict, client_name: str,
         leader_pct, echo_clients=None, primary_audio_client: str | None = None,
@@ -604,11 +752,13 @@ class SyncManager:
 
         if not self._trust_corroborated_rewind_enabled():
             return False
-        state = config.get(client_name) if config else None
-        previous_pct = getattr(state, "previous_pct", None)
-        if previous_pct is None or leader_pct is None:
+        if self._is_believable_finish(config, client_name, leader_pct):
+            return False                      # a finish, not a rewind
+        verdict = self._backward_move(config, client_name, leader_pct, primary_audio_client)
+        if verdict is None:
             return False
-        if leader_pct >= previous_pct - 1e-9:
+        backward, movement = verdict
+        if not backward:
             return False                      # not a backward move
         if len(config) < 2:
             return False                      # nobody to protect the position from
@@ -630,14 +780,14 @@ class SyncManager:
         if age > window:
             logger.info(
                 f"⌛ '{abs_id}' '{title_snip}' Accepting '{client_name}' backward move "
-                f"{previous_pct:.4%} -> {leader_pct:.4%}: uncorroborated but quiet for "
+                f"{movement}: uncorroborated but quiet for "
                 f"{age:.0f}s (> {window:.0f}s) — treating it as where the reader meant to be"
             )
             return False
 
         logger.info(
             f"⏳ '{abs_id}' '{title_snip}' Holding '{client_name}' backward move "
-            f"{previous_pct:.4%} -> {leader_pct:.4%} for up to {window - age:.0f}s more: "
+            f"{movement} for up to {window - age:.0f}s more: "
             f"{evidence} — not propagating it and not overwriting it until it is "
             f"corroborated or goes quiet"
         )
@@ -997,6 +1147,51 @@ class SyncManager:
             period_mins = 5.0
         window = period_mins * 120.0 + 60.0
         return int(max(600.0, min(window, 3600.0)))
+
+    @staticmethod
+    def _audio_echo_tolerance_seconds() -> float:
+        """How close, in seconds, an audio position must be to BookBridge's own
+        write to count as that write coming back. Read per call so the setting
+        applies without a restart."""
+        try:
+            value = float(os.environ.get("SYNC_AUDIO_ECHO_TOLERANCE_SECONDS", "10") or 10)
+        except (TypeError, ValueError):
+            return 10.0
+        return value if value > 0 else 10.0
+
+    def _audio_echo_margin(self, state, book, fallback: float) -> float:
+        """The own-write echo margin for the primary audio client, as a fraction.
+
+        The shared margin is the cross-client sync threshold, 0.5% of the book.
+        On an audiobook that is minutes, not rounding: 6 min 15 s on a 21-hour
+        title. Audiobookshelf stores the timestamp it is sent, so a genuine echo of
+        our write comes back to the second, and anything wider mistakes real
+        listening for that echo. Observed live: a Kobo sync wrote ABS at the start
+        of a chapter, the reader then listened for five minutes, and every report
+        in that time was discarded as our own write while the Kobo's position led
+        and pulled ABS back to the chapter start, re-arming the marker each cycle.
+        It let go at 0.51%. The echo marker lives only in memory, which is also why
+        restarting BookBridge used to "fix" a stuck sync.
+
+        Scaled by the audio client's own ts/pct, so it is in exactly the units the
+        marker was recorded in; the book's duration is the fallback. Never wider
+        than `fallback`, so this can only narrow what counts as an echo.
+        """
+        seconds = self._audio_echo_tolerance_seconds()
+        current = getattr(state, "current", None)
+        current = current if isinstance(current, dict) else {}
+        ts, pct = current.get("ts"), current.get("pct")
+        duration = None
+        if (isinstance(ts, (int, float)) and not isinstance(ts, bool)
+                and isinstance(pct, (int, float)) and not isinstance(pct, bool) and pct > 0):
+            duration = float(ts) / float(pct)
+        if not duration or duration <= 0:
+            book_duration = getattr(book, "duration", None) or getattr(book, "audio_duration", None)
+            if isinstance(book_duration, (int, float)) and not isinstance(book_duration, bool):
+                duration = float(book_duration)
+        if not duration or duration <= 0:
+            return fallback
+        return min(fallback, seconds / duration)
 
     def _peer_position_is_own_writeback(
         self, abs_id: str, client_name: str, observed_pct: float, margin: float,
@@ -3692,10 +3887,18 @@ class SyncManager:
             except (TypeError, ValueError):
                 cooldown_mins = 60
 
+            # A finish leader selection would ignore must not post one here either.
+            refused = self._unsupported_finishes(config, {
+                name: cfg.current.get('pct')
+                for name, cfg in config.items()
+                if cfg and cfg.current.get('pct') is not None
+                and callable(getattr(self.sync_clients.get(name), 'can_be_leader', None))
+                and self.sync_clients[name].can_be_leader()
+            })
             pcts = [
                 cfg.current.get('pct')
-                for cfg in config.values()
-                if cfg and cfg.current.get('pct') is not None
+                for name, cfg in config.items()
+                if cfg and cfg.current.get('pct') is not None and name not in refused
             ]
             if not pcts:
                 return
@@ -3796,6 +3999,20 @@ class SyncManager:
         primary_audio_client = self._get_primary_audio_client_name(book)
         clients_with_delta = {k: v for k, v in vals.items() if self._has_significant_delta(k, config, book)}
 
+        # A "finished" that nothing else supports may not lead, nor sit in the
+        # running as the furthest position or the newer peer that vetoes the real
+        # one. Removed before any guard reads `vals`; the client stays a follower,
+        # so whoever leads writes the reader's real position back over it.
+        for client_name in sorted(self._unsupported_finishes(config, vals)):
+            logger.info(
+                f"🚫 '{abs_id}' '{title_snip}' Ignoring '{client_name}' at "
+                f"{vals[client_name]:.1%}: a finish, but nothing else puts the reader past "
+                f"{self._completion_min_prior():.0%} of the book — an old 'read' mark or a "
+                f"stale bookmark, not reading"
+            )
+            vals.pop(client_name, None)
+            clients_with_delta.pop(client_name, None)
+
         # Suppress raw pct delta when locator-derived position shows no movement from previous state.
         for client_name in list(clients_with_delta.keys()):
             state = config[client_name]
@@ -3892,10 +4109,14 @@ class SyncManager:
             # of how close the two percentages land.
             echo_margin = getattr(self, "sync_delta_between_clients", 0.005)
             for client_name, observed_pct in vals.items():
-                client_echo_margin = (
-                    1e-9 if self._has_fixed_page_delta(client_name, config[client_name], book)
-                    else echo_margin
-                )
+                if self._has_fixed_page_delta(client_name, config[client_name], book):
+                    client_echo_margin = 1e-9
+                elif client_name == primary_audio_client:
+                    client_echo_margin = self._audio_echo_margin(
+                        config[client_name], book, echo_margin
+                    )
+                else:
+                    client_echo_margin = echo_margin
                 if self._peer_position_is_own_writeback(
                     abs_id, client_name, observed_pct, client_echo_margin,
                     observed_marker=config[client_name].current.get('_position_marker'),
@@ -4009,6 +4230,14 @@ class SyncManager:
 
                     material_rollback = changed_ts < (max_other_ts - MATERIAL_ROLLBACK_SECONDS)
                     mismatch_not_ahead = has_locator_mismatch and changed_ts <= (max_other_ts + NORMALIZED_LEAD_EPSILON_SECONDS)
+                    if (material_rollback or mismatch_not_ahead) and self._is_believable_finish(
+                            config, changed_client, changed_raw_pct):
+                        logger.info(
+                            f"🏁 '{abs_id}' '{title_snip}' '{changed_client}' reports "
+                            f"{changed_raw_pct:.1%}: a finish, not a rewind to "
+                            f"{changed_ts:.1f}s — keeping it as leader"
+                        )
+                        material_rollback = mismatch_not_ahead = False
                     if material_rollback or mismatch_not_ahead:
                         # A deliberate rewind is indistinguishable from a stale read in
                         # a single sample, so this guard demotes both and furthest-wins
@@ -4103,13 +4332,32 @@ class SyncManager:
                     name: pct for name, pct in candidates.items() if name not in echo_clients
                 }
                 if genuine_candidates:
-                    if len(genuine_candidates) != len(candidates):
+                    echo_excluded = len(genuine_candidates) != len(candidates)
+                    if echo_excluded:
                         excluded = sorted(set(candidates) - set(genuine_candidates))
                         logger.info(
                             f"🪞 '{abs_id}' '{title_snip}' Excluding own write-back "
                             f"candidate(s) {excluded} from leader selection"
                         )
                     candidates = genuine_candidates
+                    # Dropping our own write-back can leave one client standing,
+                    # which makes this the single-mover case in all but name — and
+                    # furthest-wins then crowns it without the backward check the
+                    # single-mover branch applies. A stale Kobo bookmark reached
+                    # Audiobookshelf eight minutes behind exactly this way.
+                    if echo_excluded and len(candidates) == 1:
+                        (sole_name, sole_pct), = candidates.items()
+                        try:
+                            if self._should_hold_backward_leader(
+                                abs_id, title_snip, config, sole_name, sole_pct,
+                                echo_clients, primary_audio_client,
+                            ):
+                                return None, None
+                        except Exception as hold_err:
+                            logger.debug(
+                                f"'{abs_id}' Backward-leader hold check failed: {hold_err}",
+                                exc_info=True,
+                            )
                 else:
                     logger.info(
                         f"🪞 '{abs_id}' '{title_snip}' No leader: every candidate holds "
