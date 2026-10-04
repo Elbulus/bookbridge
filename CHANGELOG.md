@@ -51,6 +51,12 @@ All notable changes to BookBridge will be documented in this file.
 
 ### Fixed
 
+- **Forced alignment no longer stalls on noisy FFmpeg decode errors (#467).**
+  QuartzNet streams audio while capturing decoder errors in a temporary file,
+  preventing a full stderr pipe from blocking the job. Decode failures retain
+  their error details. After updating and restarting, retry affected jobs;
+  existing reading progress needs no repair.
+
 - **CWA Kobo sync finds books whose audiobook title differs from Calibre's
   (#462).** A CWA book could be skipped every cycle with "Could not unambiguously
   resolve … to a single book" when its audiobook title carried a subtitle,
