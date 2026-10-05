@@ -4,24 +4,25 @@
 
 All notable changes to BookBridge will be documented in this file.
 
-## [Unreleased]
+## [7.9.0] - 2026-10-05
 
 ### Added
 
-- **Books you start reading in BookOrbit get matched automatically.** Turn it on
-  in Settings → BookOrbit. Once you're past 1% of an ebook the bridge hasn't
-  matched, it looks for the audiobook: a match lands in Suggestions for you to
-  confirm, and a book with no audiobook is added as ebook-only so its progress
-  syncs.
+- **Books you start reading in BookOrbit get matched automatically.** Turn on
+  **Auto-match books you start reading in BookOrbit** on the BookOrbit card
+  (Settings → Integrations; off by default). Once you're past 1% of an ebook the
+  bridge hasn't matched, it looks for the audiobook: a match lands in Suggestions
+  for you to confirm, and a book with no audiobook is added as ebook-only so its
+  progress syncs.
 
 - **Show each series as the book you're reading (#449).** With **Show each series as
-  the book you're reading** on (Settings → Series Display, off by default), a series
-  on the Library is one card: the full card of the book you are on — the one in
-  progress, or the next unread one — with the series name and author, how many are
-  finished and the other books listed along its bottom. Click that strip to open the
-  rest of the series below it. While the series is closed, the card leaves out its
-  per-service progress; it comes back when you open the series. Finished series keep
-  their usual card.
+  the book you're reading** on (Settings → Features → Series Display, off by
+  default), a series on the Library is one card: the full card of the book you are
+  on — the one in progress, or the next unread one — with the series name and
+  author, how many are finished and the other books listed along its bottom. Click
+  that strip to open the rest of the series below it. The card keeps that book's
+  per-service progress while the series is closed. Finished series keep their usual
+  card.
 
 ### Changed
 
@@ -41,9 +42,6 @@ All notable changes to BookBridge will be documented in this file.
   StoryGraph. Books without a page count continue to sync by percentage. EPUB
   and audiobook positions do not identify an exact print page.
 
-- **Collapsed series cards keep their per-service progress visible.** The lead
-  book's progress grid stays on the card while its series is closed.
-
 - **Library cards pack together instead of lining up in rows.** Each card keeps its
   own height and the next one sits directly under it, so short cards no longer stretch
   to match a tall neighbour and no gaps open up below them. Opening a series, or a
@@ -52,14 +50,13 @@ All notable changes to BookBridge will be documented in this file.
 ### Fixed
 
 - **Hardcover and StoryGraph are no longer called every sync cycle for books they
-  can't update (#468).** When a tracker couldn't take a post (for
-  example, a book with no Hardcover match), BookBridge retried every few minutes,
-  even with nothing being read. One unmatched book could use hundreds of
-  Hardcover API requests a night. Failed posts now retry after 15 minutes, then
-  wait twice as long each time, up to every 6 hours. New reading progress still
-  gets posted after the usual cooldown. Hardcover also re-detects a re-read of a
-  finished book again: starting the book over now opens a new read once you're
-  2% further in.
+  can't update (#468).** When a tracker couldn't take a post (for example, a book
+  with no Hardcover match), BookBridge retried on every sync cycle, even with
+  nothing being read. One unmatched book could use hundreds of Hardcover API
+  requests a night. Failed posts now retry after 15 minutes, then wait twice as
+  long each time, up to every 6 hours. New reading progress still gets posted
+  after the usual cooldown. Hardcover also detects a re-read of a finished book
+  again: starting the book over opens a new read once you're 2% further in.
 
 - **Forced alignment no longer stalls on noisy FFmpeg decode errors (#467).**
   QuartzNet streams audio while capturing decoder errors in a temporary file,
@@ -102,8 +99,7 @@ All notable changes to BookBridge will be documented in this file.
 - **CTC alignment can use Audiobookshelf audio (#455).** When forced alignment is
   enabled, BookBridge now caches ABS tracks locally so CTC can read them. A failed
   track download still leaves the stream available for transcription, and download
-  logs no longer expose the stream token. The 7.8.0 `:latest` image does not ship
-  QuartzNet; that backend requires a newer `:dev` image or release.
+  logs no longer expose the stream token.
 
 - **BridgeSync book downloads no longer time out on network-mounted libraries
   (#454).** Books whose ebook the bridge fetched from Audiobookshelf were looked

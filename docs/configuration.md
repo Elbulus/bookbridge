@@ -321,6 +321,12 @@ Optional "Up Next" collection watch — drop a book onto a collection in BookOrb
 | Match Threshold | `BOOKORBIT_SHELF_WATCH_THRESHOLD` | `95` | Minimum match confidence (60–100) before a book is auto-linked. |
 | Rescan Interval (Hours) | `BOOKORBIT_SHELF_WATCH_RESCAN_HOURS` | `24` | How often a still-unmatched book on the watch collection is retried. |
 
+Optional matching of books you start reading — under **Books You Start Reading** on the BookOrbit card:
+
+| Setting | Env Var | Default | Notes |
+| --- | --- | --- | --- |
+| Auto-match books you start reading in BookOrbit | `BOOKORBIT_READING_WATCH_ENABLED` | `false` | Once you are past 1% of a BookOrbit ebook that BookBridge has not matched, it looks for the audiobook. A match is added to **Suggestions** for you to confirm; a book with no audiobook becomes an ebook-only mapping so its progress syncs. A suggestion you dismiss is not offered again. |
+
 BookOrbit notes:
 
 - BookOrbit is available across Add / Update Book, the match queue, Suggestions, and the dashboard. Pick it as the ebook source, the audio source, or both when you create a mapping.
@@ -412,6 +418,7 @@ Hardcover provides modern reading tracking with a beautiful UI. BookBridge can p
 | --- | --- | --- | --- |
 | Enable | `HARDCOVER_ENABLED` | `false` | Turns on Hardcover updates. |
 | API Token | `HARDCOVER_TOKEN` | empty | Per-reader personal API token from Hardcover. |
+| Update Cooldown (minutes) | `HARDCOVER_UPDATE_COOLDOWN_MINS` | `60` | Global. Minutes of no new progress before a book's position is posted; new progress restarts the wait. Finishing a book posts at once. `0` posts on every sync cycle. |
 | Highlight Sync | `HARDCOVER_ANNOTATION_SYNC` | `false` | Per-reader. Pushes supported KOReader highlights to Hardcover. |
 | Highlight Sync Interval | `HARDCOVER_ANNOTATION_SYNC_MINUTES` | `30` | Minutes between background Hardcover annotation relay cycles. |
 | Grimmory Shelves to Hardcover Lists | `HARDCOVER_GRIMMORY_LIST_SYNC` | `off` | Per-reader. `off`, `all`, `magic`, or `shelf`. |
@@ -435,6 +442,7 @@ StoryGraph is a popular alternative to Goodreads that focuses on reading data an
 | Enable | `STORYGRAPH_ENABLED` | `false` | Turns on StoryGraph updates. |
 | Session Cookie | `STORYGRAPH_SESSION_COOKIE` | empty | `_storygraph_session` cookie value. |
 | Remember User Token | `STORYGRAPH_REMEMBER_USER_TOKEN` | empty | `remember_user_token` cookie value. |
+| Update Cooldown (minutes) | `STORYGRAPH_UPDATE_COOLDOWN_MINS` | `60` | Global. Minutes of no new progress before a book's position is posted; new progress restarts the wait. Finishing a book posts at once. `0` posts on every sync cycle. |
 
 StoryGraph notes:
 
@@ -454,6 +462,12 @@ Hardcover and StoryGraph are independent - enable either or both on their cards 
 token/cookies, under **Account -> My Integrations**. Admins can also manage those values under
 **Settings -> Users -> Integrations**.
 
+When a tracker cannot take a book's update — most often because the book has no match
+there, but also when the edition has no page count, the book is missing from the account, or
+the service is down — BookBridge retries after 15 minutes, then waits twice as long each
+time, up to every 6 hours. New reading progress gets a fresh attempt once its cooldown has
+passed. See [troubleshooting](troubleshooting.md#hardcover-or-storygraph-gets-many-requests-or-a-book-never-updates-there).
+
 #### Telegram Notifications
 
 Found under **Settings -> Features**.
@@ -472,6 +486,14 @@ Found under **Settings -> Features**.
 | Setting | Env Var | Default | Notes |
 | --- | --- | --- | --- |
 | Shelfmark URL | `SHELFMARK_URL` | empty | Adds the Shelfmark shortcut when configured. |
+
+#### Series Display
+
+Found under **Settings -> Features**.
+
+| Setting | Env Var | Default | Notes |
+| --- | --- | --- | --- |
+| Show each series as the book you're reading | `SERIES_SHOW_CURRENT_BOOK_DETAIL` | `false` | Each series on the Library becomes the full card of the book you are on (in progress, or the next unread one), with the series name, how many are finished and the other books listed along its bottom. Click that strip to open the rest of the series. Finished series keep their usual card. When off, a closed series shows each book as a compact row. |
 
 #### AI / LLM Providers (Optional)
 
