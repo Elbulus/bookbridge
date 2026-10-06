@@ -256,7 +256,7 @@ Optional matching of books you start reading — under **Books You Start Reading
 
 | Setting | Env Var | Default | Notes |
 | --- | --- | --- | --- |
-| Auto-match books you start reading in Grimmory | `BOOKLORE_READING_WATCH_ENABLED` | `false` | Once you are past 1% of a Grimmory EPUB or PDF that BookBridge has not matched (including one read on a Kobo, once the Kobo syncs), it looks for the audiobook. A match is added to **Suggestions** for you to confirm; a book with no audiobook becomes an ebook-only mapping so its progress syncs. A suggestion you dismiss is not offered again. Uses Grimmory's Continue Reading list; a Grimmory without it is skipped. |
+| Auto-match books you start reading in Grimmory | `BOOKLORE_READING_WATCH_ENABLED` | `false` | Once you are past 1% of a Grimmory EPUB or PDF that BookBridge has not matched (including one read on a Kobo, once the Kobo syncs), it looks for the audiobook. A match is added to **Suggestions** for you to confirm; a book with no audiobook becomes an ebook-only mapping so its progress syncs. A suggestion you dismiss is not offered again. Uses Grimmory's Continue Reading list, or for a Grimmory admin account (which that list leaves empty) or an older Grimmory, the books marked Reading in the full book list, read at most every 30 minutes. |
 
 Grimmory notes:
 

@@ -3567,18 +3567,26 @@ class BookloreClient:
 
     # Ebook formats the reading-watch pass will route; comics and audiobooks are left alone.
     _READING_WATCH_FILE_TYPES = frozenset({"EPUB", "PDF"})
+    _READING_WATCH_STATUSES = frozenset({"READING", "RE_READING"})
+    # The library fallback reads the whole book list, so it runs at most this often.
+    _READING_WATCH_LIBRARY_SCAN_SECONDS = 30 * 60
 
     def list_continue_reading_books(self, min_progress: float = 0.0, limit: int = 50) -> list:
-        """List this user's in-progress ebooks via Grimmory's Continue Reading list.
+        """List this user's in-progress ebooks, most recently read first.
 
-        ``GET /api/v1/app/books/continue-reading`` returns the user's books whose
-        read status is READING or RE_READING, most recently read first. A Kobo
-        sync marks a book READING once it passes the Kobo "reading" threshold
-        (1% by default), so books started on the Kobo appear here too.
-        ``readProgress`` is percent (0-100), taken from KOReader, Kobo, the web
-        reader or PDF progress in that order. Entries below *min_progress*
+        Asks Grimmory's Continue Reading list (``GET /api/v1/app/books/continue-reading``):
+        the user's READING / RE_READING books. A Kobo sync marks a book READING
+        once it passes the Kobo "reading" threshold (1% by default), so books
+        started on the Kobo appear too. That endpoint returns nothing for a
+        Grimmory admin (it filters on the admin's library list, which is null for
+        "all libraries"), and a Grimmory without it answers 404; either way the
+        same list is built from the full book list instead (see
+        ``_continue_reading_from_library``).
+
+        Progress is percent (0-100), taken from KOReader, Kobo, the web reader or
+        PDF progress in that order, as Grimmory does. Entries below *min_progress*
         (percent), without a file name, or whose primary file is not an EPUB or
-        PDF are dropped. An older Grimmory without this endpoint returns [].
+        PDF are dropped.
 
         Returns dicts shaped like BookOrbit's for ShelfWatchService's
         reading-watch pass: ``{id, title, author, fileName, progress}``.
@@ -3587,6 +3595,12 @@ class BookloreClient:
             min_progress = float(min_progress or 0.0)
         except (TypeError, ValueError):
             min_progress = 0.0
+        books = self._continue_reading_from_endpoint(limit)
+        if not books:
+            books = self._continue_reading_from_library(limit)
+        return [b for b in books if b["progress"] >= min_progress]
+
+    def _continue_reading_from_endpoint(self, limit: int) -> list:
         response = self._make_request("GET", f"/api/v1/app/books/continue-reading?limit={int(limit)}")
         if response is None or response.status_code != 200:
             if response is not None and response.status_code == 404:
@@ -3602,26 +3616,93 @@ class BookloreClient:
         for raw in data if isinstance(data, list) else []:
             if not isinstance(raw, dict):
                 continue
-            book_id = raw.get("id")
-            filename = (raw.get("primaryFileName") or "").strip()
-            file_type = str(raw.get("primaryFileType") or "").upper()
-            if book_id is None or not filename or file_type not in self._READING_WATCH_FILE_TYPES:
-                continue
-            try:
-                progress = float(raw.get("readProgress") or 0.0)
-            except (TypeError, ValueError):
-                progress = 0.0
-            if progress < min_progress:
-                continue
-            authors = raw.get("authors")
-            out.append({
-                "id": book_id,
-                "title": (raw.get("title") or "").strip(),
-                "author": ", ".join(str(a) for a in authors if a) if isinstance(authors, list) else str(authors or "").strip(),
-                "fileName": filename,
-                "progress": progress,
-            })
+            entry = self._reading_watch_entry(
+                raw.get("id"), raw.get("title"), raw.get("authors"),
+                raw.get("primaryFileName"), raw.get("primaryFileType"), raw.get("readProgress"),
+            )
+            if entry:
+                out.append(entry)
         return out
+
+    def _continue_reading_from_library(self, limit: int) -> list:
+        """The Continue Reading list rebuilt from ``GET /api/v1/books``, which
+        carries the user's own readStatus, lastReadTime and progress per book.
+        That list is the whole library, so it is re-read at most every
+        ``_READING_WATCH_LIBRARY_SCAN_SECONDS``; in between the last result is
+        reused."""
+        cached = getattr(self, "_reading_watch_library_cache", None)
+        now = time.time()
+        if cached is not None and now - cached[0] < self._READING_WATCH_LIBRARY_SCAN_SECONDS:
+            return list(cached[1])[:int(limit)]
+        response = self._make_request("GET", "/api/v1/books")
+        if response is None or response.status_code != 200:
+            logger.warning(
+                "Grimmory: Could not fetch books for the reading watch status=%s",
+                response.status_code if response is not None else "no-response",
+            )
+            return []
+        data = self._parse_json_response(response, "Grimmory books for the reading watch")
+        if isinstance(data, dict):
+            data = data.get("content") or data.get("books") or []
+        reading = []
+        for raw in data if isinstance(data, list) else []:
+            if not isinstance(raw, dict):
+                continue
+            if str(raw.get("readStatus") or "").upper() not in self._READING_WATCH_STATUSES:
+                continue
+            last_read = raw.get("lastReadTime")
+            if not last_read:
+                continue
+            primary = raw.get("primaryFile") or {}
+            metadata = raw.get("metadata") or {}
+            progress = next(
+                (p.get("percentage") for p in (
+                    raw.get("koreaderProgress"), raw.get("koboProgress"),
+                    raw.get("epubProgress"), raw.get("pdfProgress"),
+                ) if isinstance(p, dict) and p.get("percentage") is not None),
+                None,
+            )
+            entry = self._reading_watch_entry(
+                raw.get("id"), metadata.get("title") or raw.get("title"), metadata.get("authors"),
+                primary.get("fileName"), primary.get("bookType"), progress,
+            )
+            if entry:
+                reading.append((self._instant_seconds(last_read), entry))
+        reading.sort(key=lambda item: item[0], reverse=True)
+        books = [entry for _, entry in reading]
+        self._reading_watch_library_cache = (now, books)
+        return books[:int(limit)]
+
+    @staticmethod
+    def _instant_seconds(value) -> float:
+        """Epoch seconds for a Grimmory Instant (ISO string or number); 0 if unreadable."""
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _reading_watch_entry(self, book_id, title, authors, file_name, file_type, progress):
+        """One reading-watch record, or None for a book the pass should not route."""
+        file_name = (file_name or "").strip()
+        if book_id is None or not file_name or str(file_type or "").upper() not in self._READING_WATCH_FILE_TYPES:
+            return None
+        try:
+            progress = float(progress or 0.0)
+        except (TypeError, ValueError):
+            progress = 0.0
+        if isinstance(authors, list):
+            author = ", ".join(str(a) for a in authors if a)
+        else:
+            author = str(authors or "").strip()
+        return {
+            "id": book_id,
+            "title": (title or "").strip(),
+            "author": author,
+            "fileName": file_name,
+            "progress": progress,
+        }
 
     def list_books_on_shelf(self, shelf_name):
         """Return the list of Grimmory book dicts currently on the named shelf.
