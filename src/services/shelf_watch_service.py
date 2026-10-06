@@ -138,8 +138,9 @@ class ShelfWatchService:
         return str(raw).strip().lower() in ('true', '1', 'yes', 'on')
 
     def _reading_watch_enabled(self) -> bool:
-        # Reading-watch only exists for BookOrbit's Continue Reading scroller.
-        if self._source_name != 'BookOrbit':
+        # Reading-watch needs a "continue reading" list: BookOrbit's scroller or
+        # Grimmory's app endpoint (source name 'BookLore', settings prefix BOOKLORE).
+        if self._source_name not in ('BookOrbit', 'BookLore'):
             return False
         raw = os.environ.get(f'{self._env_prefix}_READING_WATCH_ENABLED', 'false')
         return str(raw).strip().lower() in ('true', '1', 'yes', 'on')
@@ -241,7 +242,7 @@ class ShelfWatchService:
     def process_watch_shelf(self, user_id: int = None) -> dict:
         """Run a shelf scan with the requested user's clients and context.
 
-        Also runs the BookOrbit reading-watch pass (Continue Reading
+        Also runs the reading-watch pass (BookOrbit / Grimmory Continue Reading
         auto-match) right after the shelf-watch pass, in the same user
         binding. A reading-watch failure never breaks the shelf-watch
         result — this method's return value is always the shelf-watch
@@ -551,10 +552,10 @@ class ShelfWatchService:
         logger.info(f"Shelf-watch: created ebook-only mapping for '{filename}' (abs_id={saved.abs_id})")
         self._move_shelf(filename, watch_shelf, kobo_shelf, client=active_client)
 
-    # ---- reading-watch (BookOrbit "Continue Reading" auto-match) --------
+    # ---- reading-watch ("Continue Reading" auto-match: BookOrbit, Grimmory) --
 
     def _process_reading_watch(self, user_id: int = None, active_client=None) -> dict:
-        """Scan BookOrbit's Continue Reading list and route each unmapped book.
+        """Scan the library's Continue Reading list and route each unmapped book.
 
         Runs after the shelf-watch pass, in the same user binding. Any
         audiobook match found ALWAYS becomes a PendingSuggestion — never an

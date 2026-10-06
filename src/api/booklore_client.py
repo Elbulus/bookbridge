@@ -3565,6 +3565,64 @@ class BookloreClient:
             logger.error(f"Failed to ensure Grimmory shelf '{shelf_name}' exists: {e}", exc_info=True)
             return None
 
+    # Ebook formats the reading-watch pass will route; comics and audiobooks are left alone.
+    _READING_WATCH_FILE_TYPES = frozenset({"EPUB", "PDF"})
+
+    def list_continue_reading_books(self, min_progress: float = 0.0, limit: int = 50) -> list:
+        """List this user's in-progress ebooks via Grimmory's Continue Reading list.
+
+        ``GET /api/v1/app/books/continue-reading`` returns the user's books whose
+        read status is READING or RE_READING, most recently read first. A Kobo
+        sync marks a book READING once it passes the Kobo "reading" threshold
+        (1% by default), so books started on the Kobo appear here too.
+        ``readProgress`` is percent (0-100), taken from KOReader, Kobo, the web
+        reader or PDF progress in that order. Entries below *min_progress*
+        (percent), without a file name, or whose primary file is not an EPUB or
+        PDF are dropped. An older Grimmory without this endpoint returns [].
+
+        Returns dicts shaped like BookOrbit's for ShelfWatchService's
+        reading-watch pass: ``{id, title, author, fileName, progress}``.
+        """
+        try:
+            min_progress = float(min_progress or 0.0)
+        except (TypeError, ValueError):
+            min_progress = 0.0
+        response = self._make_request("GET", f"/api/v1/app/books/continue-reading?limit={int(limit)}")
+        if response is None or response.status_code != 200:
+            if response is not None and response.status_code == 404:
+                logger.debug("Grimmory: continue-reading endpoint not available on this server")
+            else:
+                logger.warning(
+                    "Grimmory: Could not fetch continue-reading books status=%s",
+                    response.status_code if response is not None else "no-response",
+                )
+            return []
+        data = self._parse_json_response(response, "Grimmory continue-reading")
+        out = []
+        for raw in data if isinstance(data, list) else []:
+            if not isinstance(raw, dict):
+                continue
+            book_id = raw.get("id")
+            filename = (raw.get("primaryFileName") or "").strip()
+            file_type = str(raw.get("primaryFileType") or "").upper()
+            if book_id is None or not filename or file_type not in self._READING_WATCH_FILE_TYPES:
+                continue
+            try:
+                progress = float(raw.get("readProgress") or 0.0)
+            except (TypeError, ValueError):
+                progress = 0.0
+            if progress < min_progress:
+                continue
+            authors = raw.get("authors")
+            out.append({
+                "id": book_id,
+                "title": (raw.get("title") or "").strip(),
+                "author": ", ".join(str(a) for a in authors if a) if isinstance(authors, list) else str(authors or "").strip(),
+                "fileName": filename,
+                "progress": progress,
+            })
+        return out
+
     def list_books_on_shelf(self, shelf_name):
         """Return the list of Grimmory book dicts currently on the named shelf.
 

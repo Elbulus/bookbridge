@@ -204,17 +204,18 @@ class TestReadingWatchGating(unittest.TestCase):
             'skipped_existing': 0, 'skipped_throttled': 0, 'errors': 0,
         })
 
-    def test_non_bookorbit_source_never_runs_reading_pass(self):
-        """A BookLore-parameterized service must not run the reading pass even
-        if a same-shaped BOOKLORE_READING_WATCH_ENABLED were set — reading-watch
-        is BookOrbit-only regardless of env."""
+    def test_source_without_a_reading_list_never_runs_reading_pass(self):
+        """A Kavita-parameterized service must not run the reading pass even
+        if a same-shaped KAVITA_READING_WATCH_ENABLED were set — reading-watch
+        exists only for BookOrbit and Grimmory, which have a Continue Reading
+        list (Grimmory's is covered in test_grimmory_reading_watch.py)."""
         svc, client, _db, _bms, _ss = _build_service(
             suggestions_result=None, reading_books=[],
-            source_name='BookLore', env_prefix='BOOKLORE',
+            source_name='Kavita', env_prefix='KAVITA',
         )
         with patch.dict(os.environ, {
-            "BOOKLORE_SHELF_WATCH_ENABLED": "false",
-            "BOOKLORE_READING_WATCH_ENABLED": "true",
+            "KAVITA_SHELF_WATCH_ENABLED": "false",
+            "KAVITA_READING_WATCH_ENABLED": "true",
         }, clear=False):
             svc.process_watch_shelf()
         client.list_continue_reading_books.assert_not_called()
