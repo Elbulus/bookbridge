@@ -11,6 +11,9 @@ WORKDIR /app
 
 ARG APP_VERSION=dev
 ENV APP_VERSION=${APP_VERSION}
+# Shown beside the version for builds carrying local patches (e.g. "patched abc1234").
+ARG APP_BUILD_LABEL=
+ENV APP_BUILD_LABEL=${APP_BUILD_LABEL}
 
 # 1. Install System Dependencies
 # FFmpeg with full codec support for audio conversion
