@@ -252,6 +252,12 @@ Grimmory is a supported ebook and audiobook source. You can use it for ebook syn
 | Grimmory Audiobook Poll Interval (seconds) | `BOOKLORE_AUDIO_POLL_SECONDS` | `300` | Used when the audiobook poll mode is `custom`. |
 | Wait for Position to Settle (audiobooks) | `BOOKLORE_AUDIO_POLL_WAIT_FOR_SETTLE` | `false` | Recommended while listening: holds the sync until playback pauses or stops, instead of writing on every poll. |
 
+Optional matching of books you start reading — under **Books You Start Reading** on the Grimmory card:
+
+| Setting | Env Var | Default | Notes |
+| --- | --- | --- | --- |
+| Auto-match books you start reading in Grimmory | `BOOKLORE_READING_WATCH_ENABLED` | `false` | Once you are past 1% of a Grimmory EPUB or PDF that BookBridge has not matched (including one read on a Kobo, once the Kobo syncs), it looks for the audiobook. A match is added to **Suggestions** for you to confirm; a book with no audiobook becomes an ebook-only mapping so its progress syncs. A suggestion you dismiss is not offered again. Uses Grimmory's Continue Reading list, or for a Grimmory admin account (which that list leaves empty) or an older Grimmory, the books marked Reading in the full book list, read at most every 30 minutes. |
+
 Grimmory notes:
 
 - Add / Update Book, the match queue, and Suggestions can all use **Grimmory audiobooks** as the audio source.
