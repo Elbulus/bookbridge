@@ -4688,6 +4688,11 @@ class SyncManager:
         abs_configured = bool(
             abs_client and getattr(abs_client, "is_configured", lambda: False)()
         )
+        # This cycle's GET /api/me showed the user can access every library item
+        abs_sees_all = "ABS" in (bulk_states_per_client or {}) and (
+            getattr(abs_client, "can_access_all_items", False) is True
+        )
+        abs_item_ids = None
         abs_bulk = (bulk_states_per_client or {}).get("ABS") or {}
         abs_bulk_ids = set(abs_bulk.keys()) if isinstance(abs_bulk, dict) else set()
 
@@ -4727,6 +4732,19 @@ class SyncManager:
 
             if abs_id in abs_bulk_ids:
                 visible.append(book)
+                continue
+
+            # With access to every item, an item is accessible iff it is listed (one listing, not a request per book)
+            if abs_sees_all and abs_item_ids is None:
+                abs_item_ids = abs_client.get_all_item_ids()
+                abs_sees_all = abs_item_ids is not None  # listing failed: check each book
+            if abs_sees_all:
+                if abs_id in abs_item_ids:
+                    visible.append(book)
+                else:
+                    logger.warning(
+                        "⚠️ ABS: Skipping item '%s' for user_id=%s: not in the library listing", abs_id, user_id
+                    )
                 continue
 
             try:
@@ -4833,7 +4851,8 @@ class SyncManager:
         if not target_abs_id:
             for client_name, client in self.sync_clients.items():
                 bulk_data = client.fetch_bulk_state()
-                if bulk_data:
+                # An empty ABS map from a successful read still means "no progress"
+                if bulk_data or (client_name == "ABS" and bulk_data is not None):
                     bulk_states_per_client[client_name] = bulk_data
                     logger.debug(f"📊 Pre-fetched bulk state for {client_name}")
 
@@ -4857,7 +4876,7 @@ class SyncManager:
             logger.debug(f"🔄 Sync cycle starting - {len(active_books)} active book(s)")
             
             # Check for suggestions
-            if 'ABS' in bulk_states_per_client:
+            if bulk_states_per_client.get('ABS'):
                 self.check_for_suggestions(bulk_states_per_client['ABS'], active_books)
                 
         # Main sync loop - process each active book
