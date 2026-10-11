@@ -53,12 +53,12 @@ class _FakeStateDB:
     def get_states_for_book(self, abs_id):
         return [object()] if abs_id in self.state_abs_ids else []
 
-    def is_user_linked(self, user_id, abs_id):
-        return abs_id in self.linked.get(user_id, set())
+    def get_linked_abs_ids(self, user_id):
+        return self.linked.get(user_id, set())
 
 
 class _FailingLinkDB(_FakeStateDB):
-    def is_user_linked(self, user_id, abs_id):
+    def get_linked_abs_ids(self, user_id):
         raise RuntimeError("db unavailable")
 
 

@@ -765,6 +765,11 @@ class DatabaseService:
                 return None
             return row[0] or ""
 
+    def get_aligned_book_ids(self) -> set[str]:
+        """Every book with a stored alignment map: ``has_alignment`` for all books in one query."""
+        with self.get_session() as session:
+            return {row[0] for row in session.query(BookAlignment.abs_id).all()}
+
     def get_ctc_aligned_book_ids(self) -> set[str]:
         """Return CTC-aligned book IDs in one query without loading map blobs."""
         with self.get_session() as session:
@@ -2047,6 +2052,19 @@ class DatabaseService:
             if job:
                 session.expunge(job)
             return job
+
+    def get_latest_jobs(self, kind: Optional[str] = None) -> dict:
+        """``get_latest_job`` for all books in one query: abs_id -> latest job."""
+        with self.get_session() as session:
+            query = session.query(Job)
+            if kind is not None:
+                query = query.filter(Job.kind == kind)
+            latest = {}
+            for job in query.order_by(Job.last_attempt.desc()).all():
+                if job.abs_id not in latest:
+                    session.expunge(job)
+                    latest[job.abs_id] = job
+            return latest
 
     def get_jobs_for_book(self, abs_id: str) -> List[Job]:
         """Get all jobs for a book."""

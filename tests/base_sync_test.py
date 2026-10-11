@@ -169,6 +169,7 @@ class BaseSyncCycleTestCase(unittest.TestCase, ABC):
         database_service.get_books_by_status.return_value = [self.test_book]
         database_service.get_book.return_value = self.test_book
         database_service.get_states_for_book.return_value = self.test_states
+        database_service.get_all_states.return_value = self.test_states
         database_service.save_book.return_value = self.test_book
         database_service.save_state.return_value = None
 
