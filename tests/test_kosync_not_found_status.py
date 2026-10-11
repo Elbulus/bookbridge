@@ -195,6 +195,45 @@ class TestKosyncNotFoundStatus(unittest.TestCase):
         self.assertIsNone(KoSyncSyncClient(external, MagicMock()).fetch_bulk_state())
         self.assertIsNone(kosync_server.linked_documents_without_progress("testuser", "wrong"))
 
+    def test_empty_progress_bulk_delegates_only_after_authentication(self) -> None:
+        """The API helper leaves the authenticated progress query to the DB service."""
+        from src import web_server
+        from src.api import kosync_server
+
+        expected = {_hex_hash("empty"): "empty"}
+        with patch.object(kosync_server, "authenticate_kosync", return_value=(True, 17)) as authenticate, \
+             patch.object(web_server.database_service, "get_linked_kosync_documents_without_progress",
+                          return_value=expected, create=True) as query:
+            self.assertEqual(kosync_server.linked_documents_without_progress("reader", "key"), expected)
+            query.assert_called_once_with(17)
+            authenticate.return_value = (False, None)
+            self.assertIsNone(kosync_server.linked_documents_without_progress("reader", "bad"))
+            query.assert_called_once_with(17)
+
+    def test_empty_progress_bulk_keeps_other_users_progress_separate(self) -> None:
+        """A different user's progress never excludes this reader's empty document."""
+        from src import web_server
+        from src.api import kosync_server
+
+        db = web_server.database_service
+        admin_id = db._default_user_id()
+        reader = db.create_user("bulk-reader", "reader-password", role="user")
+        db.set_user_credentials(reader.id, {"KOSYNC_USER": "bulk-reader", "KOSYNC_KEY": "reader-key"})
+        doc_hash = _hex_hash("bulk-shared")
+        db.save_book(Book(abs_id="bulk-shared", abs_title="Shared", kosync_doc_id=doc_hash, status="active"))
+        db.link_user_book(reader.id, "bulk-shared")
+        db.save_kosync_document(KosyncDocument(document_hash=doc_hash, linked_abs_id="bulk-shared", percentage=0))
+        db.upsert_user_kosync_progress(doc_hash, 0.4, progress="/body/p[4]", user_id=admin_id)
+
+        self.assertEqual(kosync_server.linked_documents_without_progress("bulk-reader", "reader-key"),
+                         {doc_hash: "bulk-shared"})
+        self.assertEqual(db.get_linked_kosync_documents_without_progress(admin_id), {})
+        self.assertEqual(db.get_linked_kosync_documents_without_progress(None), {})
+        headers = {"x-auth-user": "bulk-reader", "x-auth-key": hashlib.md5(b"reader-key").hexdigest()}
+        self.assertEqual(self.client.get(f"/syncs/progress/{doc_hash}", headers=headers).status_code, 404)
+        db.unlink_user_book(reader.id, "bulk-shared")
+        self.assertEqual(db.get_linked_kosync_documents_without_progress(reader.id), {})
+
 
 if __name__ == '__main__':
     unittest.main()

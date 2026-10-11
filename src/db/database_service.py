@@ -2464,6 +2464,33 @@ class DatabaseService:
                 return True
             return False
 
+    def get_linked_kosync_documents_without_progress(self, user_id: Optional[int] = None) -> dict[str, str]:
+        """Map accessible linked hashes to books with no state or device progress."""
+        from sqlalchemy.orm import aliased
+
+        # With no authenticated user, all users' rows conservatively exclude progress.
+        other = aliased(KosyncDocument)
+        with self.get_session() as session:
+            states = session.query(State.abs_id)
+            user_progress = session.query(other.linked_abs_id).join(
+                KosyncUserProgress, KosyncUserProgress.document_hash == other.document_hash
+            ).filter(other.linked_abs_id.isnot(None))
+            doc_progress = session.query(other.linked_abs_id).filter(
+                other.linked_abs_id.isnot(None), other.percentage > 0
+            )
+            docs = session.query(KosyncDocument.document_hash, KosyncDocument.linked_abs_id).filter(
+                KosyncDocument.linked_abs_id.isnot(None)
+            )
+            if user_id is not None:
+                states = states.filter(State.user_id == user_id)
+                user_progress = user_progress.filter(KosyncUserProgress.user_id == user_id)
+                docs = docs.filter(KosyncDocument.linked_abs_id.in_(
+                    session.query(UserBook.abs_id).filter(UserBook.user_id == user_id)
+                ))
+            for with_progress in (states, user_progress, doc_progress):
+                docs = docs.filter(KosyncDocument.linked_abs_id.notin_(with_progress))
+            return dict(docs.all())
+
     def get_kosync_document_by_linked_book(self, abs_id: str) -> Optional[KosyncDocument]:
         """Get a KOSync document linked to a specific ABS book."""
         with self.get_session() as session:

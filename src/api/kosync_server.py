@@ -3546,7 +3546,7 @@ def _respond_from_book_states(doc_id, book):
     return jsonify(response_data), 200
 
 
-def linked_documents_without_progress(username, key):
+def linked_documents_without_progress(username: str, key: str) -> Optional[dict[str, str]]:
     """Map document hash -> abs_id for every linked document whose GET from this
     login can only end in the read-only 404 of _respond_from_book_states: the
     login's user may access the book, and the book has no State, per-user
@@ -3557,31 +3557,7 @@ def linked_documents_without_progress(username, key):
     if not authenticated:
         return None
 
-    from sqlalchemy.orm import aliased
-    from src.db.models import KosyncDocument, KosyncUserProgress, UserBook
-
-    # Counting every user's rows when user_id is None only over-reports progress.
-    other = aliased(KosyncDocument)
-    with _database_service.get_session() as session:
-        states = session.query(State.abs_id)
-        user_progress = session.query(other.linked_abs_id).join(
-            KosyncUserProgress, KosyncUserProgress.document_hash == other.document_hash
-        ).filter(other.linked_abs_id.isnot(None))
-        doc_progress = session.query(other.linked_abs_id).filter(
-            other.linked_abs_id.isnot(None), other.percentage > 0
-        )
-        docs = session.query(KosyncDocument.document_hash, KosyncDocument.linked_abs_id).filter(
-            KosyncDocument.linked_abs_id.isnot(None)
-        )
-        if user_id is not None:
-            states = states.filter(State.user_id == user_id)
-            user_progress = user_progress.filter(KosyncUserProgress.user_id == user_id)
-            docs = docs.filter(KosyncDocument.linked_abs_id.in_(
-                session.query(UserBook.abs_id).filter(UserBook.user_id == user_id)
-            ))
-        for with_progress in (states, user_progress, doc_progress):
-            docs = docs.filter(KosyncDocument.linked_abs_id.notin_(with_progress))
-        return dict(docs.all())
+    return _database_service.get_linked_kosync_documents_without_progress(user_id)
 
 
 def _resolve_book_by_sibling_hash(doc_id: str, existing_doc=None):

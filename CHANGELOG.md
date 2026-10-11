@@ -28,6 +28,12 @@ All notable changes to BookBridge will be documented in this file.
 
 ### Fixed
 
+- Full sync cycles fetch Audiobookshelf progress and unrestricted item access in
+  bulk, skip built-in KoSync reads for linked books without progress, and reuse
+  database snapshots and one client-fetch worker pool. This reduces idle-cycle
+  work while preserving per-user access checks and individual-read fallbacks.
+  Contributed by [@nmackler](https://github.com/nmackler) in #491, #492, and #493
+  for #490.
 - Suggestions match an audiobook to an ebook whose title differs only by a subtitle,
   using the Audiobookshelf subtitle when there is one. A match found only by dropping
   the subtitle scores below the default auto-keep and auto-match cutoffs, so a bare
