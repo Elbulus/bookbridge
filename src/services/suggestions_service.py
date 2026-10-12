@@ -1,8 +1,12 @@
 import os
 import re
+import zipfile
+from pathlib import Path
 from typing import Callable, List, Set, Any, Dict, Optional
+from xml.etree import ElementTree
 
 from src.services.llm_matching import craft_search_terms
+from src.utils.series_metadata import _locate_opf_path
 
 # Provider preference for collapsing the same physical audiobook when more than one
 # provider indexes the same shared library tree (#383): lower index wins ties. A
@@ -66,6 +70,48 @@ class SuggestionsService:
             return title.strip(), author.strip()
         return stem, ""
 
+    @staticmethod
+    def _opf_title_authors(opf_xml: bytes) -> tuple:
+        """Return ``(title, "Author & Author")`` from OPF package XML.
+
+        Creators with a role other than author (translator, editor) are skipped; a
+        creator without a role counts as an author.
+        """
+        title, authors = "", []
+        for element in ElementTree.fromstring(opf_xml).iter():
+            tag = element.tag.rsplit("}", 1)[-1] if isinstance(element.tag, str) else ""
+            text = (element.text or "").strip()
+            if not text:
+                continue
+            if tag == "title" and not title:
+                title = text
+            elif tag == "creator":
+                role = next((v for k, v in element.attrib.items() if k.rsplit("}", 1)[-1] == "role"), "")
+                if role in ("", "aut"):
+                    authors.append(text)
+        return title, " & ".join(authors)
+
+    @classmethod
+    def _local_file_title_authors(cls, path: Any) -> tuple:
+        """Title and authors for a library file from Calibre's metadata.opf beside it,
+        else from the EPUB's own OPF. Empty strings when neither can be read."""
+        try:
+            opf_file = Path(path).parent / "metadata.opf"
+            if opf_file.is_file():
+                title, authors = cls._opf_title_authors(opf_file.read_bytes())
+                if title:
+                    return title, authors
+        except (OSError, ElementTree.ParseError):
+            pass
+        try:
+            with zipfile.ZipFile(path) as zf:
+                opf_path = _locate_opf_path(zf)
+                if opf_path:
+                    return cls._opf_title_authors(zf.read(opf_path))
+        except (OSError, KeyError, zipfile.BadZipFile, ElementTree.ParseError):
+            pass
+        return "", ""
+
     # Role credits and list separators in author strings such as
     # "Roberto Bolaño, Natasha Wimmer - translator" or "Terry Pratchett & Neil Gaiman".
     _AUTHOR_ROLE_RE = re.compile(
@@ -88,16 +134,21 @@ class SuggestionsService:
         """Best fuzzy score between the two author strings or any pair of their names.
 
         The whole-string comparison keeps sort-form names ("Machiavelli, Niccolo")
-        scoring well even though the list split breaks them apart.
+        scoring well even though the list split breaks them apart. Comparison ignores
+        case and punctuation: rapidfuzz 3 scores "DeLillo" against "Delillo" at 91.
         """
-        from rapidfuzz import fuzz
+        from rapidfuzz import fuzz, utils
 
         if not author or not candidate_author:
             return 0.0
-        best = fuzz.token_sort_ratio(author, candidate_author)
+
+        def ratio(a, b):
+            return fuzz.token_sort_ratio(a, b, processor=utils.default_process)
+
+        best = ratio(author, candidate_author)
         for name in cls._author_names(author):
             for candidate_name in cls._author_names(candidate_author):
-                best = max(best, fuzz.token_sort_ratio(name, candidate_name))
+                best = max(best, ratio(name, candidate_name))
         return float(best)
 
     def _build_ebook_candidate_pool(self) -> List[dict]:
@@ -125,9 +176,15 @@ class SuggestionsService:
             candidate_author = self._candidate_author(candidate)
             candidate_language = str(getattr(candidate, 'language', None) or '').strip()
             candidate_source = (getattr(candidate, 'source', None) or '').strip()
-            # Local files carry no metadata; their title is the Calibre filename stem.
+            # The library scan builds Local File candidates from the filename alone.
             if candidate_source == "Local File" and not candidate_author:
-                candidate_title, candidate_author = self._split_title_author_stem(candidate_title)
+                stem_title, stem_author = self._split_title_author_stem(candidate_title)
+                local_path = getattr(candidate, 'path', None)
+                meta_title, meta_authors = (
+                    self._local_file_title_authors(local_path) if local_path else ("", "")
+                )
+                candidate_title = meta_title or stem_title
+                candidate_author = meta_authors or stem_author
             source_id = getattr(candidate, 'source_id', None) or getattr(candidate, 'booklore_id', None)
             raw_path = getattr(candidate, 'path', None)
             path = str(raw_path) if raw_path else None

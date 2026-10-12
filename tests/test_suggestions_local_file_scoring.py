@@ -1,9 +1,11 @@
-"""Local File candidates carry no metadata: their title is the filename stem, which in a
-Calibre library is "Title - Author". Scoring the audiobook title against that stem, with
-no candidate author, capped an exact title-and-author match near 50%.
+"""Local File candidates are built from the filename alone, so scoring compared the
+audiobook title against the "Title - Author" stem with no candidate author, which capped
+an exact title-and-author match near 50%. The title and authors now come from Calibre's
+metadata.opf, then the EPUB's own OPF, then the filename.
 """
 import os
 import sys
+import zipfile
 from unittest.mock import MagicMock
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -86,3 +88,110 @@ def test_a_different_author_is_never_an_exact_match():
 def test_candidate_with_several_authors_matches_one_of_them():
     top = _top("Good Omens", "Neil Gaiman", _local("Good Omens - Terry Pratchett & Neil Gaiman.epub"))
     assert top["score"] == 100.0
+
+
+# ---- metadata from metadata.opf and the EPUB's own OPF ----
+
+_OPF = """<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0">
+    <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
+        <dc:title>{title}</dc:title>
+        {creators}
+        <dc:contributor opf:file-as="calibre" opf:role="bkp">calibre (9.11.0) [https://calibre-ebook.com]</dc:contributor>
+    </metadata>
+</package>
+"""
+
+
+def _opf(title, *creators):
+    return _OPF.format(
+        title=title,
+        creators="\n        ".join(
+            f'<dc:creator opf:role="{role}">{name}</dc:creator>' if role else f"<dc:creator>{name}</dc:creator>"
+            for name, role in creators
+        ),
+    )
+
+
+def _write_epub(path, opf_xml):
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr(
+            "META-INF/container.xml",
+            '<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+            '<rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>'
+            "</rootfiles></container>",
+        )
+        zf.writestr("OEBPS/content.opf", opf_xml)
+
+
+def _calibre_book(root, filename, metadata_opf=None, embedded_opf=None):
+    folder = root / "Author" / "Title (1)"
+    folder.mkdir(parents=True)
+    epub = folder / filename
+    _write_epub(epub, embedded_opf or _opf("Embedded Title", ("Embedded Author", "aut")))
+    if metadata_opf is not None:
+        (folder / "metadata.opf").write_text(metadata_opf, encoding="utf-8")
+    return EbookResult(name=filename, path=epub, source="Local File")
+
+
+def _pool_entry(candidate):
+    return _service()._prepare_candidate_pool([candidate])[0]
+
+
+def test_metadata_opf_gives_the_full_title_and_every_author(tmp_path):
+    book = _calibre_book(
+        tmp_path,
+        "This Is How You Lose the Time War - Amal El-Mohtar.epub",
+        metadata_opf=_opf("This Is How You Lose the Time War", ("Amal El-Mohtar", "aut"), ("Max Gladstone", "aut")),
+    )
+    entry = _pool_entry(book)
+    assert entry["title"] == "This Is How You Lose the Time War"
+    assert entry["author"] == "Amal El-Mohtar & Max Gladstone"
+
+
+def test_metadata_opf_title_keeps_characters_the_filename_lost(tmp_path):
+    book = _calibre_book(
+        tmp_path, "Upgrade_ A Novel - Blake Crouch.epub",
+        metadata_opf=_opf("Upgrade: A Novel", ("Blake Crouch", "aut")),
+    )
+    assert _pool_entry(book)["title"] == "Upgrade: A Novel"
+
+
+def test_non_author_roles_are_left_out(tmp_path):
+    book = _calibre_book(
+        tmp_path, "Kafka on the Shore - Haruki Murakami.epub",
+        metadata_opf=_opf("Kafka on the Shore", ("Haruki Murakami", "aut"), ("Philip Gabriel", "trl")),
+    )
+    assert _pool_entry(book)["author"] == "Haruki Murakami"
+
+
+def test_embedded_opf_is_used_without_metadata_opf(tmp_path):
+    book = _calibre_book(
+        tmp_path, "Roadside Picnic - Arkady Strugatsky.epub",
+        embedded_opf=_opf("Roadside Picnic", ("Arkady Strugatsky", None), ("Boris Strugatsky", None)),
+    )
+    entry = _pool_entry(book)
+    assert (entry["title"], entry["author"]) == ("Roadside Picnic", "Arkady Strugatsky & Boris Strugatsky")
+
+
+def test_audiobook_by_the_second_author_matches_exactly(tmp_path):
+    book = _calibre_book(
+        tmp_path, "This Is How You Lose the Time War - Amal El-Mohtar.epub",
+        metadata_opf=_opf("This Is How You Lose the Time War", ("Amal El-Mohtar", "aut"), ("Max Gladstone", "aut")),
+    )
+    assert _top("This Is How You Lose the Time War", "Max Gladstone", book)["score"] == 100.0
+
+
+def test_unreadable_metadata_falls_back_to_the_filename(tmp_path):
+    folder = tmp_path / "Author" / "Title (1)"
+    folder.mkdir(parents=True)
+    epub = folder / "Dune - Frank Herbert.epub"
+    epub.write_bytes(b"not a zip")
+    (folder / "metadata.opf").write_text("<not xml", encoding="utf-8")
+    entry = _pool_entry(EbookResult(name=epub.name, path=epub, source="Local File"))
+    assert (entry["title"], entry["author"]) == ("Dune", "Frank Herbert")
+
+
+def test_author_case_differences_do_not_lower_the_score():
+    assert _top("White Noise", "Don DeLillo", _local("White Noise - Don Delillo.epub"))["score"] == 100.0
+    assert _top("A Naked Singularity", "Sergio De La Pava", _local("A Naked Singularity - Sergio de La Pava.epub"))["score"] == 100.0
