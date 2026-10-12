@@ -9,6 +9,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 import zipfile
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -1430,7 +1431,10 @@ def kosync_get_progress(doc_id):
                     return _defer_kosync_book_access(doc_id, book, source="get")
                 return _respond_from_book_states(doc_id, book)
 
-        resolved_book = _resolve_book_by_sibling_hash(doc_id, existing_doc=kosync_doc)
+        resolved_book = _resolve_book_by_sibling_hash(
+            doc_id, existing_doc=kosync_doc,
+            user_id=getattr(g, "kosync_user_id", None), filename_variants=True,
+        )
         if resolved_book:
             if not _kosync_user_may_access_book(resolved_book):
                 return _defer_kosync_book_access(doc_id, resolved_book, source="get")
@@ -1494,11 +1498,14 @@ def kosync_get_progress(doc_id):
     # (same doc_id/existing_doc) above with no intervening state change, so a
     # second call is deterministically redundant.
     if kosync_doc is None:
-        resolved_book = _resolve_book_by_sibling_hash(doc_id, existing_doc=kosync_doc)
+        resolved_book = _resolve_book_by_sibling_hash(
+            doc_id, existing_doc=kosync_doc,
+            user_id=getattr(g, "kosync_user_id", None), filename_variants=True,
+        )
         if resolved_book:
             if not _kosync_user_may_access_book(resolved_book):
                 return _defer_kosync_book_access(doc_id, resolved_book, source="get")
-            _register_hash_for_book(doc_id, resolved_book)
+            _register_hash_for_book(doc_id, resolved_book, user_id=getattr(g, "kosync_user_id", None))
             return _respond_from_book_states(doc_id, resolved_book)
 
     # Step 4: Unknown hash — register stub and start background discovery
@@ -1967,7 +1974,10 @@ def kosync_put_progress():
             # already-mapped book (e.g. a different EPUB build of the same title),
             # resolvable via a filename sibling. Try that before falling through to
             # auto-discovery so we link instead of creating a duplicate mapping.
-            linked_book = _resolve_book_by_sibling_hash(doc_hash, existing_doc=kosync_doc)
+            linked_book = _resolve_book_by_sibling_hash(
+                doc_hash, existing_doc=kosync_doc,
+                user_id=request_user_id, filename_variants=not is_internal,
+            )
         if linked_book:
             _register_hash_for_book(doc_hash, linked_book)
 
@@ -3546,10 +3556,14 @@ def _respond_from_book_states(doc_id, book):
     return jsonify(response_data), 200
 
 
-def _resolve_book_by_sibling_hash(doc_id: str, existing_doc=None):
+def _resolve_book_by_sibling_hash(doc_id: str, existing_doc=None, *, user_id=None, filename_variants=False):
     """
     Try to resolve an unknown hash to a known book using DB-only lookups.
     Checks if any other KosyncDocument with the same filename is already linked.
+
+    With ``filename_variants``, also tries the KOReader filename-mode hashes of
+    the user's library filenames (see ``_resolve_book_by_filename_variants``).
+    Callers enable it only for hashes a reading device sent.
     """
     # Check if this hash has a filename cached (from a prior scan/PUT)
     doc = existing_doc or _database_service.get_kosync_document(doc_id)
@@ -3570,7 +3584,12 @@ def _resolve_book_by_sibling_hash(doc_id: str, existing_doc=None):
 
     # CWA re-exports with embedded metadata on every download, so a reader's copy
     # rarely matches our hash. CWA records each served copy's hash in metadata.db.
-    return _resolve_book_by_cwa_checksum(doc_id)
+    book = _resolve_book_by_cwa_checksum(doc_id)
+    if book or not filename_variants:
+        return book
+
+    # After the exact CWA identity: a reordered library filename is a heuristic.
+    return _resolve_book_by_filename_variants(doc_id, user_id=user_id)
 
 
 def _resolve_book_by_cwa_checksum(doc_id: str):
@@ -3587,6 +3606,82 @@ def _resolve_book_by_cwa_checksum(doc_id: str):
             f"(Calibre book {calibre_book_id})"
         )
     return book
+
+
+# Longest first so ".kepub.epub" wins over ".epub". Only known extensions are
+# stripped: Path.suffixes would split names such as "J.R.R. Tolkien" on their dots.
+_FILENAME_VARIANT_EXTENSIONS = (".kepub.epub", ".epub", ".pdf", ".mobi", ".azw3", ".cbz", ".fb2")
+
+
+def _filename_variant_hashes(filename) -> tuple[set, set]:
+    """Return ``(exact, reordered)`` KOReader filename-mode hashes for a library filename.
+
+    Calibre names the library file "Title - Author" but sends the device copy as
+    "Author - Title", so the device hashes a reordering of the same " - " parts.
+    Both Unicode forms are hashed because KOReader hashes the basename bytes as
+    the device stores them, while the bridge's own filename hash does not normalize.
+    """
+    if not isinstance(filename, str) or not filename.strip():
+        return set(), set()
+    name = Path(filename.strip()).name
+    lowered = name.lower()
+    ext_length = next((len(ext) for ext in _FILENAME_VARIANT_EXTENSIONS if lowered.endswith(ext)), 0)
+    if not ext_length or ext_length == len(name):
+        return set(), set()
+    stem, ext = name[:-ext_length], name[-ext_length:]
+    parts = stem.split(" - ")
+    reordered = {" - ".join(parts[i:] + parts[:i]) for i in range(1, len(parts))} - {stem}
+
+    def _hashes(stems):
+        return {
+            hashlib.md5(unicodedata.normalize(form, s + ext).encode("utf-8"), usedforsecurity=False).hexdigest()
+            for s in stems
+            for form in ("NFC", "NFD")
+        }
+
+    return _hashes({stem}), _hashes(reordered)
+
+
+def _resolve_book_by_filename_variants(doc_id: str, user_id=None):
+    """Resolve a device's filename-mode hash to one of the user's active books.
+
+    An exact library filename (allowing a Unicode-form difference) takes precedence
+    over a reordered one, so "Foo - Bar.epub" and "Bar - Foo.epub" in the same
+    library don't block each other. More than one book in the deciding tier is
+    ambiguous and resolves nothing.
+    """
+    if not doc_id or not _is_valid_hex_hash(doc_id):
+        return None
+    target = doc_id.lower()
+
+    exact_matches: dict = {}
+    reordered_matches: dict = {}
+    for book in _database_service.get_books_by_status("active", user_id=user_id) or []:
+        for filename in (getattr(book, "original_ebook_filename", None), getattr(book, "ebook_filename", None)):
+            exact, reordered = _filename_variant_hashes(filename)
+            if target in exact:
+                exact_matches.setdefault(book.abs_id, filename)
+            elif target in reordered:
+                reordered_matches.setdefault(book.abs_id, filename)
+
+    for tier, matches in (("library filename", exact_matches), ("reordered filename", reordered_matches)):
+        if len(matches) > 1:
+            get_persistent_condition_logger().warn(
+                logger,
+                f"kosync_filename_variant_conflict:{target}",
+                "⚠️ KOSync: %s matches the %s of %d books (%s); leaving it unlinked",
+                target, tier, len(matches), ", ".join(sorted(str(abs_id) for abs_id in matches)),
+            )
+            return None
+        if matches:
+            abs_id, filename = next(iter(matches.items()))
+            book = _database_service.get_book(abs_id)
+            if book:
+                logger.info(f"🔗 KOSync: Resolved {target} to '{book.abs_title}' via {tier} '{filename}'")
+            return book
+
+    logger.debug(f"KOSync: no library filename variant matches {target}")
+    return None
 
 
 _epub_identifier_cache: dict = {}
@@ -3640,8 +3735,11 @@ def _resolve_book_by_epub_identifier(epub_filename: str, doc_id: str = None):
     return None
 
 
-def _register_hash_for_book(doc_id: str, book):
-    """Register a new hash and link it to an existing book."""
+def _register_hash_for_book(doc_id: str, book, *, user_id=None):
+    """Register a new hash and link it to an existing book.
+
+    ``user_id`` stamps a newly created document with the reader it came from.
+    """
     from src.db.models import KosyncDocument as KD
 
     existing = _database_service.get_kosync_document(doc_id)
@@ -3650,10 +3748,9 @@ def _register_hash_for_book(doc_id: str, book):
             _database_service.link_kosync_document(doc_id, book.abs_id)
             logger.info(f"🔗 KOSync: Linked existing document {doc_id} to '{book.abs_title}'")
     else:
-        doc = KD(document_hash=doc_id, linked_abs_id=book.abs_id)
+        doc = KD(document_hash=doc_id, linked_abs_id=book.abs_id, user_id=user_id)
         _database_service.save_kosync_document(doc)
         logger.info(f"🔗 KOSync: Created and linked new document {doc_id} to '{book.abs_title}'")
-
 
 def _is_valid_hex_hash(value: str) -> bool:
     """Return True if value is a 32-character lowercase or uppercase hex string."""
