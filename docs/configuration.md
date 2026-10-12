@@ -100,6 +100,12 @@ only, never on the split-port sync server, so keep it on your LAN.
 Disabling a user also stops their KOSync login, since KOSync authentication
 skips inactive users.
 
+Account updates protect the primary admin from demotion and retain at least one
+active admin, including concurrent requests. Re-enabling a reader restores shared
+books when Shared Library is enabled. Integration PATCH requests save all submitted
+fields together; changing a Readest email or password discards its previous session
+so the next sync authenticates with the updated credentials.
+
 ### Integrations
 
 Every integration card has an **Enable** switch, and that switch is server-wide: a
