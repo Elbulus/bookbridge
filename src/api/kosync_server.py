@@ -3025,6 +3025,17 @@ def _ebook_search_dirs() -> list:
     return dirs
 
 
+def _cached_hash_matches_method(cached_doc, filename: str) -> bool:
+    """Whether a cached hash was computed with the current KOSYNC_HASH_METHOD.
+
+    The cache keeps no record of the method, but a filename-mode hash is the MD5 of
+    the name itself, so it can be recognized without reading the file.
+    """
+    filename_hash = hashlib.md5(filename.encode("utf-8"), usedforsecurity=False).hexdigest()
+    is_filename_hash = cached_doc.document_hash == filename_hash
+    return is_filename_hash == (_container.ebook_parser().hash_method == "filename")
+
+
 def _scan_directory_for_hash(scan_dir, doc_hash: str) -> Optional[str]:
     """Hash-scan one directory's *.epub files for doc_hash. Returns filename or None."""
     if not scan_dir or not scan_dir.exists():
@@ -3040,7 +3051,7 @@ def _scan_directory_for_hash(scan_dir, doc_hash: str) -> Optional[str]:
         cached_doc = _database_service.get_kosync_doc_by_filename(epub_path.name)
         if cached_doc:
             current_mtime = epub_path.stat().st_mtime
-            if cached_doc.mtime == current_mtime:
+            if cached_doc.mtime == current_mtime and _cached_hash_matches_method(cached_doc, epub_path.name):
                 if cached_doc.document_hash == doc_hash:
                     logger.info(f"📚 Matched EPUB via DB filename lookup: {epub_path.name}")
                     return epub_path.name
