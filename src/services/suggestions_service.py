@@ -54,6 +54,52 @@ class SuggestionsService:
     def _candidate_author(candidate: Any) -> str:
         return (getattr(candidate, 'authors', None) or '').strip()
 
+    @staticmethod
+    def _split_title_author_stem(stem: str) -> tuple:
+        """Split a Calibre "Title - Author" filename stem at its last separator.
+
+        The author is the final part because titles can contain " - " themselves
+        ("Asian Saga 1 - Shogun - James Clavell"). A stem without one is all title.
+        """
+        title, sep, author = stem.rpartition(" - ")
+        if sep and title.strip() and author.strip():
+            return title.strip(), author.strip()
+        return stem, ""
+
+    # Role credits and list separators in author strings such as
+    # "Roberto Bolaño, Natasha Wimmer - translator" or "Terry Pratchett & Neil Gaiman".
+    _AUTHOR_ROLE_RE = re.compile(
+        r"\s*(?:-\s*|\()\s*(?:translator|narrator|editor|illustrator|contributor|foreword|introduction)s?\)?\s*$",
+        re.IGNORECASE,
+    )
+    _AUTHOR_LIST_SPLIT_RE = re.compile(r"\s*(?:,|&|;|\band\b)\s*", re.IGNORECASE)
+
+    @classmethod
+    def _author_names(cls, text: str) -> List[str]:
+        names = []
+        for part in cls._AUTHOR_LIST_SPLIT_RE.split(text or ""):
+            name = cls._AUTHOR_ROLE_RE.sub("", part).strip()
+            if name:
+                names.append(name)
+        return names
+
+    @classmethod
+    def _author_score(cls, author: str, candidate_author: str) -> float:
+        """Best fuzzy score between the two author strings or any pair of their names.
+
+        The whole-string comparison keeps sort-form names ("Machiavelli, Niccolo")
+        scoring well even though the list split breaks them apart.
+        """
+        from rapidfuzz import fuzz
+
+        if not author or not candidate_author:
+            return 0.0
+        best = fuzz.token_sort_ratio(author, candidate_author)
+        for name in cls._author_names(author):
+            for candidate_name in cls._author_names(candidate_author):
+                best = max(best, fuzz.token_sort_ratio(name, candidate_name))
+        return float(best)
+
     def _build_ebook_candidate_pool(self) -> List[dict]:
         """
         Build searchable ebook candidates once per scan to avoid per-book provider calls.
@@ -79,6 +125,9 @@ class SuggestionsService:
             candidate_author = self._candidate_author(candidate)
             candidate_language = str(getattr(candidate, 'language', None) or '').strip()
             candidate_source = (getattr(candidate, 'source', None) or '').strip()
+            # Local files carry no metadata; their title is the Calibre filename stem.
+            if candidate_source == "Local File" and not candidate_author:
+                candidate_title, candidate_author = self._split_title_author_stem(candidate_title)
             source_id = getattr(candidate, 'source_id', None) or getattr(candidate, 'booklore_id', None)
             raw_path = getattr(candidate, 'path', None)
             path = str(raw_path) if raw_path else None
@@ -546,8 +595,6 @@ class SuggestionsService:
 
     def _scan_single_audiobook(self, ab: dict, candidate_pool: List[dict]) -> Optional[dict]:
         """Scan one unmatched audiobook and return a suggestion dict or None."""
-        from rapidfuzz import fuzz
-
         audio_source_id = self._audio_source_id(ab)
         bridge_key = self._audio_bridge_key(ab)
         audio_title = self._audio_title(ab)
@@ -602,7 +649,7 @@ class SuggestionsService:
                 continue
 
             if audio_author:
-                author_score = float(fuzz.token_sort_ratio(audio_author, candidate_author)) if candidate_author else 0.0
+                author_score = self._author_score(audio_author, candidate_author)
                 score = (title_score * 0.7) + (author_score * 0.3)
             else:
                 score = title_score
@@ -1287,7 +1334,7 @@ class SuggestionsService:
 
             title_score = float(fuzz.token_sort_ratio(ebook_title, cand_title))
             if ebook_author:
-                author_score = float(fuzz.token_sort_ratio(ebook_author, cand_author)) if cand_author else 0.0
+                author_score = self._author_score(ebook_author, cand_author)
                 score = (title_score * 0.7) + (author_score * 0.3)
             else:
                 score = title_score
