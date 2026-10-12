@@ -81,13 +81,13 @@
         {% endif %}
         {% if ebook_source and ebook_source != audio_source %}
             {% if ebook_source == 'cwa' %}
-                {{ library_link(cwa_url, '', 'Calibre-Web ebook library') }}
+                {{ library_link(cwa_url, '/static/calibre-web.png', 'Calibre-Web ebook library') }}
             {% elif ebook_source == 'grimmory' %}
                 {{ library_link(grimmory_url, '/static/grimmory.webp', 'Grimmory ebook library') }}
             {% elif ebook_source == 'bookorbit' %}
                 {{ library_link(bookorbit_url, '/static/bookorbit.svg', 'BookOrbit ebook library') }}
             {% elif ebook_source == 'kavita' %}
-                {{ library_link(kavita_url, '', 'Kavita ebook library') }}
+                {{ library_link(kavita_url, '/static/kavita.svg', 'Kavita ebook library') }}
             {% endif %}
         {% endif %}
 

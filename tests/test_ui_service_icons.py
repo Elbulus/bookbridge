@@ -71,6 +71,33 @@ class ServiceIconUiTestCase(unittest.TestCase):
                 self.assertNotIn(f"{label} ebook library", html)
                 self.assertNotIn("audiobookshelf.png", html)
 
+    def test_nav_uses_calibre_web_and_kavita_logos_for_ebook(self):
+        cases = (
+            ("CWA", "https://cwa.example", "calibre-web.png", "Calibre-Web"),
+            ("KAVITA", "https://kavita.example", "kavita.svg", "Kavita"),
+        )
+        for prefix, url, icon, label in cases:
+            with self.subTest(source=label):
+                html = self.render_nav(
+                    {"ABS_SERVER": "https://abs.example", f"{prefix}_SERVER": url},
+                    {f"{prefix}_ENABLED"},
+                )
+
+                self.assertIn(f'href="{url}"', html)
+                self.assertIn(f'src="/static/{icon}"', html)
+                self.assertIn(f"{label} ebook library", html)
+                self.assertNotIn('<svg viewBox="0 0 24 24"', html)
+
+    def test_templates_have_no_mis_decoded_utf8(self):
+        # UTF-8 arrows and quotes read as cp1252 start with "â" followed by
+        # the cp1252 reading of their second byte (0x80, 0x86, or 0x96).
+        markers = tuple("â" + bytes([b]).decode("cp1252") for b in (0x80, 0x86, 0x96))
+        for template in sorted((ROOT / "templates").glob("*.html")):
+            text = template.read_text(encoding="utf-8")
+            for marker in markers:
+                with self.subTest(template=template.name, marker=marker):
+                    self.assertNotIn(marker, text)
+
     def test_requested_assets_exist_and_replace_card_placeholders(self):
         index_html = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
         nav_html = (ROOT / "templates" / "_nav.html").read_text(encoding="utf-8")
@@ -80,6 +107,8 @@ class ServiceIconUiTestCase(unittest.TestCase):
             "bookfusion.png": index_html,
             "hardcover.svg": index_html,
             "shelfmark.png": nav_html,
+            "calibre-web.png": index_html,
+            "kavita.svg": index_html,
         }
 
         for asset, template in expected.items():
