@@ -78,7 +78,15 @@ class SuggestionsService:
         creator without a role counts as an author.
         """
         title, authors = "", []
-        for element in ElementTree.fromstring(opf_xml).iter():
+        root = ElementTree.fromstring(opf_xml)
+        refined_roles = {}
+        for element in root.iter():
+            tag = element.tag.rsplit("}", 1)[-1] if isinstance(element.tag, str) else ""
+            refines = element.attrib.get("refines", "")
+            role = (element.text or "").strip().lower()
+            if tag == "meta" and element.attrib.get("property") == "role" and refines.startswith("#") and role:
+                refined_roles.setdefault(refines[1:], set()).add(role)
+        for element in root.iter():
             tag = element.tag.rsplit("}", 1)[-1] if isinstance(element.tag, str) else ""
             text = (element.text or "").strip()
             if not text:
@@ -86,8 +94,11 @@ class SuggestionsService:
             if tag == "title" and not title:
                 title = text
             elif tag == "creator":
-                role = next((v for k, v in element.attrib.items() if k.rsplit("}", 1)[-1] == "role"), "")
-                if role in ("", "aut"):
+                roles = set(refined_roles.get(element.attrib.get("id"), ()))
+                role = next((v for k, v in element.attrib.items() if k.rsplit("}", 1)[-1] == "role"), "").strip().lower()
+                if role:
+                    roles.add(role)
+                if not roles or "aut" in roles:
                     authors.append(text)
         return title, " & ".join(authors)
 
@@ -118,36 +129,35 @@ class SuggestionsService:
         r"\s*(?:-\s*|\()\s*(?:translator|narrator|editor|illustrator|contributor|foreword|introduction)s?\)?\s*$",
         re.IGNORECASE,
     )
-    _AUTHOR_LIST_SPLIT_RE = re.compile(r"\s*(?:,|&|;|\band\b)\s*", re.IGNORECASE)
+    _AUTHOR_LIST_SPLIT_RE = re.compile(r"\s*(?:&|;|\band\b)\s*", re.IGNORECASE)
 
     @classmethod
     def _author_names(cls, text: str) -> List[str]:
         names = []
+        # shortcut: ambiguous comma lists stay intact until structured author metadata is available.
         for part in cls._AUTHOR_LIST_SPLIT_RE.split(text or ""):
-            name = cls._AUTHOR_ROLE_RE.sub("", part).strip()
+            name = ", ".join(segment.strip() for segment in part.split(",")
+                             if segment.strip() and not cls._AUTHOR_ROLE_RE.search(segment))
             if name:
                 names.append(name)
         return names
 
     @classmethod
     def _author_score(cls, author: str, candidate_author: str) -> float:
-        """Best fuzzy score between the two author strings or any pair of their names.
-
-        The whole-string comparison keeps sort-form names ("Machiavelli, Niccolo")
-        scoring well even though the list split breaks them apart. Comparison ignores
-        case and punctuation: rapidfuzz 3 scores "DeLillo" against "Delillo" at 91.
-        """
+        """Best fuzzy score between complete authors, excluding non-author credits."""
         from rapidfuzz import fuzz, utils
 
-        if not author or not candidate_author:
+        names = cls._author_names(author)
+        candidate_names = cls._author_names(candidate_author)
+        if not names or not candidate_names:
             return 0.0
 
         def ratio(a, b):
             return fuzz.token_sort_ratio(a, b, processor=utils.default_process)
 
-        best = ratio(author, candidate_author)
-        for name in cls._author_names(author):
-            for candidate_name in cls._author_names(candidate_author):
+        best = ratio(" & ".join(names), " & ".join(candidate_names))
+        for name in names:
+            for candidate_name in candidate_names:
                 best = max(best, ratio(name, candidate_name))
         return float(best)
 

@@ -195,3 +195,39 @@ def test_unreadable_metadata_falls_back_to_the_filename(tmp_path):
 def test_author_case_differences_do_not_lower_the_score():
     assert _top("White Noise", "Don DeLillo", _local("White Noise - Don Delillo.epub"))["score"] == 100.0
     assert _top("A Naked Singularity", "Sergio De La Pava", _local("A Naked Singularity - Sergio de La Pava.epub"))["score"] == 100.0
+
+
+def test_sort_form_authors_do_not_match_on_a_shared_surname():
+    candidate = EbookResult(name='Collected Stories.epub', title='Collected Stories', authors='King, Owen',
+                            source='Grimmory', path='/books/owen/stories.epub')
+    assert _top('Collected Stories', 'King, Stephen', candidate)['score'] < 100.0
+    reverse = _service()._scan_single_ebook(
+        {'title': 'Collected Stories', 'authors': 'King, Stephen', 'path': '/books/stephen/stories.epub'},
+        [_abs_item('Collected Stories', 'King, Owen')],
+    )
+    assert reverse['matches'][0]['score'] < 100.0
+
+
+def test_translator_does_not_match_as_the_writer():
+    assert _top('Collected Poems', 'Jorge Luis Borges, Jane Doe - translator',
+                _local('Collected Poems - Jane Doe.epub'))['score'] < 100.0
+    assert SuggestionsService._author_score('Jane Doe - narrator', 'Jane Doe') == 0.0
+
+
+def test_sort_form_author_keeps_both_name_parts_beside_role_credits():
+    assert _top('Collected Stories', 'King, Stephen, Jane Doe - narrator',
+                _local('Collected Stories - Stephen King.epub'))['score'] == 100.0
+
+
+def test_epub3_role_refinements_filter_non_authors(tmp_path):
+    opf = '''<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+      <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+        <dc:title>Collected Poems</dc:title>
+        <dc:creator id="writer">Jorge Luis Borges</dc:creator>
+        <meta refines="#writer" property="role" scheme="marc:relators">aut</meta>
+        <meta refines="#writer" property="role" scheme="marc:relators">ill</meta>
+        <dc:creator id="translator">Jane Doe</dc:creator>
+        <meta refines="#translator" property="role" scheme="marc:relators">trl</meta>
+      </metadata></package>'''
+    book = _calibre_book(tmp_path, 'Collected Poems.epub', embedded_opf=opf)
+    assert _pool_entry(book)['author'] == 'Jorge Luis Borges'
