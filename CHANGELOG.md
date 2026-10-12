@@ -8,6 +8,8 @@ All notable changes to BookBridge will be documented in this file.
 
 ### Added
 
+- Token-authenticated admin API to create readers and set their integrations from a
+  script, off unless `ADMIN_API_TOKEN` is set.
 - Link CBZ comics as ebooks without allowing them to become audiobook matches (#459).
 - Optionally filter KOReader device manifests to selected Grimmory shelves (#464).
 - Prefer ebooks already mounted in the configured library, with provider fallback
