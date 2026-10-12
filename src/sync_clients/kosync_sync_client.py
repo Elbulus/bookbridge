@@ -20,6 +20,8 @@ from src.utils.fixed_page_progress import (
     percentage_from_cbz_page,
 )
 from src.utils.config_loader import env_truthy
+from src.utils.logging_utils import get_persistent_condition_logger
+from src.utils.user_context import get_current_user_id
 from src.utils.kosync_canonical import (
     prewarm_xpath_order_cache,
     resolve_canonical_position,
@@ -88,6 +90,13 @@ class KoSyncSyncClient(SyncClient):
             logger.debug(f"KoSync: built-in progress lookup skipped: {e}")
             return None
 
+    @staticmethod
+    def _server_has_no_record(ko_xpath: Optional[str], ko_metadata: dict) -> bool:
+        """True when the server answered that it holds nothing for the document:
+        BookBridge's 404, or the original server's 200 with no position fields."""
+        status = ko_metadata.get("_http_status")
+        return status == 404 or (status == 200 and ko_xpath is None and not ko_metadata.get("progress"))
+
     def get_service_state(self, book: Book, prev_state: Optional[State], title_snip: str = "", bulk_context: dict = None) -> Optional[ServiceState]:
         ko_id = book.kosync_doc_id
         ko_metadata = {}
@@ -148,13 +157,31 @@ class KoSyncSyncClient(SyncClient):
                     )
                 ko_pct = canonical_pct
         book_label = f"'{title_snip}' " if title_snip else ""
-        if ko_pct is None and prev_state is None and ko_metadata.get("_http_status") == 404:
-            # The server has never stored a position for this mapped book. Joining at
-            # 0% lets the cycle write the leader's position here; staying out would
-            # leave the 404 in place forever. Only without a saved state: a 404 after
-            # one is not evidence the reader went back to the start.
-            logger.debug(f"{book_label}KoSync has no stored position yet; joining the cycle at 0%")
-            ko_pct = 0.0
+        no_record_key = f"kosync-no-record:{get_current_user_id()}:{getattr(book, 'abs_id', None)}"
+        if ko_pct is None and prev_state is None and self._server_has_no_record(ko_xpath, ko_metadata):
+            # Only a definite "no record" (never a 5xx or an outage) and only without a
+            # saved state: a missing position later is not evidence of a rewind. The
+            # placeholder never reaches change detection; it just lets the cycle write
+            # the other clients' agreed position here.
+            get_persistent_condition_logger().warn(
+                logger, no_record_key,
+                "%sKoSync has no stored position yet; it will be filled from the other clients",
+                book_label, level=logging.INFO,
+            )
+            return ServiceState(
+                current={"pct": 0.0, "xpath": None},
+                previous_pct=0,
+                delta=0.0,
+                threshold=self.delta_kosync_thresh,
+                is_configured=self.kosync_client.is_configured(),
+                display=("KoSync", "{prev:.4%} -> {curr:.4%}"),
+                value_formatter=lambda v: f"{v*100:.4f}%",
+                follower_only=True,
+            )
+        if ko_pct is not None:
+            get_persistent_condition_logger().resolve(
+                logger, no_record_key, f"{book_label}KoSync now has a stored position"
+            )
         if ko_pct is None:
             if ko_xpath is None:
                 logger.debug(f"{book_label}KoSync state missing xpath and percentage; returning None")
@@ -399,6 +426,7 @@ class KoSyncSyncClient(SyncClient):
     def update_progress(self, book: Book, request: UpdateProgressRequest) -> SyncResult:
         pct = request.locator_result.percentage
         ko_id = book.kosync_doc_id if book else None
+        fill = {"fill_if_absent": True} if request.fill_if_absent else {}
         # Keep the original cutoff through ordinary writes; only a corroborated
         # rewind can retire an older device position, including for CBZ books.
         rewind_at = time.time() if request.allow_rewind else (
@@ -462,7 +490,7 @@ class KoSyncSyncClient(SyncClient):
                 current = request.current_state.current if request.current_state else {}
                 return SyncResult(current.get('pct'), True, dict(current), skipped=True)
 
-            success = self.kosync_client.update_progress(ko_id, pct, page_progress)
+            success = self.kosync_client.update_progress(ko_id, pct, page_progress, **fill)
             updated_state = {'pct': pct, 'xpath': page_progress, 'page': coerce_page(page_progress)}
             if success and rewind_at is not None:
                 updated_state["kosync_approved_rewind_at"] = rewind_at
@@ -530,7 +558,7 @@ class KoSyncSyncClient(SyncClient):
                     exc_info=True,
                 )
 
-        success = self.kosync_client.update_progress(ko_id, pct, safe_xpath)
+        success = self.kosync_client.update_progress(ko_id, pct, safe_xpath, **fill)
         updated_state = {
             'pct': pct,
             'xpath': safe_xpath
