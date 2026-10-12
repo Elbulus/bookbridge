@@ -22,22 +22,25 @@ admin_api_bp = Blueprint("admin_api", __name__, url_prefix="/api/v1/admin")
 _database_service = None
 _on_user_created = None
 _on_integrations_saved = None
+_on_user_updated = None
 
 MIN_TOKEN_LENGTH = 32
 _short_token_warned = False
 
 
-def init_admin_api(database_service, on_user_created=None, on_integrations_saved=None):
+def init_admin_api(database_service, on_user_created=None, on_integrations_saved=None, on_user_updated=None):
     """Initialize the admin API with its dependencies.
 
-    on_user_created(user) runs after a user is created (for example to share the
+    on_user_created(user) runs after a user is created or re-enabled (to share the
     existing library). on_integrations_saved(user_id) runs after integrations
-    change (cache invalidation, primary-admin mirroring).
+    change (cache invalidation, primary-admin mirroring). on_user_updated(user_id)
+    refreshes cached clients after account role or active changes.
     """
-    global _database_service, _on_user_created, _on_integrations_saved
+    global _database_service, _on_user_created, _on_integrations_saved, _on_user_updated
     _database_service = database_service
     _on_user_created = on_user_created
     _on_integrations_saved = on_integrations_saved
+    _on_user_updated = on_user_updated
 
 
 def _configured_token():
@@ -73,10 +76,6 @@ def _user_json(user, created=None):
     if created is not None:
         data["created"] = created
     return data
-
-
-def _active_admin_count():
-    return sum(1 for u in _database_service.list_users() if u.role == "admin" and u.active)
 
 
 def _field_types():
@@ -135,28 +134,34 @@ def put_user(username):
     if user is None:
         if not password:
             return jsonify({"error": "password is required to create a user"}), 400
-        user = _database_service.create_user(username, password, role=role or "user")
+        user = _database_service.create_user(username, password, role=role or "user", active=0 if active is False else 1)
         logger.info(f"👤 Admin API: created user '{username}'")
         if _on_user_created is not None:
             try:
                 _on_user_created(user)
             except Exception as e:
                 logger.warning(f"Admin API: post-create hook failed for '{username}': {e}", exc_info=True)
-        if active is False:
-            _database_service.set_user_active(user.id, False)
         return jsonify(_user_json(_database_service.get_user(user.id), created=True)), 201
 
-    is_last_admin = user.role == "admin" and user.active and _active_admin_count() <= 1
-    if is_last_admin and (role == "user" or active is False):
-        return jsonify({"error": "can't demote or disable the last active admin"}), 409
-    if password:
-        _database_service.set_user_password(user.id, password)
-    if role is not None and role != user.role:
-        _database_service.set_user_role(user.id, role)
-    if active is not None and active != bool(user.active):
-        _database_service.set_user_active(user.id, active)
+    was_active = bool(user.active)
+    try:
+        user = _database_service.update_user_account(user.id, password=password, role=role, active=active)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 409
+    if user is None:
+        return jsonify({"error": "user not found"}), 404
+    if _on_user_updated is not None and (role is not None or active is not None):
+        try:
+            _on_user_updated(user.id)
+        except Exception as e:
+            logger.warning(f"Admin API: post-update hook failed for '{username}': {e}", exc_info=True)
+    if not was_active and user.active and _on_user_created is not None:
+        try:
+            _on_user_created(user)
+        except Exception as e:
+            logger.warning(f"Admin API: post-enable hook failed for '{username}': {e}", exc_info=True)
     logger.info(f"👤 Admin API: updated user '{username}'")
-    return jsonify(_user_json(_database_service.get_user(user.id), created=False)), 200
+    return jsonify(_user_json(user, created=False)), 200
 
 
 @admin_api_bp.route("/users/<username>/integrations", methods=["PATCH"])
@@ -192,8 +197,7 @@ def patch_integrations(username):
         else:
             return jsonify({"error": f"{key} must be a string"}), 400
 
-    for key, value in values.items():
-        _database_service.set_user_credential(user.id, key, value)
+    _database_service.set_user_credentials(user.id, values)
     if _on_integrations_saved is not None:
         try:
             _on_integrations_saved(user.id)
