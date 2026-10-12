@@ -100,7 +100,7 @@ class TestSyncCyclePushesToKoSyncWithoutAPosition(unittest.TestCase):
             State(abs_id="night", client_name="abs", percentage=0.11, timestamp=110.0, last_updated=1791757881.5),
         ]
 
-    def test_abs_position_is_pushed_to_kosync_that_has_no_position(self):
+    def _assert_abs_position_is_pushed(self, use_bulk_shortcut=False):
         from src.sync_clients.abs_sync_client import ABSSyncClient
         from src.sync_manager import SyncManager
 
@@ -133,6 +133,9 @@ class TestSyncCyclePushesToKoSyncWithoutAPosition(unittest.TestCase):
         database_service.get_states_for_book.return_value = self.states
         database_service.get_all_states.return_value = self.states
 
+        kosync = KoSyncSyncClient(kosync_api, ebook_parser)
+        if use_bulk_shortcut:
+            kosync.fetch_bulk_state = Mock(return_value={KOSYNC_DOC: self.book.abs_id})
         manager = SyncManager(
             abs_client=abs_client,
             transcriber=transcriber,
@@ -140,7 +143,7 @@ class TestSyncCyclePushesToKoSyncWithoutAPosition(unittest.TestCase):
             database_service=database_service,
             sync_clients={
                 "ABS": ABSSyncClient(abs_client, transcriber, ebook_parser),
-                "KoSync": KoSyncSyncClient(kosync_api, ebook_parser),
+                "KoSync": kosync,
             },
             epub_cache_dir=Path(self.temp_dir) / "epub_cache",
             data_dir=Path(self.temp_dir),
@@ -156,6 +159,14 @@ class TestSyncCyclePushesToKoSyncWithoutAPosition(unittest.TestCase):
         self.assertEqual(doc_id, KOSYNC_DOC)
         self.assertAlmostEqual(pct, 0.11, places=2)
         self.assertEqual(xpath, "/body/DocFragment[3]/body/p[2].0")
+        if use_bulk_shortcut:
+            kosync_api.get_progress_with_metadata.assert_not_called()
+
+    def test_abs_position_is_pushed_to_kosync_that_has_no_position(self):
+        self._assert_abs_position_is_pushed()
+
+    def test_bulk_shortcut_still_initializes_the_missing_kosync_position(self):
+        self._assert_abs_position_is_pushed(use_bulk_shortcut=True)
 
 
 if __name__ == "__main__":

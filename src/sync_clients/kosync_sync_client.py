@@ -94,6 +94,7 @@ class KoSyncSyncClient(SyncClient):
         if bulk_context and bulk_context.get(ko_id) == book.abs_id:
             # Built-in server with no progress for this book: the GET's 404 result.
             ko_pct, ko_xpath = None, None
+            ko_metadata = {"_http_status": 404}
         elif hasattr(self.kosync_client, "get_progress_with_metadata"):
             try:
                 ko_pct, ko_xpath, ko_metadata = self.kosync_client.get_progress_with_metadata(ko_id)
