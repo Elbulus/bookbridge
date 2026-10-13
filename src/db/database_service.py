@@ -9,6 +9,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -90,6 +91,11 @@ _SQL_IN_CHUNK = 500
 
 _PENDING_SHELF_ADDS_KEY = "BOOKLORE_SHELF_PENDING_ADDS"
 _SHELF_ASSIGNMENTS_KEY = "BOOKLORE_SHELF_ASSIGNMENTS"
+
+
+def _username_key(name: str) -> str:
+    """Unicode-correct comparison key for usernames (SQLite lower() folds ASCII only)."""
+    return unicodedata.normalize("NFC", unicodedata.normalize("NFC", (name or "").strip()).casefold())
 
 
 class DatabaseService:
@@ -412,14 +418,22 @@ class DatabaseService:
                 session.expunge(user)
             return user
 
+    @staticmethod
+    def _find_user_by_name(session, username: str, exclude_id: Optional[int] = None) -> Optional[User]:
+        """Match a username by NFC + casefold; the users table is tiny so this runs in Python."""
+        key = _username_key(username)
+        if not key:
+            return None
+        for user in session.query(User).order_by(User.id):
+            if user.id != exclude_id and _username_key(user.username) == key:
+                return user
+        return None
+
     def get_user_by_username(self, username: str) -> Optional[User]:
         if not username:
             return None
-        from sqlalchemy import func
         with self.get_session() as session:
-            user = session.query(User).filter(
-                func.lower(User.username) == username.strip().lower()
-            ).first()
+            user = self._find_user_by_name(session, username)
             if user:
                 session.expunge(user)
             return user
@@ -439,28 +453,30 @@ class DatabaseService:
                     active: int = 1) -> User:
         """Create a user with an optional plaintext password (hashed here).
 
-        Enforces case-insensitive username uniqueness. Every lookup (login,
-        KoSync auth, rename) compares via ``func.lower()``, but the DB unique
-        index is case-sensitive, so 'Admin' and 'admin' could otherwise coexist
-        and make those lookups resolve ambiguously. Raises ValueError on a clash.
+        Enforces Unicode case-insensitive username uniqueness (the DB unique
+        index is case-sensitive). The duplicate check and insert share one
+        BEGIN IMMEDIATE transaction so concurrent creators cannot both win.
+        Raises ValueError on a clash.
         """
+        from sqlalchemy import text
         from werkzeug.security import generate_password_hash
-        from sqlalchemy import func
         username = (username or "").strip()
         password_hash = generate_password_hash(password) if password else None
+        clash = False
         with self.get_session() as session:
-            existing = session.query(User).filter(
-                func.lower(User.username) == username.lower()
-            ).first()
-            if existing is not None:
-                raise ValueError(f"Username '{username}' already exists")
-            user = User(username=username, password_hash=password_hash,
-                        role=role, active=active)
-            session.add(user)
-            session.flush()
-            session.refresh(user)
-            session.expunge(user)
-            return user
+            session.execute(text("BEGIN IMMEDIATE"))
+            if self._find_user_by_name(session, username) is not None:
+                clash = True
+            else:
+                user = User(username=username, password_hash=password_hash,
+                            role=role, active=active)
+                session.add(user)
+                session.flush()
+                session.refresh(user)
+                session.expunge(user)
+        if clash:
+            raise ValueError(f"Username '{username}' already exists")
+        return user
 
     def set_user_password(self, user_id: int, password: str) -> bool:
         from werkzeug.security import generate_password_hash
@@ -469,30 +485,6 @@ class DatabaseService:
             if not user:
                 return False
             user.password_hash = generate_password_hash(password) if password else None
-            return True
-
-    def set_user_active(self, user_id: int, active: bool) -> bool:
-        with self.get_session() as session:
-            user = session.query(User).filter(User.id == user_id).first()
-            if not user:
-                return False
-            user.active = 1 if active else 0
-            return True
-
-    def set_user_role(self, user_id: int, role: str) -> bool:
-        """Set a user's role to 'admin' or 'user'. Returns False if not found."""
-        normalized = (role or "").strip().lower()
-        if normalized not in ('admin', 'user'):
-            raise ValueError(f"Invalid role: {role}")
-        with self.get_session() as session:
-            user = session.query(User).filter(User.id == user_id).first()
-            if not user:
-                return False
-            user.role = normalized
-            # A role change can move which account is the primary admin, and the
-            # default-user id is cached for the process lifetime, so recompute it
-            # on next access — same reason delete_user clears it.
-            self._default_uid = None
             return True
 
     def update_user_account(self, user_id: int, *, password: Optional[str] = None,
@@ -517,6 +509,10 @@ class DatabaseService:
                 primary = session.query(User).filter(User.role == 'admin').order_by(User.id).first()
                 if primary and primary.id == user_id:
                     policy_error = "Can't demote the primary admin — the global service settings belong to that account"
+            if role_changed and role == 'admin':
+                primary = session.query(User).filter(User.role == 'admin').order_by(User.id).first()
+                if primary and user_id < primary.id:
+                    policy_error = "Can't promote this account to admin — it would become the primary admin and take over the global service settings"
             if not policy_error and user.role == 'admin' and user.active and (role == 'user' or active is False):
                 if session.query(User).filter(User.role == 'admin', User.active == 1).count() <= 1:
                     policy_error = "Can't demote the last active admin" if role == 'user' else "Can't disable the last active admin"
@@ -537,17 +533,14 @@ class DatabaseService:
 
     def set_username(self, user_id: int, new_username: str) -> tuple:
         """Rename a user. Returns (ok, error_message). Enforces uniqueness
-        (case-insensitive) and a non-empty name."""
-        from sqlalchemy import func
+        (Unicode case-insensitive) and a non-empty name."""
+        from sqlalchemy import text
         new_username = (new_username or "").strip()
         if not new_username:
             return False, "Username cannot be empty"
         with self.get_session() as session:
-            clash = session.query(User).filter(
-                func.lower(User.username) == new_username.lower(),
-                User.id != user_id,
-            ).first()
-            if clash:
+            session.execute(text("BEGIN IMMEDIATE"))
+            if self._find_user_by_name(session, new_username, exclude_id=user_id) is not None:
                 return False, "That username is already taken"
             user = session.query(User).filter(User.id == user_id).first()
             if not user:
@@ -628,54 +621,42 @@ class DatabaseService:
             ).all()
             return {c.key: self._read_value(c.key, c.value) for c in creds}
 
-    def set_user_credential(self, user_id: int, key: str, value: str) -> Optional[UserCredential]:
-        """Store a per-user credential. Secret keys are encrypted at rest; the
-        returned (detached) row carries the plaintext the caller passed in.
-        Returns None when the account no longer exists."""
-        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+    _READEST_IDENTITY_KEYS = ('READEST_EMAIL', 'READEST_PASSWORD')
+    _READEST_TOKEN_KEYS = ('READEST_ACCESS_TOKEN', 'READEST_REFRESH_TOKEN', 'READEST_TOKEN_EXPIRES_AT')
 
-        plain = str(value) if value is not None else None
-        value_str = self._store_value(key, value)
-        with self.get_session() as session:
-            if session.query(User.id).filter(User.id == user_id).first() is None:
-                # An in-flight token refresh must not outlive its deleted account.
-                logger.info("🔐 Ignored credential write for missing user %s", user_id)
-                return None
-            statement = sqlite_insert(UserCredential).values(
-                user_id=user_id, key=key, value=value_str
-            ).on_conflict_do_update(
-                index_elements=[UserCredential.user_id, UserCredential.key],
-                set_={"value": value_str},
-            )
-            session.execute(statement)
-            cred = session.query(UserCredential).filter(
-                UserCredential.user_id == user_id, UserCredential.key == key
-            ).one()
-            session.expunge(cred)
-            cred.value = plain
-            return cred
+    def _write_user_credentials(self, user_id: int, values: dict,
+                                expected: Optional[dict] = None) -> bool:
+        """The one credential writer: atomic, and a no-op once the account is gone.
 
-    def set_user_credentials(self, user_id: int, values: dict[str, str]) -> None:
-        """Save related credentials atomically, encrypting secret values at rest."""
+        ``expected`` makes the write a compare-and-set: it is dropped unless every
+        listed key currently holds the given value (missing counts as ''). A change
+        of Readest identity clears that account's cached tokens in the same
+        transaction. Returns False when nothing was written.
+        """
         from sqlalchemy import text
         from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
         updates = dict(values)
         with self.get_session() as session:
-            identity_keys = ('READEST_EMAIL', 'READEST_PASSWORD')
-            if any(key in updates for key in identity_keys):
-                # Serialize the identity read/reset with other credential writers.
-                session.execute(text("BEGIN IMMEDIATE"))
-                current = {
-                    row.key: self._read_value(row.key, row.value)
-                    for row in session.query(UserCredential).filter(
-                        UserCredential.user_id == user_id, UserCredential.key.in_(identity_keys)
-                    )
-                }
-                if any(updates[key] != current.get(key) for key in identity_keys if key in updates):
-                    updates.update({key: '' for key in (
-                        'READEST_ACCESS_TOKEN', 'READEST_REFRESH_TOKEN', 'READEST_TOKEN_EXPIRES_AT'
-                    )})
+            session.execute(text("BEGIN IMMEDIATE"))
+            if session.query(User.id).filter(User.id == user_id).first() is None:
+                # An in-flight token refresh must not outlive its deleted account.
+                logger.info("🔐 Ignored credential write for missing user %s", user_id)
+                return False
+            watched = set(self._READEST_IDENTITY_KEYS) | set(expected or {})
+            current = {
+                row.key: self._read_value(row.key, row.value)
+                for row in session.query(UserCredential).filter(
+                    UserCredential.user_id == user_id, UserCredential.key.in_(watched)
+                )
+            }
+            if expected is not None and any(
+                (current.get(key) or '').strip() != (want or '').strip() for key, want in expected.items()
+            ):
+                logger.info("🔐 Dropped credential write for user %s: identity changed meanwhile", user_id)
+                return False
+            if any(updates[key] != current.get(key) for key in self._READEST_IDENTITY_KEYS if key in updates):
+                updates.update({key: '' for key in self._READEST_TOKEN_KEYS})
             for key, value in updates.items():
                 stored = self._store_value(key, value)
                 session.execute(sqlite_insert(UserCredential).values(
@@ -684,6 +665,38 @@ class DatabaseService:
                     index_elements=[UserCredential.user_id, UserCredential.key],
                     set_={"value": stored},
                 ))
+        return True
+
+    def set_user_credential(self, user_id: int, key: str, value: str) -> Optional[UserCredential]:
+        """Store a per-user credential. Secret keys are encrypted at rest; the
+        returned (detached) row carries the plaintext the caller passed in.
+        Returns None when the account no longer exists."""
+        plain = str(value) if value is not None else None
+        if not self._write_user_credentials(user_id, {key: value}):
+            return None
+        with self.get_session() as session:
+            cred = session.query(UserCredential).filter(
+                UserCredential.user_id == user_id, UserCredential.key == key
+            ).first()
+            if cred is None:
+                return None
+            session.expunge(cred)
+            cred.value = plain
+            return cred
+
+    def set_user_credentials(self, user_id: int, values: dict[str, str]) -> bool:
+        """Save related credentials atomically, encrypting secret values at rest.
+
+        Returns False (writing nothing) when the account no longer exists."""
+        return self._write_user_credentials(user_id, values)
+
+    def persist_readest_tokens(self, user_id: int, tokens: dict[str, str],
+                               email: str, password: str) -> bool:
+        """Store refreshed Readest tokens only if the account's Readest identity is
+        still the one that obtained them; otherwise drop them."""
+        return self._write_user_credentials(
+            user_id, tokens, expected={'READEST_EMAIL': email, 'READEST_PASSWORD': password}
+        )
 
     def encrypt_plaintext_secrets(self) -> int:
         """Wrap any secret still sitting in plaintext, in both credential stores.
