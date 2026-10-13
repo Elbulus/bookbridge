@@ -64,6 +64,17 @@ _SESSION_DEDUPE_WINDOW_SECONDS = 7200
 _SESSION_OVERLAP_EPSILON_PCT = 0.05
 
 
+class BookOrbitUploadError(Exception):
+    """A refused/failed file upload; ``kind`` is one of name_conflict, duplicate,
+    conflict, too_large, auth, failed."""
+
+    def __init__(self, kind: str, status_code: Optional[int] = None, message: str = ""):
+        super().__init__(message or kind)
+        self.kind = kind
+        self.status_code = status_code
+        self.message = message
+
+
 class BookOrbitClient:
     def __init__(self, ollama_client=None, credentials: dict = None):
         self.ollama_client = ollama_client
@@ -1116,8 +1127,9 @@ class BookOrbitClient:
                 "format": (f.get("format") or "").lower(),
                 "duration_seconds": track_duration,
                 "size_bytes": f.get("sizeBytes"),
-                # BookOrbit and the bridge share the /books mount, so this
-                # container path often resolves locally (staging fast path).
+                # absolutePath is in BookOrbit's container namespace; it
+                # resolves here only when the bridge mounts the library at the
+                # same path (staging fast path), never assumed.
                 "absolute_path": f.get("absolutePath"),
             })
 
