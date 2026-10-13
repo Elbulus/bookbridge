@@ -31,6 +31,9 @@ All notable changes to BookBridge will be documented in this file.
 
 ### Fixed
 
+- Show the real Calibre-Web and Kavita logos in the Library header and on the dashboard,
+  and fix the Kavita settings section's expand arrow. Contributed by
+  [@chemicalsno](https://github.com/chemicalsno) in #501.
 - Apply account changes atomically in the admin API and dashboard, protecting the
   primary admin and retaining an active admin during concurrent updates or deletion.
   Deleting an account removes its scoped data while retaining the shared catalog,
