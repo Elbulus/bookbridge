@@ -279,6 +279,11 @@ class TestKosyncEndpoints(unittest.TestCase):
         # Clear specific tables
         from src import web_server
         from src.api import kosync_server
+        # Mocked endpoint tests must not consume or refresh a real manifest cache.
+        for name in ('_start_manifest_prebuilder', '_load_persisted_manifest'):
+            patcher = patch.object(kosync_server, name, return_value=None)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         with web_server.database_service.get_session() as session:
              session.query(ReadingSession).delete()
              session.query(KosyncDocument).delete()
