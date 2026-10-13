@@ -100,6 +100,12 @@ class DatabaseService:
     conversions for better type safety and cleaner code.
     """
 
+    # Process-local log of which books had sync-relevant progress written, so a
+    # sync cycle can tell its start-of-cycle snapshot went stale for a book.
+    _progress_lock = threading.Lock()
+    _progress_seq = 0
+    _progress_written_at: dict = {}
+
     def __init__(self, db_path: str):
         import os
         self.db_path = Path(os.path.abspath(db_path))
@@ -218,12 +224,40 @@ class DatabaseService:
         try:
             yield session
             session.commit()
+            written = session.info.pop("progress_written", None)
+            if written:
+                self._note_progress_written(written)
         except Exception as e:
             session.rollback()
             logger.error(f"❌ Database error: {e}", exc_info=True)
             raise
         finally:
             session.close()
+
+    @classmethod
+    def _note_progress_written(cls, abs_ids) -> None:
+        """Record that these books' sync-relevant progress was just committed."""
+        with DatabaseService._progress_lock:
+            DatabaseService._progress_seq += 1
+            for abs_id in abs_ids:
+                DatabaseService._progress_written_at[abs_id] = DatabaseService._progress_seq
+
+    @classmethod
+    def progress_write_seq(cls) -> int:
+        """Current value of the process-wide progress-write counter."""
+        with DatabaseService._progress_lock:
+            return DatabaseService._progress_seq
+
+    @classmethod
+    def progress_written_since(cls, abs_id: str, seq: int) -> bool:
+        """True when a book's progress (State or linked KoSync device progress) was written after ``seq``."""
+        with DatabaseService._progress_lock:
+            return DatabaseService._progress_written_at.get(abs_id, 0) > seq
+
+    @staticmethod
+    def _mark_progress_written(session, *abs_ids) -> None:
+        """Queue books for the progress-write log; it is bumped once the session commits."""
+        session.info.setdefault("progress_written", set()).update(a for a in abs_ids if a)
 
     # Setting operations
     @staticmethod
@@ -1363,6 +1397,7 @@ class DatabaseService:
             try:
                 # Migrate Foreign Keys
                 # synchronize_session=False is required for updates on collections
+                self._mark_progress_written(session, old_abs_id, new_abs_id)
                 session.query(State).filter(State.abs_id == old_abs_id).update({State.abs_id: new_abs_id}, synchronize_session=False)
                 session.query(Job).filter(Job.abs_id == old_abs_id).update({Job.abs_id: new_abs_id}, synchronize_session=False)
                 session.query(KosyncDocument).filter(KosyncDocument.linked_abs_id == old_abs_id).update({KosyncDocument.linked_abs_id: new_abs_id}, synchronize_session=False)
@@ -2066,19 +2101,26 @@ class DatabaseService:
                 session.expunge(state)
             return states
 
-    def get_all_states(self, user_id: int = None) -> List[State]:
+    def get_all_states(self, user_id: int = None, abs_ids=None) -> List[State]:
         """Get all states. When user_id is given, scope to that user; otherwise
-        return every row (dashboard, until per-user scoping in the UI)."""
+        return every row (dashboard, until per-user scoping in the UI).
+        ``abs_ids`` restricts the read to those books."""
         if user_id is None:
             logger.debug(
                 "get_all_states called with user_id=None — returning unfiltered "
                 "bulk data. Future callers should pass an explicit user_id."
             )
+        wanted = None if abs_ids is None else list(abs_ids)
         with self.get_session() as session:
             query = session.query(State)
             if user_id is not None:
                 query = query.filter(State.user_id == user_id)
-            states = query.all()
+            if wanted is None:
+                states = query.all()
+            else:
+                states = []
+                for i in range(0, len(wanted), 500):  # stay under SQLite's variable limit
+                    states.extend(query.filter(State.abs_id.in_(wanted[i:i + 500])).all())
             for state in states:
                 session.expunge(state)
             return states
@@ -2093,6 +2135,7 @@ class DatabaseService:
                 State.client_name == state.client_name,
                 State.user_id == state.user_id,
             ).first()
+            self._mark_progress_written(session, state.abs_id)
 
             if existing:
                 # Update existing state
@@ -2115,6 +2158,7 @@ class DatabaseService:
     def delete_states_for_book(self, abs_id: str, user_id: int = None) -> int:
         """Delete states for a book. Scoped to a user when user_id is given."""
         with self.get_session() as session:
+            self._mark_progress_written(session, abs_id)
             query = session.query(State).filter(State.abs_id == abs_id)
             if user_id is not None:
                 query = query.filter(State.user_id == user_id)
@@ -2144,12 +2188,19 @@ class DatabaseService:
 
     def get_latest_jobs(self, kind: Optional[str] = None) -> dict:
         """``get_latest_job`` for all books in one query: abs_id -> latest job."""
+        from sqlalchemy import func
         with self.get_session() as session:
-            query = session.query(Job)
+            newest = session.query(Job.abs_id, func.max(Job.last_attempt).label("newest"))
+            if kind is not None:
+                newest = newest.filter(Job.kind == kind)
+            newest = newest.group_by(Job.abs_id).subquery()
+            query = session.query(Job).join(
+                newest, (Job.abs_id == newest.c.abs_id) & Job.last_attempt.is_(newest.c.newest)
+            )
             if kind is not None:
                 query = query.filter(Job.kind == kind)
             latest = {}
-            for job in query.order_by(Job.last_attempt.desc()).all():
+            for job in query.all():
                 if job.abs_id not in latest:
                     session.expunge(job)
                     latest[job.abs_id] = job
@@ -2419,6 +2470,7 @@ class DatabaseService:
         now = utcnow()
         doc.last_updated = now
         with self.get_session() as session:
+            self._mark_progress_written(session, doc.linked_abs_id)
             stmt = sqlite_insert(KosyncDocument).values(
                 document_hash=doc.document_hash,
                 progress=doc.progress,
@@ -2682,6 +2734,7 @@ class DatabaseService:
         if uid is None or not document_hash:
             return None
         with self.get_session() as session:
+            self._mark_hash_progress_written(session, document_hash)
             row = session.query(KosyncUserProgress).filter(
                 KosyncUserProgress.document_hash == document_hash,
                 KosyncUserProgress.user_id == uid,
@@ -2708,6 +2761,13 @@ class DatabaseService:
             session.refresh(row)
             session.expunge(row)
             return row
+
+    def _mark_hash_progress_written(self, session, document_hash: str) -> None:
+        """Mark every book a KoSync document hash is linked to (or is the doc id of) as written."""
+        linked = [r[0] for r in session.query(KosyncDocument.linked_abs_id).filter(
+            KosyncDocument.document_hash == document_hash).all()]
+        owners = [r[0] for r in session.query(Book.abs_id).filter(Book.kosync_doc_id == document_hash).all()]
+        self._mark_progress_written(session, *linked, *owners)
 
     def get_user_kosync_progress_for_book(self, abs_id: str, user_id: int = None) -> List[KosyncUserProgress]:
         """Return this user's progress rows across every hash linked to ``abs_id``.
@@ -2843,6 +2903,7 @@ class DatabaseService:
             return 0, 0
 
         with self.get_session() as session:
+            self._mark_progress_written(session, abs_id)
             hashes = {
                 row[0]
                 for row in session.query(KosyncDocument.document_hash)
@@ -2882,6 +2943,7 @@ class DatabaseService:
 
         now = utcnow()
         with self.get_session() as session:
+            self._mark_progress_written(session, abs_id)
             hashes = {
                 row[0]
                 for row in session.query(KosyncDocument.document_hash)

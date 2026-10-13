@@ -135,7 +135,7 @@ class TestSyncCyclePushesToKoSyncWithoutAPosition(unittest.TestCase):
 
         kosync = KoSyncSyncClient(kosync_api, ebook_parser)
         if use_bulk_shortcut:
-            kosync.fetch_bulk_state = Mock(return_value={KOSYNC_DOC: self.book.abs_id})
+            kosync.fetch_bulk_state = Mock(return_value={"documents_without_progress": {KOSYNC_DOC: self.book.abs_id}})
         manager = SyncManager(
             abs_client=abs_client,
             transcriber=transcriber,
