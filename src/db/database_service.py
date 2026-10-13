@@ -633,38 +633,47 @@ class DatabaseService:
         of Readest identity clears that account's cached tokens in the same
         transaction. Returns False when nothing was written.
         """
-        from sqlalchemy import text
+        from sqlalchemy import exists, literal, select, text
         from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
         updates = dict(values)
+        written = 0
         with self.get_session() as session:
-            session.execute(text("BEGIN IMMEDIATE"))
-            if session.query(User.id).filter(User.id == user_id).first() is None:
-                # An in-flight token refresh must not outlive its deleted account.
-                logger.info("🔐 Ignored credential write for missing user %s", user_id)
-                return False
-            watched = set(self._READEST_IDENTITY_KEYS) | set(expected or {})
-            current = {
-                row.key: self._read_value(row.key, row.value)
-                for row in session.query(UserCredential).filter(
-                    UserCredential.user_id == user_id, UserCredential.key.in_(watched)
-                )
-            }
-            if expected is not None and any(
-                (current.get(key) or '').strip() != (want or '').strip() for key, want in expected.items()
-            ):
-                logger.info("🔐 Dropped credential write for user %s: identity changed meanwhile", user_id)
-                return False
-            if any(updates[key] != current.get(key) for key in self._READEST_IDENTITY_KEYS if key in updates):
-                updates.update({key: '' for key in self._READEST_TOKEN_KEYS})
+            if expected is not None or any(key in updates for key in self._READEST_IDENTITY_KEYS):
+                # Reads that decide the write: hold the writer lock from read to write.
+                session.execute(text("BEGIN IMMEDIATE"))
+                watched = set(self._READEST_IDENTITY_KEYS) | set(expected or {})
+                current = {
+                    row.key: self._read_value(row.key, row.value)
+                    for row in session.query(UserCredential).filter(
+                        UserCredential.user_id == user_id, UserCredential.key.in_(watched)
+                    )
+                }
+                if expected is not None and any(
+                    (current.get(key) or '').strip() != (want or '').strip() for key, want in expected.items()
+                ):
+                    logger.info("🔐 Dropped credential write for user %s: identity changed meanwhile", user_id)
+                    return False
+                if any(updates[key] != current.get(key) for key in self._READEST_IDENTITY_KEYS if key in updates):
+                    updates.update({key: '' for key in self._READEST_TOKEN_KEYS})
             for key, value in updates.items():
                 stored = self._store_value(key, value)
-                session.execute(sqlite_insert(UserCredential).values(
-                    user_id=user_id, key=key, value=stored,
-                ).on_conflict_do_update(
-                    index_elements=[UserCredential.user_id, UserCredential.key],
-                    set_={"value": stored},
-                ))
+                # One statement that writes only while the account exists: atomic against a
+                # concurrent delete_user without serializing every credential writer.
+                row = select(literal(user_id), literal(key), literal(stored)).where(
+                    exists().where(User.id == user_id)
+                )
+                written += session.execute(
+                    sqlite_insert(UserCredential).from_select(['user_id', 'key', 'value'], row)
+                    .on_conflict_do_update(
+                        index_elements=[UserCredential.user_id, UserCredential.key],
+                        set_={"value": stored},
+                    )
+                ).rowcount
+        if updates and not written:
+            # An in-flight token refresh must not outlive its deleted account.
+            logger.info("🔐 Ignored credential write for missing user %s", user_id)
+            return False
         return True
 
     def set_user_credential(self, user_id: int, key: str, value: str) -> Optional[UserCredential]:
