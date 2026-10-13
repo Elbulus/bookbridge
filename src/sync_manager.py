@@ -4535,6 +4535,18 @@ class SyncManager:
         except Exception as e:
             logger.debug(f"Could not persist state snapshot for '{client_name}': {e}")
 
+    def _user_may_sync(self, user_id: int) -> bool:
+        """False for a disabled or deleted account; a failed lookup lets the cycle run."""
+        try:
+            user = self.database_service.get_user(user_id)
+        except Exception as e:
+            logger.debug("Could not check account %s before syncing: %s", user_id, e, exc_info=True)
+            return True
+        if user is not None and getattr(user, "active", 1):
+            return True
+        logger.info("⏸️ Skipping sync for user %s: account is disabled or deleted", user_id)
+        return False
+
     def sync_cycle(self, target_abs_id=None, user_id=None, sessions_only: bool = False):
         """
         Run a sync cycle.
@@ -4547,6 +4559,9 @@ class SyncManager:
                      runs as the default (single-user/admin) exactly as before.
             sessions_only: Deliver buffered sessions using the same user context and lock.
         """
+        if user_id is not None and not self._user_may_sync(user_id):
+            return
+
         # Per-user context: only when an explicit user + a registry are present,
         # so the default cycle is byte-for-byte unchanged.
         clients_token = None
