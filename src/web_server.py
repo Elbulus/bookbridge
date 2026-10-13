@@ -38,6 +38,7 @@ from src.utils.user_context import (
 from src.utils.user_config import resolve_setting, user_setting
 from src.utils.user_config import global_fallback_allowed as _global_fallback_allowed
 from src.utils.user_config import SERVICE_ENABLE_KEYS
+from src.utils.kosync_url import is_builtin_kosync_url
 
 from src.utils.config_loader import ConfigLoader, KNOWN_SETTING_KEYS, env_truthy
 from src.utils.cache_paths import safe_cache_path, safe_library_path, is_plain_basename
@@ -12485,34 +12486,6 @@ def _build_test_url(base_url: str, path: str) -> str:
     return f"{base_url.rstrip('/')}/{path.lstrip('/')}"
 
 
-def _is_builtin_kosync_test_url(url: str) -> bool:
-    if not url:
-        return False
-
-    try:
-        parsed = urlparse(url)
-    except Exception:
-        return False
-
-    host = (parsed.hostname or "").strip().lower()
-    if host not in {"127.0.0.1", "localhost", "0.0.0.0", "::1"}:
-        return False
-
-    valid_ports = {5757}
-    configured_port = (os.environ.get("KOSYNC_PORT") or "").strip()
-    if configured_port:
-        try:
-            valid_ports.add(int(configured_port))
-        except ValueError:
-            logger.warning(f"Invalid KOSYNC_PORT '{configured_port}' while testing KOSync settings", exc_info=True)
-
-    port = parsed.port
-    if port is None:
-        port = 443 if parsed.scheme == "https" else 80
-
-    return port in valid_ports
-
-
 def _run_test_connection(service: str, payload: dict):
     testers = {
         'abs': lambda data: _test_abs(
@@ -13277,7 +13250,7 @@ def _test_kosync(
     except Exception as e:
         healthcheck_error = str(e)
 
-    if _is_builtin_kosync_test_url(url):
+    if is_builtin_kosync_url(url):
         if healthcheck_status == 200:
             return {
                 "ok": True,

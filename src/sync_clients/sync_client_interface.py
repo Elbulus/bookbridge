@@ -117,6 +117,13 @@ class SyncClient:
         Returns a dict keyed by book identifier for quick lookup.
         Only implemented by clients that support bulk fetching (ABS, Storyteller).
         Default returns None (no bulk support).
+
+        Contract: None means the read failed, is unknown or unsupported; any dict,
+        even an empty one, means the read succeeded and is handed to every
+        get_service_state call as ``bulk_context``. A client whose per-book read
+        would find more than the map must fall back to it for a missing key; a
+        client for which a missing key after a successful read means "no progress"
+        (ABS) must say so.
         """
         return None
 

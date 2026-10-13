@@ -4707,11 +4707,10 @@ class SyncManager:
             abs_client and getattr(abs_client, "is_configured", lambda: False)()
         )
         # This cycle's GET /api/me showed the user can access every library item
-        abs_sees_all = "ABS" in (bulk_states_per_client or {}) and (
-            getattr(abs_client, "can_access_all_items", False) is True
-        )
+        abs_bulk = (bulk_states_per_client or {}).get("ABS")
+        abs_sees_all = abs_bulk is not None and getattr(abs_bulk, "can_access_all_items", False) is True
+        abs_bulk = abs_bulk or {}
         abs_item_ids = None
-        abs_bulk = (bulk_states_per_client or {}).get("ABS") or {}
         abs_bulk_ids = set(abs_bulk.keys()) if isinstance(abs_bulk, dict) else set()
 
         # Primary ownership gate: only the books this user claimed (linked).
@@ -4724,6 +4723,14 @@ class SyncManager:
                 exc,
                 exc_info=True,
             )
+            for book in books or []:
+                logger.warning(
+                    "Skipping '%s' for user_id=%s: ownership check failed: %s",
+                    getattr(book, "abs_id", None),
+                    user_id,
+                    exc,
+                    exc_info=True,
+                )
             linked_abs_ids = set()
 
         visible = []
@@ -4752,22 +4759,30 @@ class SyncManager:
                 visible.append(book)
                 continue
 
-            # With access to every item, an item is accessible iff it is listed (one listing, not a request per book)
+            # With access to every item, a listed item is accessible (one cached listing, not a request per
+            # book); a miss may be a new item, so it is checked on its own below.
+            missing_key = f"abs-item-not-listed:{user_id}:{abs_id}"
             if abs_sees_all and abs_item_ids is None:
                 abs_item_ids = abs_client.get_all_item_ids()
                 abs_sees_all = abs_item_ids is not None  # listing failed: check each book
-            if abs_sees_all:
-                if abs_id in abs_item_ids:
-                    visible.append(book)
-                else:
-                    logger.warning(
-                        "⚠️ ABS: Skipping item '%s' for user_id=%s: not in the library listing", abs_id, user_id
-                    )
+            if abs_sees_all and abs_id in abs_item_ids:
+                get_persistent_condition_logger().resolve(
+                    logger, missing_key, "✅ ABS: Item '%s' is back in the library listing", abs_id
+                )
+                visible.append(book)
                 continue
 
             try:
                 if abs_client.get_item_details(abs_id):
+                    get_persistent_condition_logger().resolve(
+                        logger, missing_key, "✅ ABS: Item '%s' is back in the library listing", abs_id
+                    )
                     visible.append(book)
+                elif abs_sees_all:
+                    get_persistent_condition_logger().warn(
+                        logger, missing_key,
+                        "⚠️ ABS: Skipping item '%s' for user_id=%s: not in the library listing", abs_id, user_id,
+                    )
                 else:
                     logger.debug(
                         "Skipping ABS item '%s' for user_id=%s: item is not accessible to this ABS token",
@@ -4790,6 +4805,14 @@ class SyncManager:
         return visible
 
     def _sync_cycle_internal(self, target_abs_id=None):
+        # One state-fetch pool per cycle, sized so each book still fetches all its clients at once.
+        state_fetch_pool = ThreadPoolExecutor(max_workers=max(1, len(self.sync_clients)))
+        try:
+            self._run_sync_cycle(target_abs_id, state_fetch_pool)
+        finally:
+            state_fetch_pool.shutdown()
+
+    def _run_sync_cycle(self, target_abs_id, state_fetch_pool: ThreadPoolExecutor) -> None:
         self._flush_reading_sessions()
         # Clear caches at start of cycle
         self._sync_cycle_ebook_cache.clear()
@@ -4865,12 +4888,15 @@ class SyncManager:
         # Optimization: Pre-fetch bulk data from all clients that support it
         # Only do this if we are in a full cycle (target_abs_id is None)
         bulk_states_per_client = {}
+        # Taken before the bulk reads: a book written after this point is re-read
+        # individually, since every cycle-start read is minutes old by its turn.
+        snapshot_seq = None if target_abs_id else self.database_service.progress_write_seq()
 
         if not target_abs_id:
             for client_name, client in self.sync_clients.items():
                 bulk_data = client.fetch_bulk_state()
-                # An empty ABS map from a successful read still means "no progress"
-                if bulk_data or (client_name == "ABS" and bulk_data is not None):
+                # None = the read failed; any dict, even an empty one, is a successful read
+                if bulk_data is not None:
                     bulk_states_per_client[client_name] = bulk_data
                     logger.debug(f"📊 Pre-fetched bulk state for {client_name}")
 
@@ -4905,16 +4931,21 @@ class SyncManager:
         # here; Instant Sync (one book) keeps the per-book reads.
         states_by_book = alignment_snapshot = None
         if not target_abs_id:
-            states_by_book = {}
-            for state in self.database_service.get_all_states(user_id=self.database_service._resolve_uid(None)):
-                states_by_book.setdefault(state.abs_id, []).append(state)
-            if self.alignment_service:
-                alignment_snapshot = (
-                    self.database_service.get_aligned_book_ids(),
-                    self.database_service.get_latest_jobs(kind=JOB_KIND_ALIGNMENT),
-                )
-        # One state-fetch pool per cycle, sized so each book still fetches all its clients at once.
-        state_fetch_pool = ThreadPoolExecutor(max_workers=max(1, len(self.sync_clients)))
+            try:
+                states_by_book = {}
+                for state in self.database_service.get_all_states(
+                    user_id=self.database_service._resolve_uid(None),
+                    abs_ids=[b.abs_id for b in active_books],
+                ):
+                    states_by_book.setdefault(state.abs_id, []).append(state)
+                if self.alignment_service:
+                    alignment_snapshot = (
+                        self.database_service.get_aligned_book_ids(),
+                        self.database_service.get_latest_jobs(kind=JOB_KIND_ALIGNMENT),
+                    )
+            except Exception as e:
+                logger.warning("Cycle snapshot read failed, reading per book instead: %s", e, exc_info=True)
+                states_by_book = alignment_snapshot = None
 
         for book in active_books:
             book_t0 = time.monotonic()
@@ -4931,8 +4962,18 @@ class SyncManager:
                     if not had_db_managed_alignment and getattr(book, 'transcript_file', None) == 'DB_MANAGED':
                         logger.info(f"   🔄 Upgrading '{title_snip}' to DB_MANAGED unified architecture")
 
+                # A write since the snapshot (web route, KoSync PUT) makes both the saved states
+                # and the cycle-start "KoSync would 404" map stale for this book.
+                written_since_snapshot = (
+                    states_by_book is not None
+                    and self.database_service.progress_written_since(abs_id, snapshot_seq) is True
+                )
+                book_bulk_states = bulk_states_per_client
+                if written_since_snapshot:
+                    book_bulk_states = {k: v for k, v in bulk_states_per_client.items() if k != "KoSync"}
+
                 # Get previous state for this book from database
-                if states_by_book is not None:
+                if states_by_book is not None and not written_since_snapshot:
                     previous_states = states_by_book.get(abs_id, [])
                 else:
                     previous_states = self.database_service.get_states_for_book(abs_id)
@@ -4956,7 +4997,7 @@ class SyncManager:
 
                 # Build config using active_clients - parallel fetch
                 config = self._fetch_states_parallel(
-                    book, prev_states_by_client, title_snip, bulk_states_per_client, active_clients, executor=state_fetch_pool
+                    book, prev_states_by_client, title_snip, book_bulk_states, active_clients, executor=state_fetch_pool
                 )
 
                 # Filtered config now only contains non-None states
@@ -5547,7 +5588,6 @@ class SyncManager:
                 logger.error(f"❌ Sync error: {e}", exc_info=True)
             finally:
                 book_durations.append((time.monotonic() - book_t0, title_snip))
-        state_fetch_pool.shutdown()
 
         cycle_elapsed = time.monotonic() - cycle_t0
         n_books = len(book_durations)

@@ -180,7 +180,7 @@ class TestKosyncNotFoundStatus(unittest.TestCase):
         kosync = KoSyncClient({**creds, "KOSYNC_SERVER": "http://127.0.0.1:5757"})
         sync_client = KoSyncSyncClient(kosync, MagicMock())
         bulk = sync_client.fetch_bulk_state()
-        self.assertEqual(bulk, {hashes["empty"]: "empty"})
+        self.assertEqual(bulk, {"documents_without_progress": {hashes["empty"]: "empty"}})
         for name, doc_hash in hashes.items():
             status = self.client.get(f'/syncs/progress/{doc_hash}', headers=self.auth_headers).status_code
             self.assertEqual(status, 404 if name == "empty" else 200, name)
