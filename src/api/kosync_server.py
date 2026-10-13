@@ -1798,6 +1798,19 @@ def _record_user_kosync_state(book, percentage, progress, timestamp, user_id):
         )
 
 
+def _kosync_position_is_held(doc_hash: str, kosync_doc, baseline, user_id) -> bool:
+    """True when the requesting user already has a position stored for the document:
+    a device/user progress row with a percentage, or a KoSync State on the linked book.
+    The GET can hide such a position (no locator), so absence there proves nothing."""
+    if baseline is not None and baseline.percentage and float(baseline.percentage) > 0:
+        return True
+    abs_id = getattr(kosync_doc, "linked_abs_id", None)
+    if not abs_id:
+        linked = _database_service.get_book_by_kosync_id(doc_hash)
+        abs_id = linked.abs_id if linked else None
+    return bool(abs_id and _database_service.get_state(abs_id, "kosync", user_id=user_id))
+
+
 @kosync_sync_bp.route('/syncs/progress', methods=['PUT'])
 @kosync_sync_bp.route('/koreader/syncs/progress', methods=['PUT'])
 @kosync_auth_required
@@ -1861,6 +1874,16 @@ def kosync_put_progress():
     baseline_device = getattr(baseline, "device", None)
     baseline_device_id = getattr(baseline, "device_id", None)
     same_device = bool(baseline and baseline_device_id and baseline_device_id == device_id)
+
+    if data.get('fill_if_absent') and is_internal and _kosync_position_is_held(
+        doc_hash, kosync_doc, baseline, request_user_id
+    ):
+        logger.info(
+            f"KOSync: Ignored fill-if-absent push for doc {doc_hash}: this user already has a "
+            f"stored position, which a starting-position fill must not replace"
+        )
+        # 409, not 200: the caller must not record the fill as the position held here.
+        return jsonify({"document": doc_hash, "message": "Position already stored"}), 409
 
     # Furthest-wins exists to stop one DEVICE from regressing another. When the
     # position it is defending was never claimed by a real device — no device_id

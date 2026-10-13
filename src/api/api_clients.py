@@ -1225,7 +1225,8 @@ class KoSyncClient:
                 data = r.json()
                 raw_pct = data.get('percentage')
                 if raw_pct is None:
-                    return None, None, data
+                    # The original sync server answers 200 + {} for an unknown document.
+                    return None, None, {**data, "_http_status": 200}
                 pct = float(raw_pct)
                 # Grab the raw progress string (XPath)
                 xpath = data.get('progress')
@@ -1244,7 +1245,7 @@ class KoSyncClient:
             logger.error(f"❌ Error fetching KoSync progress for doc '{doc_id}': {e}", exc_info=True)
         return None, None, {}
 
-    def update_progress(self, doc_id, percentage, xpath=None):
+    def update_progress(self, doc_id, percentage, xpath=None, fill_if_absent=False):
         if not self.is_configured(): return False
 
         request_kwargs = self._request_kwargs()
@@ -1267,11 +1268,16 @@ class KoSyncClient:
         if self._is_local_server():
             payload["timestamp"] = int(time.time())
             payload["force"] = True
+            if fill_if_absent:
+                payload["fill_if_absent"] = True
         try:
             r = self.session.put(url, json=payload, timeout=10, **request_kwargs)
             if r.status_code in (200, 202, 201, 204):
                 logger.debug(f"   📡 KoSync Updated: {percentage:.1%} with progress '{progress_val}' for doc {doc_id}")
                 return True
+            elif fill_if_absent and r.status_code == 409:
+                logger.info(f"KoSync already holds a position for doc {doc_id}; starting-position fill not applied")
+                return False
             else:
                 logger.error(f"❌ Failed to update KoSync: {r.status_code} - {r.text}")
                 return False
