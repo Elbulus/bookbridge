@@ -207,7 +207,10 @@ class TestJobKindIsolation(unittest.TestCase):
         book = self.db.get_book(self.abs_id)
         book.status = "processing"
         import src.web_server as ws
-        with patch.object(ws, "database_service", self.db):
+        # The module's manager is set only when the app runs; give the URL builder one.
+        manager = MagicMock()
+        manager.abs_client.base_url = "http://abs.example"
+        with patch.object(ws, "database_service", self.db), patch.object(ws, "manager", manager):
             mapping = ws._build_dashboard_mapping(
                 book, {}, {}, {}, {}, {}, {},
             )
