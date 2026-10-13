@@ -1543,6 +1543,8 @@ class DatabaseService:
             ).first()
             if not exists:
                 session.add(UserBook(user_id=user_id, abs_id=abs_id))
+        if not exists:
+            self._notify_catalog_change()
 
     def link_book_to_all_active_users(self, abs_id: str) -> int:
         """Claim one book for every active user. Returns links created.
@@ -1564,7 +1566,9 @@ class DatabaseService:
             missing = user_ids - claimed
             for user_id in missing:
                 session.add(UserBook(user_id=user_id, abs_id=abs_id))
-            return len(missing)
+        if missing:
+            self._notify_catalog_change()
+        return len(missing)
 
     def backfill_user_books_for_user(self, user_id: int) -> int:
         """Claim every catalog book for one user. Returns links created.
@@ -1583,7 +1587,9 @@ class DatabaseService:
             missing = all_ids - claimed
             for abs_id in missing:
                 session.add(UserBook(user_id=user_id, abs_id=abs_id))
-            return len(missing)
+        if missing:
+            self._notify_catalog_change()
+        return len(missing)
 
     def share_all_books_with_active_users(self) -> dict:
         """Claim every catalog book for every active user. Returns {"users": <count>, "links": <count>}.
@@ -1618,16 +1624,21 @@ class DatabaseService:
                     session.add(UserBook(user_id=user_id, abs_id=abs_id))
                     links_created += 1
 
-            return {"users": len(active_user_ids), "links": links_created}
+        if links_created:
+            self._notify_catalog_change()
+        return {"users": len(active_user_ids), "links": links_created}
 
     def unlink_user_book(self, user_id: int, abs_id: str) -> int:
         """Remove a user's claim on a book. Returns rows deleted."""
         if user_id is None or not abs_id:
             return 0
         with self.get_session() as session:
-            return session.query(UserBook).filter(
+            deleted = session.query(UserBook).filter(
                 UserBook.user_id == user_id, UserBook.abs_id == abs_id
             ).delete(synchronize_session=False)
+        if deleted:
+            self._notify_catalog_change()
+        return deleted
 
     def is_user_linked(self, user_id: int, abs_id: str) -> bool:
         """True if the user has claimed this book."""
@@ -2434,6 +2445,7 @@ class DatabaseService:
                 source=doc.source,
                 booklore_id=doc.booklore_id,
                 mtime=doc.mtime,
+                hash_method=doc.hash_method,
             )
             excluded = stmt.excluded
             session.execute(stmt.on_conflict_do_update(
@@ -2451,6 +2463,7 @@ class DatabaseService:
                     "source": excluded.source,
                     "booklore_id": excluded.booklore_id,
                     "mtime": excluded.mtime,
+                    "hash_method": excluded.hash_method,
                 },
             ))
             saved = session.get(KosyncDocument, doc.document_hash)
@@ -2554,31 +2567,75 @@ class DatabaseService:
             return False
 
     def get_linked_kosync_documents_without_progress(self, user_id: Optional[int] = None) -> dict[str, str]:
-        """Map accessible linked hashes to books with no state or device progress."""
-        from sqlalchemy.orm import aliased
+        """Map accessible linked hashes to books whose built-in GET would answer 404.
 
-        # With no authenticated user, all users' rows conservatively exclude progress.
-        other = aliased(KosyncDocument)
+        Mirrors ``_respond_from_book_states``. A book answers 200 when the user has
+        a State whose served position is not a locator-less non-zero one (the GET
+        suppresses that as a page-0 reset), or when a usable device row (percentage
+        > 0 with a locator) is at least as far as that State. Per-user rows are the
+        device rows; the legacy shared document rows count only when the user has no
+        per-user rows at all, and only when unowned or owned by this user. With no
+        authenticated user every user's rows conservatively count.
+        """
+        from sqlalchemy import func, or_
+
+        def usable(model):
+            return (model.percentage > 0, func.trim(func.coalesce(model.progress, "")) != "")
+
         with self.get_session() as session:
-            states = session.query(State.abs_id)
-            user_progress = session.query(other.linked_abs_id).join(
-                KosyncUserProgress, KosyncUserProgress.document_hash == other.document_hash
-            ).filter(other.linked_abs_id.isnot(None))
-            doc_progress = session.query(other.linked_abs_id).filter(
-                other.linked_abs_id.isnot(None), other.percentage > 0
+            states = session.query(
+                State.abs_id, State.client_name, State.percentage, State.xpath, State.cfi, State.last_updated
+            )
+            user_rows = session.query(KosyncDocument.linked_abs_id, KosyncUserProgress.percentage).join(
+                KosyncUserProgress, KosyncUserProgress.document_hash == KosyncDocument.document_hash
+            ).filter(KosyncDocument.linked_abs_id.isnot(None))
+            legacy = session.query(KosyncDocument.linked_abs_id, KosyncDocument.percentage).filter(
+                KosyncDocument.linked_abs_id.isnot(None), *usable(KosyncDocument)
             )
             docs = session.query(KosyncDocument.document_hash, KosyncDocument.linked_abs_id).filter(
                 KosyncDocument.linked_abs_id.isnot(None)
             )
             if user_id is not None:
                 states = states.filter(State.user_id == user_id)
-                user_progress = user_progress.filter(KosyncUserProgress.user_id == user_id)
+                user_rows = user_rows.filter(KosyncUserProgress.user_id == user_id)
+                legacy = legacy.filter(or_(KosyncDocument.user_id.is_(None), KosyncDocument.user_id == user_id))
                 docs = docs.filter(KosyncDocument.linked_abs_id.in_(
                     session.query(UserBook.abs_id).filter(UserBook.user_id == user_id)
                 ))
-            for with_progress in (states, user_progress, doc_progress):
-                docs = docs.filter(KosyncDocument.linked_abs_id.notin_(with_progress))
-            return dict(docs.all())
+            has_rows = {abs_id for abs_id, _ in user_rows.all()}
+            good_rows = user_rows.filter(*usable(KosyncUserProgress)).all()
+            best_row: dict[str, float] = {}
+            for abs_id, pct in good_rows + [r for r in legacy.all() if r[0] not in has_rows]:
+                best_row[abs_id] = max(best_row.get(abs_id, 0.0), float(pct))
+
+            chosen: dict = {}
+            for row in states.all():
+                current = chosen.get(row.abs_id)
+                is_kosync = str(row.client_name).lower() == "kosync"
+                if current is None or (is_kosync and not current[0]) or (
+                    is_kosync == current[0] and (row.last_updated or 0) > (current[1].last_updated or 0)
+                ):
+                    chosen[row.abs_id] = (is_kosync, row)
+
+            def answers_200(abs_id: str) -> bool:
+                row_pct = best_row.get(abs_id)
+                if abs_id not in chosen:
+                    return row_pct is not None
+                state = chosen[abs_id][1]
+                state_pct = float(state.percentage or 0)
+                if state_pct > 0 and not str(state.xpath or state.cfi or "").strip():
+                    return row_pct is not None and row_pct >= state_pct - 0.0001
+                return True
+
+            return {h: a for h, a in docs.all() if not answers_200(a)}
+
+    def kosync_document_has_other_user_progress(self, document_hash: str, user_id: int) -> bool:
+        """True when a user other than ``user_id`` has per-user progress on this hash."""
+        with self.get_session() as session:
+            return session.query(KosyncUserProgress.document_hash).filter(
+                KosyncUserProgress.document_hash == document_hash,
+                KosyncUserProgress.user_id != user_id,
+            ).first() is not None
 
     def get_kosync_document_by_linked_book(self, abs_id: str) -> Optional[KosyncDocument]:
         """Get a KOSync document linked to a specific ABS book."""
@@ -2629,15 +2686,82 @@ class DatabaseService:
                 session.expunge(book)
             return book
 
-    def get_kosync_doc_by_filename(self, filename: str) -> Optional[KosyncDocument]:
-        """Find a KOSync document by its associated filename."""
+    def get_kosync_doc_by_filename(self, filename: str, hash_method: Optional[str] = None) -> Optional[KosyncDocument]:
+        """Find a KOSync document by its associated filename.
+
+        ``hash_method`` restricts the lookup to rows cached with that
+        KOSYNC_HASH_METHOD; rows of the other method are invisible to it.
+        """
+        with self.get_session() as session:
+            query = session.query(KosyncDocument).filter(KosyncDocument.filename == filename)
+            if hash_method is not None:
+                query = query.filter(KosyncDocument.hash_method == hash_method)
+            doc = query.first()
+            if doc:
+                session.expunge(doc)
+            return doc
+
+    def get_linked_kosync_sibling_by_filename(self, filename: str, exclude_hash: str) -> Optional[KosyncDocument]:
+        """Find a book-linked KOSync document with this filename other than ``exclude_hash``."""
         with self.get_session() as session:
             doc = session.query(KosyncDocument).filter(
-                KosyncDocument.filename == filename
+                KosyncDocument.filename == filename,
+                KosyncDocument.linked_abs_id.isnot(None),
+                KosyncDocument.document_hash != exclude_hash,
             ).first()
             if doc:
                 session.expunge(doc)
             return doc
+
+    def upsert_kosync_hash_metadata(self, document_hash: str, filename: str, source: str,
+                                    mtime: Optional[float] = None, booklore_id: Optional[str] = None,
+                                    hash_method: Optional[str] = None) -> Optional[KosyncDocument]:
+        """Insert or update ONLY the hash-cache columns of a KOSync document.
+
+        Progress, device, link and owner columns are never touched, so a cache
+        write cannot overwrite them with a stale snapshot or stamp an owner.
+        """
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        if not document_hash:
+            return None
+        now = utcnow()
+        values = {"filename": filename, "source": source}
+        for column, value in (("mtime", mtime), ("hash_method", hash_method),
+                              ("booklore_id", None if booklore_id is None else str(booklore_id))):
+            if value is not None:
+                values[column] = value
+        with self.get_session() as session:
+            stmt = sqlite_insert(KosyncDocument).values(
+                document_hash=document_hash, percentage=0, first_seen=now, last_updated=now, **values,
+            )
+            session.execute(stmt.on_conflict_do_update(index_elements=["document_hash"], set_=values))
+            saved = session.get(KosyncDocument, document_hash)
+            session.expunge(saved)
+            return saved
+
+    def clear_kosync_hash_metadata(self, document_hash: str, filename: Optional[str] = None,
+                                   booklore_id: Optional[str] = None,
+                                   hash_method: Optional[str] = None) -> bool:
+        """Drop cached lookup metadata from a row, keeping progress and link data.
+
+        Only a row cached with ``hash_method`` is touched, so a row belonging to
+        the other hash method (devices may still use it) keeps its metadata.
+        """
+        with self.get_session() as session:
+            doc = session.query(KosyncDocument).filter(
+                KosyncDocument.document_hash == document_hash
+            ).first()
+            if not doc or (hash_method is not None and doc.hash_method != hash_method):
+                return False
+            changed = False
+            if filename is not None and doc.filename == filename:
+                doc.filename = doc.mtime = doc.source = doc.hash_method = None
+                changed = True
+            if booklore_id is not None and str(doc.booklore_id) == str(booklore_id):
+                doc.booklore_id = doc.source = None
+                changed = True
+            return changed
 
     def get_kosync_doc_by_booklore_id(self, booklore_id: str) -> Optional[KosyncDocument]:
         """Find a KOSync document by its Grimmory ID."""
