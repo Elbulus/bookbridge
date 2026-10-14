@@ -5886,7 +5886,7 @@ class DatabaseService:
             row.bookorbit_status = "disabled"
             return
         book_title = session.query(
-            func.coalesce(Book.abs_title, Book.audio_title)
+            func.coalesce(func.nullif(Book.abs_title, ''), func.nullif(Book.audio_title, ''))
         ).filter(Book.abs_id == row.abs_id).scalar()
         session.add(ReadingSession(
             abs_id=row.abs_id, session_type=row.session_type,
@@ -6102,7 +6102,7 @@ class DatabaseService:
 
             with self.get_session() as db_session:
                 book_title = db_session.query(
-                    func.coalesce(Book.abs_title, Book.audio_title)
+                    func.coalesce(func.nullif(Book.abs_title, ''), func.nullif(Book.audio_title, ''))
                 ).filter(Book.abs_id == abs_id).scalar()
             session = ReadingSession(
                 abs_id=abs_id,
