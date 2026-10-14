@@ -35,6 +35,8 @@ All notable changes to BookBridge will be documented in this file.
 
 ### Fixed
 
+- Skip adding books to an Audiobookshelf collection when the collection name is
+  blank, instead of asking Audiobookshelf to create a collection with no name.
 - Keep the KOReader reading-status upload's empty `books` field encoded as a JSON
   array so the server accepts it and the device still pulls merged statuses.
 - Bind cached input recovery to its approved audiobook and ebook pairing across
