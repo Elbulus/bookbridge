@@ -35,6 +35,11 @@ All notable changes to BookBridge will be documented in this file.
 
 ### Fixed
 
+- Follow a user's current Audiobookshelf key in their instant-sync listener. A key
+  saved on the integrations page or through the admin API now reconnects a running
+  listener or starts one for an account that had none, instead of retrying the old
+  key until the next restart. Saving an unrelated integration leaves the socket
+  connected.
 - Bind cached input recovery to its approved audiobook and ebook pairing across
   retries and restarts. Commit its alignment, backup, activation and job completion
   together; a changed pairing, job, map or document owner leaves the newer state
