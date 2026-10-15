@@ -279,6 +279,12 @@ class TestKosyncEndpoints(unittest.TestCase):
         # Clear specific tables
         from src import web_server
         from src.api import kosync_server
+        # A cached app can leave the KoSync database global bound to an
+        # older service; bind it to the fixture's service for this test.
+        patcher = patch.object(kosync_server, '_database_service',
+                               web_server.database_service)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         # Mocked endpoint tests must not consume or refresh a real manifest cache.
         for name in ('_start_manifest_prebuilder', '_load_persisted_manifest'):
             patcher = patch.object(kosync_server, name, return_value=None)
@@ -293,8 +299,10 @@ class TestKosyncEndpoints(unittest.TestCase):
              session.query(HardcoverDetails).delete()
              session.query(UserCredential).delete()
              session.query(Book).delete()
-        if web_server.database_service.count_users() == 0:
+        # Document tests can leave regular users in this shared database.
+        if not any(user.is_admin for user in web_server.database_service.list_users()):
             web_server.database_service.create_user("admin", "secret", role="admin")
+        web_server.database_service._default_uid = None
         kosync_server._kosync_device_session_registry = None
         with kosync_server._booklore_shelf_mapping_cache_lock:
             kosync_server._booklore_shelf_mapping_cache.clear()
@@ -2916,6 +2924,13 @@ class TestKosyncAuthStubs(unittest.TestCase):
     def setUp(self):
         import hashlib
         from src import web_server
+        from src.api import kosync_server
+        # A cached app can leave the KoSync database global bound to an
+        # older service; bind it to the fixture's service for this test.
+        patcher = patch.object(kosync_server, '_database_service',
+                               web_server.database_service)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         # A user must exist or require_login_guard redirects to first-run setup.
         if web_server.database_service.count_users() == 0:
             web_server.database_service.create_user("admin", "secret", role="admin")
