@@ -1,7 +1,9 @@
 # KoSync Server - Extracted from web_server.py for clean code separation
 # Implements KOSync protocol compatible with kosync-dotnet
 import hashlib
+import hmac
 import io
+import ipaddress
 import json
 import logging
 import mimetypes
@@ -9,6 +11,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 import zipfile
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -26,6 +29,7 @@ from src.utils.cache_paths import safe_cache_path
 from src.utils.config_loader import env_truthy
 from src.utils.kosync_canonical import load_persisted_pair
 from src.utils.kosync_headers import hash_kosync_key
+from src.utils.logging_utils import get_persistent_condition_logger
 from src.utils.progress_metadata import get_kosync_approved_rewind_at, parse_service_timestamp, state_metadata_kwargs
 from src.utils.fixed_page_progress import is_cbz_book, page_from_persisted_state
 from src.utils.time_utils import datetime_to_epoch, utcnow
@@ -33,6 +37,7 @@ from src.utils.user_context import set_current_user_id, reset_current_user_id
 from src.utils.user_config import (
     _ALLOW_GLOBAL_FALLBACK_KEY,
     global_fallback_allowed,
+    global_service_disabled,
     resolve_setting,
 )
 from src.utils.string_utils import calculate_similarity, clean_book_title
@@ -72,6 +77,12 @@ _AUTH_FAILURES: dict[tuple[str, str], list[float]] = {}
 _AUTH_FAILURES_LOCK = threading.Lock()
 _AUTH_FAILURE_LIMIT = 5
 _AUTH_FAILURE_WINDOW = 60
+_LOOPBACK_PROXY_NETWORKS = ('127.0.0.0/8', '::1/128')
+
+# Caps on the auth-failure table: an unauthenticated client controls the username,
+# so neither the key count nor a key's size may grow with what it sends.
+_AUTH_FAILURE_MAX_KEYS = 10_000
+_AUTH_USERNAME_KEY_CHARS = 256
 
 # Plugin self-update: resolved from src/api/ -> project root -> plugins/
 _PLUGIN_DIR = Path(__file__).parent.parent.parent / "plugins" / "bridgesync.koplugin"
@@ -89,6 +100,9 @@ _BOOKLORE_SHELF_MAPPING_TTL_SECONDS = 86400
 _hardcover_list_mapping_cache: dict = {}
 _hardcover_list_mapping_cache_lock = threading.Lock()
 _HARDCOVER_LIST_MAPPING_TTL_SECONDS = 86400
+_booklore_shelf_filter_cache: dict = {}
+_booklore_shelf_filter_cache_lock = threading.Lock()
+_BOOKLORE_SHELF_FILTER_TTL_SECONDS = 120
 
 # KoSync PUT debounce state
 _kosync_debounce: dict = {}  # {(abs_id, user_id): {'last_event': float, 'title': str, 'synced': bool, 'user_id', 'abs_id'}}
@@ -571,6 +585,84 @@ def _apply_user_collection_source(manifest: dict, user_id) -> None:
         _apply_hardcover_list_collections(manifest, user_id)
 
 
+class ManifestShelfFilterUnavailable(Exception):
+    """The device-sync shelf filter cannot be evaluated, so no manifest may be served."""
+
+
+class ManifestOwnershipUnavailable(Exception):
+    """The device user's manifest ownership cannot be verified safely."""
+
+
+def _booklore_shelf_members(user_id, credentials: Optional[dict], shelf_names: list[str]) -> set[str]:
+    wanted = tuple(sorted({name.casefold() for name in shelf_names}))
+    cache_key = (_booklore_shelf_cache_key(user_id, credentials), wanted)
+    now = time.time()
+    with _booklore_shelf_filter_cache_lock:
+        cached = _booklore_shelf_filter_cache.get(user_id)
+    if cached and cached["key"] != cache_key:
+        cached = None
+    if cached and (now - cached["time"]) < _BOOKLORE_SHELF_FILTER_TTL_SECONDS:
+        return cached["members"]
+
+    condition_logger = get_persistent_condition_logger()
+    failure = None
+    shelves = None
+    try:
+        if user_id is None:
+            client = _container.booklore_client()
+        else:
+            client = _container.user_client_registry().get_clients(user_id).booklore_client
+        if not client.is_configured():
+            reason = "Grimmory is not configured for this reader"
+        else:
+            shelves = client.get_shelf_book_ids(shelf_names)
+            if shelves is None:
+                reason = "Grimmory shelves could not be read"
+            elif not shelves:
+                reason = "none of the shelves %s exist in Grimmory" % ", ".join(sorted(shelf_names))
+    except Exception as e:
+        failure = e
+        reason = str(e) or type(e).__name__
+
+    if shelves:
+        members = set().union(*shelves.values())
+        with _booklore_shelf_filter_cache_lock:
+            _booklore_shelf_filter_cache[user_id] = {"key": cache_key, "time": now, "members": members}
+        for condition in ("stale", "withheld"):
+            condition_logger.resolve(
+                logger, f"manifest-shelf-filter-{condition}:{user_id}",
+                "Device-sync shelf filter can read Grimmory again (user_id=%s)", user_id,
+            )
+        return members
+    if cached:
+        condition_logger.warn(
+            logger, f"manifest-shelf-filter-stale:{user_id}",
+            "Device-sync shelf filter is using its last known shelf membership (user_id=%s): %s",
+            user_id, reason, exc_info=failure,
+        )
+        return cached["members"]
+    raise ManifestShelfFilterUnavailable(reason) from failure
+
+
+def _apply_manifest_shelf_filter(items: list, user_id, credentials: Optional[dict],
+                                 active_books: Optional[list] = None) -> list:
+    shelf_names = _split_csv(str(resolve_setting(credentials, "DEVICE_SYNC_SHELF_FILTER", "") or ""))
+    if not shelf_names:
+        return items
+    if active_books is None:
+        active_books = _database_service.get_books_by_status("active")
+    grimmory_ids = {
+        str(book.abs_id): str(book.ebook_source_id)
+        for book in active_books
+        if _is_booklore_manifest_book(book)
+    }
+    members = _booklore_shelf_members(user_id, credentials, shelf_names)
+    return [
+        item for item in items
+        if grimmory_ids.get(str(item.get("abs_id") or "")) in members
+    ]
+
+
 def _scope_manifest_to_user(manifest, user_id):
     """Return a copy of the manifest containing only the books owned by `user_id`.
 
@@ -584,20 +676,20 @@ def _scope_manifest_to_user(manifest, user_id):
     if user_id is None:
         scoped = dict(manifest)
         scoped["books"] = [dict(item) for item in manifest.get("books") or []]
+        scoped["books"] = _apply_manifest_shelf_filter(scoped["books"], user_id, None)
         _apply_user_collection_source(scoped, user_id)
         scoped["revision"] = _compute_manifest_revision(scoped["books"])
         return scoped
     try:
-        owned_ids = {
-            str(book.abs_id)
-            for book in _database_service.get_books_by_status("active", user_id=user_id)
-        }
+        owned_books = _database_service.get_books_by_status("active", user_id=user_id)
     except Exception as e:
         logger.warning("Manifest user-scoping failed (user_id=%s): %s", user_id, e, exc_info=True)
-        return manifest
+        raise ManifestOwnershipUnavailable from e
+    owned_ids = {str(book.abs_id) for book in owned_books}
     all_books = manifest.get("books") or []
     books = [dict(item) for item in all_books if str(item.get("abs_id")) in owned_ids]
     credentials = _booklore_credentials_for_manifest(user_id)
+    books = _apply_manifest_shelf_filter(books, user_id, credentials, owned_books)
     if len(books) == len(all_books) and _device_collection_source(credentials) == "off":
         return manifest
     scoped = dict(manifest)
@@ -655,6 +747,10 @@ def init_kosync_server(database_service, container, manager, ebook_dir=None):
     _manager = manager
     _ebook_dir = ebook_dir
     _kosync_device_session_registry = None
+    _invalidate_filename_variant_index()
+    register_callback = getattr(database_service, "register_catalog_change_callback", None)
+    if callable(register_callback):
+        register_callback(_invalidate_filename_variant_index)
     # First-time device sync starts the prebuilder on request. After that,
     # catalog-change signals can start it again following a restart.
 
@@ -1117,27 +1213,106 @@ def _kosync_debounce_loop() -> None:
 
 
 def _kosync_creds_match(presented_key: str, stored_secret: str) -> bool:
-    """KOReader sends either the raw key or its md5 hash."""
-    if not presented_key or not stored_secret:
+    """KOReader sends either the raw key or its md5 hash. Compared in constant time."""
+    if not isinstance(presented_key, str) or not presented_key or not stored_secret:
         return False
-    return presented_key == stored_secret or presented_key == hash_kosync_key(stored_secret)
+    presented = presented_key.encode("utf-8")
+    return (
+        hmac.compare_digest(presented, stored_secret.encode("utf-8"))
+        or hmac.compare_digest(presented, hash_kosync_key(stored_secret).encode("utf-8"))
+    )
 
 
-def _auth_failure_key(username: str) -> tuple[str, str]:
-    return ((username or "").strip().lower(), request.remote_addr or "")
+def _kosync_trusted_proxies() -> list:
+    """Reverse proxies whose X-Forwarded-For names the KoSync client, read per call.
+
+    KOSYNC_TRUSTED_PROXIES is a comma-separated list of IPs/CIDRs; blank means
+    localhost only. Malformed entries are skipped, never widening the list.
+    """
+    raw = os.environ.get('KOSYNC_TRUSTED_PROXIES', '') or ''
+    entries = [part.strip() for part in raw.replace('\n', ',').split(',') if part.strip()]
+    networks = []
+    for entry in entries or _LOOPBACK_PROXY_NETWORKS:
+        try:
+            networks.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError:
+            get_persistent_condition_logger().warn(
+                logger,
+                f"kosync_bad_proxy_entry:{entry}",
+                "⚠️ KOSYNC_TRUSTED_PROXIES entry %s is not a valid IP or CIDR — ignoring it",
+                entry,
+            )
+    return networks
+
+
+def _kosync_client_address() -> str:
+    """The KoSync client's address for rate limiting.
+
+    The TCP peer, unless the peer is a trusted proxy: then the right-most
+    X-Forwarded-For hop that is not itself a trusted proxy. Behind a proxy every
+    request otherwise shares the proxy's address, and five bad keys from anyone
+    would lock the real reader out.
+    """
+    networks = _kosync_trusted_proxies()
+
+    def trusted(address: str) -> bool:
+        try:
+            ip = ipaddress.ip_address(address)
+        except ValueError:
+            return False
+        return any(ip in network for network in networks)
+
+    peer = (request.remote_addr or "").strip()
+    if not trusted(peer):
+        return peer
+    hops = [hop.strip() for hop in request.headers.get("X-Forwarded-For", "").split(",") if hop.strip()]
+    for hop in reversed(hops):
+        if not trusted(hop):
+            return hop
+    return peer
+
+
+def _auth_failure_key(username) -> tuple[str, str]:
+    return (str(username or "").strip().lower()[:_AUTH_USERNAME_KEY_CHARS], _kosync_client_address())
 
 
 def _auth_is_limited(key: tuple[str, str], failed: bool = False) -> bool:
     now = time.time()
     with _AUTH_FAILURES_LOCK:
-        recent = [t for t in _AUTH_FAILURES.get(key, []) if now - t < _AUTH_FAILURE_WINDOW]
+        recent = [t for t in _AUTH_FAILURES.pop(key, []) if now - t < _AUTH_FAILURE_WINDOW]
         if failed:
             recent.append(now)
         if recent:
             _AUTH_FAILURES[key] = recent
-        else:
-            _AUTH_FAILURES.pop(key, None)
+        # Re-inserting keeps dict order = last-touched order, so expired keys and,
+        # past the cap, the least recently touched ones are dropped from the front.
+        while _AUTH_FAILURES:
+            oldest = next(iter(_AUTH_FAILURES))
+            if (
+                len(_AUTH_FAILURES) <= _AUTH_FAILURE_MAX_KEYS
+                and now - _AUTH_FAILURES[oldest][-1] < _AUTH_FAILURE_WINDOW
+            ):
+                break
+            del _AUTH_FAILURES[oldest]
         return len(recent) >= _AUTH_FAILURE_LIMIT
+
+
+def _authenticate_kosync_limited(username, key) -> tuple[bool, Optional[int], bool]:
+    """authenticate_kosync behind the per-(username, client) failure limiter.
+
+    Returns (authenticated, user_id, limited). A limited request is refused before
+    the credentials are checked; a failure is counted, a success clears the count.
+    """
+    failure_key = _auth_failure_key(username)
+    if _auth_is_limited(failure_key):
+        return False, None, True
+    authenticated, user_id = authenticate_kosync(username, key)
+    if authenticated:
+        with _AUTH_FAILURES_LOCK:
+            _AUTH_FAILURES.pop(failure_key, None)
+    else:
+        _auth_is_limited(failure_key, failed=True)
+    return authenticated, user_id, False
 
 
 def _kosync_user_may_access_book(book) -> bool:
@@ -1173,7 +1348,7 @@ def authenticate_kosync(username: str, key: str):
     which case user_id is the default/admin user (or None if no users exist —
     still authenticated, scoping then falls back to the default).
     """
-    if not username or not key:
+    if not isinstance(username, str) or not isinstance(key, str) or not username or not key:
         return False, None
 
     # 1. Per-user credentials
@@ -1209,18 +1384,13 @@ def kosync_auth_required(f):
     def decorated_function(*args, **kwargs):
         user = request.headers.get('x-auth-user')
         key = request.headers.get('x-auth-key')
-        failure_key = _auth_failure_key(user)
-        if _auth_is_limited(failure_key):
+        authenticated, user_id, limited = _authenticate_kosync_limited(user, key)
+        if limited:
             return jsonify({"error": "Too many authentication attempts"}), 429
-
-        authenticated, user_id = authenticate_kosync(user, key)
         if not authenticated:
-            _auth_is_limited(failure_key, failed=True)
             logger.warning(f"⚠️ KOSync Integrated Server: Unauthorized access attempt from '{request.remote_addr}' (user: '{user}')")
             return jsonify({"error": "Unauthorized"}), 401
 
-        with _AUTH_FAILURES_LOCK:
-            _AUTH_FAILURES.pop(failure_key, None)
         g.kosync_user_id = user_id
         token = set_current_user_id(user_id)
         try:
@@ -1250,7 +1420,9 @@ def kosync_users_auth():
         logger.warning(f"⚠️ KOSync Auth: Missing credentials from '{request.remote_addr}'")
         return jsonify({"message": "Invalid credentials"}), 401
 
-    authenticated, _ = authenticate_kosync(user, key)
+    authenticated, _, limited = _authenticate_kosync_limited(user, key)
+    if limited:
+        return jsonify({"message": "Too many authentication attempts"}), 429
     if authenticated:
         logger.debug(f"KOSync Auth: User '{user}' authenticated successfully")
         return jsonify({"username": user}), 200
@@ -1276,7 +1448,9 @@ def kosync_users_create():
     requested = data.get("username") or request.form.get("username") or ""
     password = data.get("password") or request.form.get("password") or ""
 
-    authenticated, _ = authenticate_kosync(requested, password)
+    authenticated, _, limited = _authenticate_kosync_limited(requested, password)
+    if limited:
+        return jsonify({"message": "Too many authentication attempts"}), 429
     if not authenticated:
         logger.warning(
             f"⚠️ KOSync Create: Registration refused for unconfigured user '{requested}' from "
@@ -1306,7 +1480,9 @@ def kosync_users_login():
         user = user or data.get("username")
         key = key or data.get("password")
 
-    authenticated, _ = authenticate_kosync(user, key)
+    authenticated, _, limited = _authenticate_kosync_limited(user, key)
+    if limited:
+        return jsonify({"message": "Too many authentication attempts"}), 429
     if not authenticated:
         logger.warning(f"⚠️ KOSync Login: Failed attempt for user '{user}' from '{request.remote_addr}'")
         return jsonify({"message": "Unauthorized"}), 401
@@ -1352,11 +1528,13 @@ def kosync_get_progress(doc_id):
                     return _defer_kosync_book_access(doc_id, book, source="get")
                 return _respond_from_book_states(doc_id, book)
 
-        resolved_book = _resolve_book_by_sibling_hash(doc_id, existing_doc=kosync_doc)
+        resolved_book = _resolve_book_by_sibling_hash(
+            doc_id, existing_doc=kosync_doc, user_id=getattr(g, "kosync_user_id", None),
+        )
         if resolved_book:
             if not _kosync_user_may_access_book(resolved_book):
                 return _defer_kosync_book_access(doc_id, resolved_book, source="get")
-            _register_hash_for_book(doc_id, resolved_book)
+            _register_hash_for_book(doc_id, resolved_book, user_id=getattr(g, "kosync_user_id", None))
             return _respond_from_book_states(doc_id, resolved_book)
 
         request_user_id = getattr(g, "kosync_user_id", None)
@@ -1408,20 +1586,26 @@ def kosync_get_progress(doc_id):
         # The book names this hash but an existing document row may still be unlinked,
         # which hides its stored per-user progress from _respond_from_book_states (#431).
         # Register it the way Step 3 does so the pairing heals on this read.
-        _register_hash_for_book(doc_id, book)
+        _register_hash_for_book(doc_id, book, user_id=getattr(g, "kosync_user_id", None), exact=True)
         return _respond_from_book_states(doc_id, book)
 
-    # Step 3: Sibling hash resolution — find the book via other linked hashes.
-    # Skip when a kosync_doc existed: Step 1 already ran this identical resolution
-    # (same doc_id/existing_doc) above with no intervening state change, so a
-    # second call is deterministically redundant.
+    # Step 3: Sibling hash resolution — find the book via other linked hashes, then
+    # (last, as a heuristic) via the filename-mode hashes of the user's library.
+    # When a kosync_doc existed, Step 1 already ran the sibling part (same doc_id,
+    # no intervening state change), so only the variant match remains. The bridge's
+    # own reads always carry a book's exact hash and are answered by Step 2.
     if kosync_doc is None:
-        resolved_book = _resolve_book_by_sibling_hash(doc_id, existing_doc=kosync_doc)
-        if resolved_book:
-            if not _kosync_user_may_access_book(resolved_book):
-                return _defer_kosync_book_access(doc_id, resolved_book, source="get")
-            _register_hash_for_book(doc_id, resolved_book)
-            return _respond_from_book_states(doc_id, resolved_book)
+        resolved_book = _resolve_book_by_sibling_hash(
+            doc_id, existing_doc=kosync_doc,
+            user_id=getattr(g, "kosync_user_id", None), filename_variants=True,
+        )
+    else:
+        resolved_book = _resolve_book_by_filename_variants(doc_id, user_id=getattr(g, "kosync_user_id", None))
+    if resolved_book:
+        if not _kosync_user_may_access_book(resolved_book):
+            return _defer_kosync_book_access(doc_id, resolved_book, source="get")
+        _register_hash_for_book(doc_id, resolved_book, user_id=getattr(g, "kosync_user_id", None))
+        return _respond_from_book_states(doc_id, resolved_book)
 
     # Step 4: Unknown hash — register stub and start background discovery
     if not _is_valid_hex_hash(doc_id):
@@ -1713,6 +1897,51 @@ def _record_user_kosync_state(book, percentage, progress, timestamp, user_id):
         )
 
 
+def _kosync_position_is_held(doc_hash: str, kosync_doc, baseline, user_id) -> bool:
+    """True when the requesting user already has a position stored for the document:
+    a device/user progress row with a percentage, or a KoSync State on the linked book.
+    The GET can hide such a position (no locator), so absence there proves nothing."""
+    if baseline is not None and baseline.percentage and float(baseline.percentage) > 0:
+        return True
+    abs_id = getattr(kosync_doc, "linked_abs_id", None)
+    if not abs_id:
+        linked = _database_service.get_book_by_kosync_id(doc_hash)
+        abs_id = linked.abs_id if linked else None
+    return bool(abs_id and _database_service.get_state(abs_id, "kosync", user_id=user_id))
+
+
+def _book_for_put_baseline(doc_hash: str, kosync_doc, user_id):
+    """The book a PUT's hash resolves to without writing anything, or None."""
+    if kosync_doc is not None and kosync_doc.linked_abs_id:
+        return _database_service.get_book(kosync_doc.linked_abs_id)
+    return _database_service.get_book_by_kosync_id(doc_hash) or _resolve_book_by_sibling_hash(
+        doc_hash, existing_doc=kosync_doc, user_id=user_id, filename_variants=True,
+    )
+
+
+def _note_kosync_off_server_wide(user_id, device) -> None:
+    """Warn once per user (per process) that progress arriving from their device
+    stops here while KoSync is switched off server-wide, and say once when it is
+    switched back on. Goes through the persistent-condition logger, so the first
+    PUT logs at WARNING and later ones at DEBUG, with its usual periodic reminder
+    while the condition lasts."""
+    condition_logger = get_persistent_condition_logger()
+    key = f"kosync-off-server-wide:{user_id}"
+    if global_service_disabled("KOSYNC_ENABLED"):
+        condition_logger.warn(
+            logger, key,
+            "KOSync: received progress from device '%s' for user_id=%s, but KoSync is switched "
+            "off server-wide in Settings, so it is kept here and will not reach the other services",
+            device or "unknown", user_id,
+        )
+    else:
+        condition_logger.resolve(
+            logger, key,
+            "KOSync: KoSync is switched on server-wide again, so progress from user_id=%s "
+            "reaches the other services", user_id,
+        )
+
+
 @kosync_sync_bp.route('/syncs/progress', methods=['PUT'])
 @kosync_sync_bp.route('/koreader/syncs/progress', methods=['PUT'])
 @kosync_auth_required
@@ -1756,6 +1985,14 @@ def kosync_put_progress():
     is_internal = _is_internal_kosync_device(device, device_id)
     request_user_id = getattr(g, 'kosync_user_id', None)
 
+    # This server does not read the service gate: devices keep authenticating and
+    # their positions are kept, by design, so nothing is lost while KoSync is off
+    # in Settings. But the KoSync sync client sits out every cycle for as long as
+    # it is, so what arrives here goes no further. Say so once per reader rather
+    # than letting a working-looking device hide a stopped sync.
+    if not is_internal:
+        _note_kosync_off_server_wide(request_user_id, device)
+
     # Allow rewinds if:
     # 1. Force flag is set (e.g. from SyncManager)
     # 2. Update comes from the SAME device (user moved slider back)
@@ -1772,10 +2009,33 @@ def kosync_put_progress():
         doc_user_id = getattr(kosync_doc, "user_id", None)
         if request_user_id is None or doc_user_id in (None, request_user_id):
             baseline = kosync_doc
+    # A hash with no saved position of its own (newly linked through a sibling or
+    # filename match) still has a book, and the reader's KoSync State for it is what
+    # a GET would hand out - so that is what a stale device must not regress.
+    state_baseline = False
+    observation_doc = kosync_doc
+    if (baseline is None or not baseline.percentage) and furthest_wins and not is_internal and not force_update:
+        state_book = _book_for_put_baseline(doc_hash, kosync_doc, request_user_id)
+        state = _database_service.get_state(state_book.abs_id, "kosync", user_id=request_user_id) if state_book else None
+        if state is not None and state.percentage:
+            baseline = SimpleNamespace(percentage=state.percentage, device=None, device_id=None, timestamp=None)
+            state_baseline = True
+            if not getattr(kosync_doc, "linked_abs_id", None):
+                observation_doc = SimpleNamespace(linked_abs_id=state_book.abs_id)
     baseline_pct = float(baseline.percentage) if baseline and baseline.percentage else 0
     baseline_device = getattr(baseline, "device", None)
     baseline_device_id = getattr(baseline, "device_id", None)
     same_device = bool(baseline and baseline_device_id and baseline_device_id == device_id)
+
+    if data.get('fill_if_absent') and is_internal and _kosync_position_is_held(
+        doc_hash, kosync_doc, baseline, request_user_id
+    ):
+        logger.info(
+            f"KOSync: Ignored fill-if-absent push for doc {doc_hash}: this user already has a "
+            f"stored position, which a starting-position fill must not replace"
+        )
+        # 409, not 200: the caller must not record the fill as the position held here.
+        return jsonify({"document": doc_hash, "message": "Position already stored"}), 409
 
     # Furthest-wins exists to stop one DEVICE from regressing another. When the
     # position it is defending was never claimed by a real device — no device_id
@@ -1789,8 +2049,8 @@ def kosync_put_progress():
     # which is every reader the bridge has pushed to and that has not yet pushed a
     # forward position of its own — can never rewind, and the user's deliberate
     # rewind is rejected against an echo of our own write (issue #215).
-    baseline_unclaimed = not baseline_device_id or _is_internal_kosync_device(
-        baseline_device, baseline_device_id
+    baseline_unclaimed = not state_baseline and (
+        not baseline_device_id or _is_internal_kosync_device(baseline_device, baseline_device_id)
     )
 
     # Record what the device said BEFORE furthest-wins can reject it. A rejected
@@ -1799,7 +2059,7 @@ def kosync_put_progress():
     # device: proving the rewind needs observations, observations needed accepted
     # PUTs, and the PUTs were rejected for being the rewind (issue #215).
     if not is_internal:
-        _record_external_kosync_observation(kosync_doc, percentage, device, request_user_id)
+        _record_external_kosync_observation(observation_doc, percentage, device, request_user_id)
 
     if (
         furthest_wins
@@ -1817,7 +2077,7 @@ def kosync_put_progress():
                     f"claimed by another device (stored device_id="
                     f"{baseline_device_id or 'none'}), so furthest-wins has no peer to defend"
                 )
-            elif _backward_move_is_corroborated(kosync_doc, device, request_user_id):
+            elif _backward_move_is_corroborated(observation_doc, device, request_user_id):
                 logger.info(
                     f"KOSync: Allowing rewind from '{device}' for doc {doc_hash} "
                     f"({baseline_pct:.2%} -> {new_pct:.2%}): that device has kept reading on "
@@ -1830,6 +2090,12 @@ def kosync_put_progress():
                     "document": doc_hash,
                     "timestamp": int(datetime_to_epoch(baseline.timestamp)) if baseline and baseline.timestamp else int(datetime_to_epoch(now))
                 }), 200
+
+    # An internal write for this user must not land in a shared row another user
+    # owns: _respond_from_book_states serves owned rows as that owner's position.
+    prior_owner = kosync_doc.user_id if kosync_doc is not None else None
+    other_owned = request_user_id is not None and prior_owner not in (None, request_user_id)
+    foreign_row = is_internal and other_owned
 
     if kosync_doc is None:
         kosync_doc = KosyncDocument(
@@ -1866,17 +2132,19 @@ def kosync_put_progress():
         if request_user_id is not None and not is_internal:
             kosync_doc.user_id = request_user_id
 
-    _database_service.save_kosync_document(kosync_doc)
+    if not foreign_row:
+        _database_service.save_kosync_document(kosync_doc)
     if not is_internal:
         _record_recent_external_kosync_put(doc_hash, device, device_id, percentage, now_ts, request_user_id)
-        # The observation was recorded before the furthest-wins gate, so that a report
-        # the guard rejects still counts toward proving a later rewind.
-        # Per-user device progress: the durable per-user record for unlinked docs
-        # and the furthest-wins / sibling-GET source (no-op for no-accounts installs).
-        _database_service.upsert_user_kosync_progress(
-            doc_hash, percentage, progress=progress, device=device,
-            device_id=device_id, timestamp=now, user_id=request_user_id,
-        )
+    # Every accepted write is recorded for the user who made it, the bridge's own
+    # pushes included: the shared row is one slot that changes owner whenever another
+    # user's device writes to it, so a position kept only there is lost the moment
+    # that happens. The per-user row is what a GET reads first. No-op for a
+    # no-accounts install, which keeps using the shared row.
+    _database_service.upsert_user_kosync_progress(
+        doc_hash, percentage, progress=progress, device=device,
+        device_id=device_id, timestamp=now, user_id=request_user_id,
+    )
 
     # Update linked book if exists
     linked_book = None
@@ -1884,14 +2152,18 @@ def kosync_put_progress():
         linked_book = _database_service.get_book(kosync_doc.linked_abs_id)
     else:
         linked_book = _database_service.get_book_by_kosync_id(doc_hash)
+        exact_hit = linked_book is not None
         if not linked_book:
             # Mirror the GET path: an unlinked device hash may belong to an
             # already-mapped book (e.g. a different EPUB build of the same title),
             # resolvable via a filename sibling. Try that before falling through to
             # auto-discovery so we link instead of creating a duplicate mapping.
-            linked_book = _resolve_book_by_sibling_hash(doc_hash, existing_doc=kosync_doc)
-        if linked_book:
-            _register_hash_for_book(doc_hash, linked_book)
+            linked_book = _resolve_book_by_sibling_hash(
+                doc_hash, existing_doc=kosync_doc,
+                user_id=request_user_id, filename_variants=not is_internal,
+            )
+        if linked_book and (exact_hit or not other_owned):
+            _register_hash_for_book(doc_hash, linked_book, user_id=request_user_id, exact=exact_hit)
 
     if linked_book and not is_internal:
         if not _kosync_user_may_access_book(linked_book):
@@ -1958,6 +2230,25 @@ def kosync_put_progress():
     }), 200
 
 
+def _scoped_manifest_response(manifest, user_id):
+    try:
+        return jsonify(_scope_manifest_to_user(manifest, user_id)), 200
+    except ManifestOwnershipUnavailable:
+        get_persistent_condition_logger().warn(
+            logger, f"manifest-ownership-withheld:{user_id}",
+            "Device-sync manifest withheld because ownership lookup failed (user_id=%s)",
+            user_id, exc_info=True,
+        )
+        return jsonify({"error": "Manifest ownership unavailable"}), 503
+    except ManifestShelfFilterUnavailable as e:
+        get_persistent_condition_logger().warn(
+            logger, f"manifest-shelf-filter-withheld:{user_id}",
+            "Device-sync manifest withheld, shelf filter unavailable (user_id=%s): %s",
+            user_id, e, exc_info=True,
+        )
+        return jsonify({"error": "Shelf filter unavailable", "detail": str(e)}), 503
+
+
 @kosync_sync_bp.route('/device-sync/manifest', methods=['GET'])
 @kosync_sync_bp.route('/koreader/device-sync/manifest', methods=['GET'])
 @kosync_auth_required
@@ -1981,7 +2272,7 @@ def koreader_device_sync_manifest():
         cached = _manifest_cache
 
     if cached is not None:
-        return jsonify(_scope_manifest_to_user(cached, user_id)), 200
+        return _scoped_manifest_response(cached, user_id)
 
     # Cold start after a restart: serve the last manifest written to disk rather
     # than rebuilding inline. A rebuild walks the whole catalogue (minutes on a
@@ -1994,7 +2285,7 @@ def koreader_device_sync_manifest():
             _manifest_cache = persisted
         signal_manifest_rebuild()
         logger.info("📄 Served the persisted device-sync manifest while the cache rebuilds")
-        return jsonify(_scope_manifest_to_user(persisted, user_id)), 200
+        return _scoped_manifest_response(persisted, user_id)
 
     # Never built before (fresh install): no choice but to build inline.
     service = _get_koreader_device_sync_service()
@@ -2006,7 +2297,7 @@ def koreader_device_sync_manifest():
         _manifest_cache = manifest
     _persist_manifest_cache(manifest)
 
-    return jsonify(_scope_manifest_to_user(manifest, user_id)), 200
+    return _scoped_manifest_response(manifest, user_id)
 
 
 @kosync_sync_bp.route('/device-sync/books/<path:abs_id>/download', methods=['GET'])
@@ -2837,78 +3128,25 @@ def admin_plugin_download():
 
 # ---------------- Helper Functions ----------------
 
-def _upsert_kosync_metadata(document_hash, filename, source, mtime=None, booklore_id=None):
-    """Cache hash metadata without overwriting any existing progress data."""
-    from src.db.models import KosyncDocument
+def _cache_kosync_metadata(document_hash, filename, source, mtime=None, booklore_id=None,
+                           cached_doc=None, hash_method=None):
+    """Cache hash metadata (never touching progress/link columns) tagged with its hash method.
 
-    existing = _database_service.get_kosync_document(document_hash)
-    if existing:
-        existing.filename = filename
-        existing.source = source
-        if mtime is not None:
-            existing.mtime = mtime
-        if booklore_id is not None:
-            existing.booklore_id = booklore_id
-        _database_service.save_kosync_document(existing)
-    else:
-        doc = KosyncDocument(
-            document_hash=document_hash,
-            filename=filename,
-            source=source,
-            mtime=mtime,
-            booklore_id=booklore_id,
+    A stale ``cached_doc`` under a different hash (the file's content changed) loses
+    its lookup metadata only when it was cached with the same method; a row of the
+    other method belongs to devices still hashing that way.
+    """
+    if not document_hash:
+        return None
+    method = hash_method or _container.ebook_parser().hash_method
+    saved = _database_service.upsert_kosync_hash_metadata(
+        document_hash, filename, source, mtime=mtime, booklore_id=booklore_id, hash_method=method,
+    )
+    if cached_doc and cached_doc.document_hash != document_hash:
+        _database_service.clear_kosync_hash_metadata(
+            cached_doc.document_hash, filename=filename, booklore_id=booklore_id, hash_method=method,
         )
-        _database_service.save_kosync_document(doc)
-
-
-def _clear_stale_kosync_metadata(cached_doc, filename=None, booklore_id=None):
-    """Remove lookup metadata from an old hash row while preserving progress/link data."""
-    if not cached_doc:
-        return
-
-    changed = False
-    if filename is not None and cached_doc.filename == filename:
-        cached_doc.filename = None
-        cached_doc.mtime = None
-        cached_doc.source = None
-        changed = True
-    if booklore_id is not None and str(cached_doc.booklore_id) == str(booklore_id):
-        cached_doc.booklore_id = None
-        cached_doc.source = None
-        changed = True
-
-    if changed:
-        _database_service.save_kosync_document(cached_doc)
-
-
-def _cache_kosync_metadata(document_hash, filename, source, mtime=None, booklore_id=None, cached_doc=None):
-    """Cache hash metadata without mutating a primary key into an existing hash."""
-    existing = _database_service.get_kosync_document(document_hash)
-    if existing:
-        existing.filename = filename
-        existing.source = source
-        if mtime is not None:
-            existing.mtime = mtime
-        if booklore_id is not None:
-            existing.booklore_id = str(booklore_id)
-        saved = _database_service.save_kosync_document(existing)
-        if cached_doc and cached_doc.document_hash != document_hash:
-            _clear_stale_kosync_metadata(cached_doc, filename=filename, booklore_id=booklore_id)
-        return saved
-
-    if cached_doc and cached_doc.document_hash == document_hash:
-        cached_doc.filename = filename
-        cached_doc.source = source
-        if mtime is not None:
-            cached_doc.mtime = mtime
-        if booklore_id is not None:
-            cached_doc.booklore_id = str(booklore_id)
-        return _database_service.save_kosync_document(cached_doc)
-
-    _upsert_kosync_metadata(document_hash, filename, source, mtime=mtime, booklore_id=booklore_id)
-    if cached_doc:
-        _clear_stale_kosync_metadata(cached_doc, filename=filename, booklore_id=booklore_id)
-    return _database_service.get_kosync_document(document_hash)
+    return saved
 
 
 def _ebook_search_dirs() -> list:
@@ -2927,32 +3165,50 @@ def _scan_directory_for_hash(scan_dir, doc_hash: str) -> Optional[str]:
     """Hash-scan one directory's *.epub files for doc_hash. Returns filename or None."""
     if not scan_dir or not scan_dir.exists():
         return None
+    try:
+        parser = _container.ebook_parser()
+        method = parser.hash_method
+    except Exception as e:
+        logger.warning(f"KOSync: ebook parser unavailable, skipping scan of {scan_dir}: {e}", exc_info=True)
+        return None
     logger.info(f"🔎 Starting filesystem search in {scan_dir} for hash {doc_hash}...")
+
+    # A row already holding doc_hash is valid under either method (devices may mix),
+    # so trust its cached filename while the file is unchanged.
+    known = _database_service.get_kosync_document(doc_hash)
+    if known and known.filename and known.mtime is not None:
+        for epub_path in scan_dir.rglob("*.epub"):
+            if epub_path.name == known.filename and epub_path.stat().st_mtime == known.mtime:
+                logger.info(f"📚 Matched EPUB via DB hash lookup: {epub_path.name}")
+                return epub_path.name
+
     count = 0
     for epub_path in scan_dir.rglob("*.epub"):
         count += 1
         if count % 100 == 0:
             logger.debug(f"Checked {count} local EPUBs...")
 
-        # Optimization: Check if we already have this file's hash in DB
-        cached_doc = _database_service.get_kosync_doc_by_filename(epub_path.name)
-        if cached_doc:
-            current_mtime = epub_path.stat().st_mtime
-            if cached_doc.mtime == current_mtime:
-                if cached_doc.document_hash == doc_hash:
-                    logger.info(f"📚 Matched EPUB via DB filename lookup: {epub_path.name}")
-                    return epub_path.name
-                continue
-
         try:
-            computed_hash = _container.ebook_parser().get_kosync_id(epub_path)
-            _cache_kosync_metadata(
-                computed_hash,
-                epub_path.name,
-                'filesystem',
-                mtime=epub_path.stat().st_mtime,
-                cached_doc=cached_doc,
-            )
+            current_mtime = epub_path.stat().st_mtime
+            cached_doc = None
+            if method != "filename":
+                # Content hashing is the expensive path: reuse this method's cached hash.
+                cached_doc = _database_service.get_kosync_doc_by_filename(epub_path.name, hash_method=method)
+                if cached_doc and cached_doc.mtime == current_mtime:
+                    if cached_doc.document_hash == doc_hash:
+                        logger.info(f"📚 Matched EPUB via DB filename lookup: {epub_path.name}")
+                        return epub_path.name
+                    continue
+            computed_hash = parser.get_kosync_id(epub_path)
+            if method != "filename" or computed_hash == doc_hash:
+                _cache_kosync_metadata(
+                    computed_hash,
+                    epub_path.name,
+                    'filesystem',
+                    mtime=current_mtime,
+                    cached_doc=cached_doc,
+                    hash_method=method,
+                )
             if computed_hash == doc_hash:
                 logger.info(f"📚 Matched EPUB via filesystem: {epub_path.name}")
                 return epub_path.name
@@ -3300,15 +3556,18 @@ def _respond_from_book_states(doc_id, book):
         sibling_is_ahead = sibling_pct > synced_pct + 0.0001
 
         # KOReader's reported percentage and the bridge-synced percentage can
-        # use different position scales even for the same EPUB. The synced State
-        # XPath is generated for book.kosync_doc_id, so only compare resolved text
-        # positions when the request and device row refer to that exact hash.
+        # use different position scales even for the same EPUB. The bridge
+        # generates the synced State XPath for book.kosync_doc_id, so the gate
+        # resolves both positions in that hash's file, whether the device row is
+        # on that hash or on another one linked to the book.
         # If resolution is unavailable, keep the existing percentage-based behavior.
         state_doc_id = str(getattr(book, "kosync_doc_id", "") or "").strip()
+        device_doc_id = getattr(best_doc, "document_hash", None)
         same_document = (
-            getattr(best_doc, "document_hash", None) == doc_id
+            device_doc_id == doc_id
             and state_doc_id == doc_id
         )
+        cross_hash = bool(state_doc_id) and device_doc_id != state_doc_id
         sibling_xpath = str(getattr(best_doc, "progress", "") or "").strip()
         synced_xpath = str(getattr(kosync_state, "xpath", "") or "").strip() if kosync_state else ""
 
@@ -3330,14 +3589,18 @@ def _respond_from_book_states(doc_id, book):
 
         if (
             env_truthy("KOSYNC_XPATH_ORDER_ENABLED")
-            and same_document
+            and not is_cbz_book(book)
+            and (same_document or cross_hash)
             and sibling_xpath
             and synced_xpath
             and within_pct_bound
         ):
             try:
-                document = _database_service.get_kosync_document(doc_id)
-                filename = str(getattr(document, "filename", "") or "").strip() if document else ""
+                def _cached_filename(document_hash):
+                    document = _database_service.get_kosync_document(document_hash)
+                    return str(getattr(document, "filename", "") or "").strip() if document else ""
+
+                filename = _cached_filename(state_doc_id)
 
                 # Both XPaths are resolved against this one file, but the synced
                 # State's XPath was generated against the book's own ebook file.
@@ -3351,8 +3614,15 @@ def _respond_from_book_states(doc_id, book):
                 }
                 book_files.discard("")
 
-                if filename and filename in book_files:
-                    cache_key = (doc_id, filename, sibling_xpath, synced_xpath)
+                comparable = bool(filename) and filename in book_files
+                if comparable and cross_hash:
+                    # Linked hashes can belong to different EPUB layouts, including
+                    # the book's original copy. Resolve only the same cached file.
+                    device_filename = _cached_filename(device_doc_id)
+                    comparable = device_filename == filename
+
+                if comparable:
+                    cache_key = (state_doc_id, filename, sibling_xpath, synced_xpath)
                     cached = _xpath_index_cache_get(cache_key)
                     if cached is not None:
                         sibling_index, synced_index = cached
@@ -3453,17 +3723,35 @@ def _respond_from_book_states(doc_id, book):
     return jsonify(response_data), 200
 
 
-def _resolve_book_by_sibling_hash(doc_id: str, existing_doc=None):
+def linked_documents_without_progress(username: str, key: str) -> Optional[dict[str, str]]:
+    """Map document hash -> abs_id for every linked document whose GET from this
+    login can only end in the read-only 404 of _respond_from_book_states: the
+    login's user may access the book, and the book has no State, per-user
+    progress or document progress. None when the login would be rejected."""
+    if _database_service is None:
+        return None
+    authenticated, user_id = authenticate_kosync(username, key)
+    if not authenticated:
+        return None
+
+    return _database_service.get_linked_kosync_documents_without_progress(user_id)
+
+
+def _resolve_book_by_sibling_hash(doc_id: str, existing_doc=None, *, user_id=None, filename_variants=False):
     """
     Try to resolve an unknown hash to a known book using DB-only lookups.
     Checks if any other KosyncDocument with the same filename is already linked.
+
+    With ``filename_variants``, also tries the KOReader filename-mode hashes of
+    the user's library filenames (see ``_resolve_book_by_filename_variants``).
+    Callers enable it only for hashes a reading device sent.
     """
     # Check if this hash has a filename cached (from a prior scan/PUT)
     doc = existing_doc or _database_service.get_kosync_document(doc_id)
     if doc and doc.filename:
         # Find a sibling document with the same filename that's linked to a book
-        sibling = _database_service.get_kosync_doc_by_filename(doc.filename)
-        if sibling and sibling.linked_abs_id and sibling.document_hash != doc_id:
+        sibling = _database_service.get_linked_kosync_sibling_by_filename(doc.filename, doc_id)
+        if sibling:
             book = _database_service.get_book(sibling.linked_abs_id)
             if book:
                 logger.info(f"🔗 KOSync: Resolved {doc_id} to '{book.abs_title}' via filename sibling")
@@ -3475,6 +3763,146 @@ def _resolve_book_by_sibling_hash(doc_id: str, existing_doc=None):
             logger.info(f"🔗 KOSync: Resolved {doc_id} to '{book.abs_title}' via ebook filename match")
             return book
 
+    # CWA re-exports with embedded metadata on every download, so a reader's copy
+    # rarely matches our hash. CWA records each served copy's hash in metadata.db.
+    book = _resolve_book_by_cwa_checksum(doc_id)
+    if book or not filename_variants:
+        return book
+
+    # After the exact CWA identity: a reordered library filename is a heuristic.
+    return _resolve_book_by_filename_variants(doc_id, user_id=user_id)
+
+
+def _resolve_book_by_cwa_checksum(doc_id: str):
+    """Resolve a hash through CWA's checksum history (needs CALIBRE_LIBRARY_PATH)."""
+    from src.services.cwa_checksum_resolver import find_calibre_book_id
+
+    calibre_book_id = find_calibre_book_id(doc_id)
+    if not calibre_book_id:
+        return None
+    book = _database_service.get_book_by_ebook_source("CWA", calibre_book_id)
+    if book:
+        logger.info(
+            f"🔗 KOSync: Resolved {doc_id} to '{book.abs_title}' via CWA checksum history "
+            f"(Calibre book {calibre_book_id})"
+        )
+    return book
+
+
+# Longest first so ".kepub.epub" wins over ".epub". Only known extensions are
+# stripped: Path.suffixes would split names such as "J.R.R. Tolkien" on their dots.
+_FILENAME_VARIANT_EXTENSIONS = (".kepub.epub", ".epub", ".pdf", ".mobi", ".azw3", ".cbz", ".fb2")
+
+
+def _filename_variant_hashes(filename) -> tuple[set, set]:
+    """Return ``(exact, reordered)`` KOReader filename-mode hashes for a library filename.
+
+    Calibre names the library file "Title - Author" but sends the device copy as
+    "Author - Title", so the device hashes a reordering of the same " - " parts.
+    Both Unicode forms are hashed because KOReader hashes the basename bytes as
+    the device stores them, while the bridge's own filename hash does not normalize.
+    """
+    if not isinstance(filename, str) or not filename.strip():
+        return set(), set()
+    name = Path(filename.strip()).name
+    lowered = name.lower()
+    ext_length = next((len(ext) for ext in _FILENAME_VARIANT_EXTENSIONS if lowered.endswith(ext)), 0)
+    if not ext_length or ext_length == len(name):
+        return set(), set()
+    stem, ext = name[:-ext_length], name[-ext_length:]
+    parts = stem.split(" - ")
+    reordered = {" - ".join(parts[i:] + parts[:i]) for i in range(1, len(parts))} - {stem}
+
+    def _hashes(stems):
+        return {
+            hashlib.md5(unicodedata.normalize(form, s + ext).encode("utf-8"), usedforsecurity=False).hexdigest()
+            for s in stems
+            for form in ("NFC", "NFD")
+        }
+
+    return _hashes({stem}), _hashes(reordered)
+
+
+_variant_index_lock = threading.Lock()
+_variant_index: dict = {}
+_variant_index_generation = 0
+
+
+def _invalidate_filename_variant_index() -> None:
+    """Drop every per-user variant index (catalog or user-book links changed)."""
+    global _variant_index_generation
+    with _variant_index_lock:
+        _variant_index.clear()
+        _variant_index_generation += 1
+
+
+def _filename_variant_index(user_id) -> tuple[dict, dict]:
+    """Per-user ``(exact, reordered)`` maps of variant hash -> ``{abs_id: filename}``.
+
+    Built lazily from the user's active books and kept until the catalog or a
+    user<->book link changes, so a request costs a dict lookup, not an MD5 sweep.
+    """
+    with _variant_index_lock:
+        cached = _variant_index.get(user_id)
+        generation = _variant_index_generation
+    if cached is not None:
+        return cached
+    exact_map: dict = {}
+    reordered_map: dict = {}
+    for book in _database_service.get_books_by_status("active", user_id=user_id) or []:
+        for filename in (getattr(book, "original_ebook_filename", None), getattr(book, "ebook_filename", None)):
+            exact, reordered = _filename_variant_hashes(filename)
+            for variant in exact:
+                exact_map.setdefault(variant, {}).setdefault(book.abs_id, filename)
+            for variant in reordered - exact:
+                reordered_map.setdefault(variant, {}).setdefault(book.abs_id, filename)
+    built = (exact_map, reordered_map)
+    with _variant_index_lock:
+        if generation == _variant_index_generation:
+            _variant_index[user_id] = built
+    return built
+
+
+def _resolve_book_by_filename_variants(doc_id: str, user_id=None):
+    """Resolve a device's filename-mode hash to one of the user's active books.
+
+    An exact library filename (allowing a Unicode-form difference) takes precedence
+    over a reordered one, so "Foo - Bar.epub" and "Bar - Foo.epub" in the same
+    library don't block each other. More than one book in the deciding tier is
+    ambiguous and resolves nothing.
+    """
+    if not doc_id or not _is_valid_hex_hash(doc_id):
+        return None
+    target = doc_id.lower()
+    conflict_key = f"kosync_filename_variant_conflict:{target}"
+
+    exact_map, reordered_map = _filename_variant_index(user_id)
+    for tier, matches in (
+        ("library filename", exact_map.get(target, {})),
+        ("reordered filename", reordered_map.get(target, {})),
+    ):
+        if len(matches) > 1:
+            get_persistent_condition_logger().warn(
+                logger,
+                conflict_key,
+                "⚠️ KOSync: %s matches the %s of %d books (%s); leaving it unlinked",
+                target, tier, len(matches), ", ".join(sorted(str(abs_id) for abs_id in matches)),
+            )
+            return None
+        if matches:
+            get_persistent_condition_logger().resolve(
+                logger, conflict_key, "KOSync: %s now matches a single book by filename", target,
+            )
+            abs_id, filename = next(iter(matches.items()))
+            book = _database_service.get_book(abs_id)
+            if book:
+                logger.info(f"🔗 KOSync: Resolved {target} to '{book.abs_title}' via {tier} '{filename}'")
+            return book
+
+    get_persistent_condition_logger().resolve(
+        logger, conflict_key, "KOSync: %s no longer matches multiple books by filename", target,
+    )
+    logger.debug(f"KOSync: no library filename variant matches {target}")
     return None
 
 
@@ -3529,17 +3957,32 @@ def _resolve_book_by_epub_identifier(epub_filename: str, doc_id: str = None):
     return None
 
 
-def _register_hash_for_book(doc_id: str, book):
-    """Register a new hash and link it to an existing book."""
+def _register_hash_for_book(doc_id: str, book, *, user_id=None, exact: bool = False) -> None:
+    """Register a new hash and link it to an existing book.
+
+    ``user_id`` stamps a newly created document with the reader it came from. A
+    heuristic match (``exact=False``) never relinks an existing unlinked document
+    that another user owns: the link is global but the match only searched this
+    reader's books.
+    """
     from src.db.models import KosyncDocument as KD
 
     existing = _database_service.get_kosync_document(doc_id)
     if existing:
         if not existing.linked_abs_id:
+            if not exact and user_id is not None and (
+                getattr(existing, "user_id", None) not in (None, user_id)
+                or _database_service.kosync_document_has_other_user_progress(doc_id, user_id)
+            ):
+                logger.info(
+                    f"KOSync: Not relinking {doc_id} to '{book.abs_title}' by heuristic match - "
+                    "the document belongs to another user"
+                )
+                return
             _database_service.link_kosync_document(doc_id, book.abs_id)
             logger.info(f"🔗 KOSync: Linked existing document {doc_id} to '{book.abs_title}'")
     else:
-        doc = KD(document_hash=doc_id, linked_abs_id=book.abs_id)
+        doc = KD(document_hash=doc_id, linked_abs_id=book.abs_id, user_id=user_id)
         _database_service.save_kosync_document(doc)
         logger.info(f"🔗 KOSync: Created and linked new document {doc_id} to '{book.abs_title}'")
 
@@ -3660,7 +4103,7 @@ def _run_put_auto_discovery_inner(doc_hash_val: str, user_id=None) -> None:
         or _resolve_book_by_epub_identifier(epub_filename, doc_id=doc_hash_val)
     )
     if existing_book:
-        _register_hash_for_book(doc_hash_val, existing_book)
+        _register_hash_for_book(doc_hash_val, existing_book, user_id=user_id)
         if user_id is not None:
             _database_service.link_user_book(user_id, existing_book.abs_id)
         _database_service.dismiss_suggestion(doc_hash_val)

@@ -22,6 +22,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from src.utils.polisher import Polisher
 from src.utils.transcriber import AudioTranscriber
 
 # The reporter's actual numbers (issue #362).
@@ -36,7 +37,7 @@ def _segments_to(end_ts):
 class TranscriptCoverageTestCase(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
-        self.transcriber = AudioTranscriber(self.tmp, MagicMock(), MagicMock())
+        self.transcriber = AudioTranscriber(self.tmp, MagicMock(), Polisher())
         self._saved_env = os.environ.get("TRANSCRIPT_MIN_COVERAGE")
         os.environ.pop("TRANSCRIPT_MIN_COVERAGE", None)
 
@@ -114,6 +115,34 @@ class TestCoverageCheck(TranscriptCoverageTestCase):
         self.assertEqual(self.transcriber._transcript_extent([]), 0.0)
         self.assertEqual(self.transcriber._transcript_extent(None), 0.0)
 
+    def test_cached_word_transcript_uses_configured_coverage_and_validates_snapshot(self):
+        cache_dir = self.transcriber.cache_root / "cached-book"
+        cache_dir.mkdir(parents=True)
+        segments = [{
+            "start": 0.0,
+            "end": 90.0,
+            "text": "ready",
+            "words": [{"word": "ready", "start": 89.0, "end": 90.0}],
+        }]
+        progress = {"done": True, "chunks_completed": 1, "transcript": segments}
+        (cache_dir / "_progress.json").write_text(json.dumps(progress), encoding="utf-8")
+
+        assert self.transcriber.get_cached_word_timed_transcript("cached-book", 100) == segments
+        self.assertIsNone(
+            self.transcriber.get_cached_word_timed_transcript("cached-book", 110)
+        )
+
+        progress.update(vad_filter=True, cumulative_duration=95.0)
+        progress["transcript"][0]["words"][0].update(start=69.0, end=70.0)
+        (cache_dir / "_progress.json").write_text(json.dumps(progress), encoding="utf-8")
+        assert self.transcriber.get_cached_word_timed_transcript("cached-book", 100) == segments
+
+        progress["transcript"][0]["words"][0]["end"] = float("nan")
+        (cache_dir / "_progress.json").write_text(json.dumps(progress), encoding="utf-8")
+        self.assertIsNone(
+            self.transcriber.get_cached_word_timed_transcript("cached-book", 100)
+        )
+
 
 class TestDownloadIntegrity(TranscriptCoverageTestCase):
     def _response(self, content_length):
@@ -181,6 +210,26 @@ class TestProcessAudioGuards(TranscriptCoverageTestCase):
             abs_id, [], expected_duration=REPORTED_AUDIO_DURATION
         )
         self.assertEqual(len(result), 1)
+
+    def test_vad_cache_uses_processed_audio_duration_when_music_follows_speech(self):
+        abs_id = 'vad-trailing-music'
+        progress_file = self._write_completed_cache(abs_id, 60)
+        progress = json.loads(progress_file.read_text())
+        progress.update(vad_filter=True, cumulative_duration=100)
+        progress_file.write_text(json.dumps(progress))
+        result = self.transcriber.process_audio(abs_id, [], expected_duration=100)
+        self.assertEqual(result[0]['end'], 60)
+        self.assertTrue(progress_file.exists())
+
+    def test_vad_does_not_accept_audio_shorter_than_expected_runtime(self):
+        abs_id = 'vad-short-audio'
+        progress_file = self._write_completed_cache(abs_id, 60)
+        progress = json.loads(progress_file.read_text())
+        progress.update(vad_filter=True, cumulative_duration=60)
+        progress_file.write_text(json.dumps(progress))
+        with self.assertRaises(Exception):
+            self.transcriber.process_audio(abs_id, [], expected_duration=100)
+        self.assertFalse(progress_file.exists())
 
     def test_cached_transcript_reused_when_no_expected_duration(self):
         """Unchanged behaviour for callers that cannot supply a runtime."""

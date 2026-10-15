@@ -46,6 +46,9 @@ class KosyncDocument(Base):
     source = Column(String(50), nullable=True)
     booklore_id = Column(String(255), nullable=True, index=True)
     mtime = Column(Float, nullable=True)
+    # Which KOSYNC_HASH_METHOD ('content' | 'filename') produced document_hash when
+    # this row was cached; NULL for rows that carry no cached filename.
+    hash_method = Column(String(16), nullable=True)
 
     # Relationship to Book (optional)
     linked_book = relationship("Book", backref="kosync_documents")
@@ -53,7 +56,8 @@ class KosyncDocument(Base):
     def __init__(self, document_hash: str, progress: str = None, percentage: float = 0,
                  device: str = None, device_id: str = None, timestamp: datetime = None,
                  linked_abs_id: str = None, filename: str = None, source: str = None,
-                 booklore_id: str = None, mtime: float = None, user_id: int = None):
+                 booklore_id: str = None, mtime: float = None, user_id: int = None,
+                 hash_method: str = None):
         self.document_hash = document_hash
         self.progress = progress
         self.percentage = percentage
@@ -65,6 +69,7 @@ class KosyncDocument(Base):
         self.source = source
         self.booklore_id = booklore_id
         self.mtime = mtime
+        self.hash_method = hash_method
         self.user_id = user_id
         self.first_seen = utcnow()
         self.last_updated = utcnow()
@@ -220,7 +225,7 @@ class Book(Base):
     hardcover_details = relationship("HardcoverDetails", back_populates="book", cascade="all, delete-orphan", uselist=False)
     storygraph_details = relationship("StorygraphDetails", back_populates="book", cascade="all, delete-orphan", uselist=False)
     alignment = relationship("BookAlignment", back_populates="book", uselist=False, cascade="all, delete-orphan")
-    reading_sessions = relationship("ReadingSession", back_populates="book", cascade="all, delete-orphan")
+    reading_sessions = relationship("ReadingSession", back_populates="book", passive_deletes="all")
 
     def __init__(self, abs_id: str, abs_title: str = None, ebook_filename: str = None,
                  audio_source: str = None, audio_source_id: str = None,
@@ -434,13 +439,15 @@ class Job(Base):
     # leaves it NULL, and callers treat
     # None the same as "no stage recorded" rather than an error.
     stage = Column(String(50), nullable=True)
+    recovery_identity = Column(String(64), nullable=True)
 
     # Relationship
     book = relationship("Book", back_populates="jobs")
 
     def __init__(self, abs_id: str, last_attempt: float = None,
                  retry_count: int = 0, last_error: str = None, progress: float = 0.0,
-                 kind: str = JOB_KIND_ALIGNMENT, stage: Optional[str] = None):
+                 kind: str = JOB_KIND_ALIGNMENT, stage: Optional[str] = None,
+                 recovery_identity: Optional[str] = None):
         self.abs_id = abs_id
         self.last_attempt = last_attempt
         self.retry_count = retry_count
@@ -448,6 +455,7 @@ class Job(Base):
         self.progress = progress
         self.kind = kind
         self.stage = stage
+        self.recovery_identity = recovery_identity
 
     def __repr__(self):
         return f"<Job(abs_id='{self.abs_id}', kind='{self.kind}', stage='{self.stage}', retries={self.retry_count})>"
@@ -685,12 +693,14 @@ class ReadingSession(Base):
     leader_client = Column(String(50), nullable=True)    # e.g. 'ABS', 'BookLoreAudio', 'KoSync', 'BookLore'
     # Multi-user: stats are per-user. Nullable during rollout; backfilled in Phase 3.
     user_id = Column(Integer, ForeignKey('users.id'), nullable=True, index=True)
+    # Title snapshot so history stays nameable after the book mapping is deleted.
+    book_title = Column(String(500), nullable=True)
 
     book = relationship("Book", back_populates="reading_sessions")
 
     def __init__(self, abs_id: str, session_type: str, start_time: float, end_time: float,
                  duration_seconds: int, start_progress: float = None, end_progress: float = None,
-                 leader_client: str = None, user_id: int = None):
+                 leader_client: str = None, user_id: int = None, book_title: str = None):
         self.abs_id = abs_id
         self.session_type = session_type
         self.start_time = start_time
@@ -700,6 +710,7 @@ class ReadingSession(Base):
         self.end_progress = end_progress
         self.leader_client = leader_client
         self.user_id = user_id
+        self.book_title = book_title
 
 
 class KOReaderBookStat(Base):
@@ -1039,6 +1050,8 @@ class User(Base):
     and alignments are shared across users.
     """
     __tablename__ = 'users'
+    # A deleted account's id must never be reissued (sessions + stamped rows).
+    __table_args__ = {'sqlite_autoincrement': True}
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     username = Column(String(255), nullable=False, unique=True, index=True)

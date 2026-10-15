@@ -1,9 +1,11 @@
 import glob
 import logging
+import math
 import os
 import threading
 import time
 import traceback
+from contextlib import nullcontext
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
@@ -55,6 +57,7 @@ from src.utils.transcription_cancel import (
 from src.utils.transcriber import TranscriptionCancelled
 from src.utils.logging_utils import sanitize_log_data, get_persistent_condition_logger
 from src.utils.progress_metadata import state_metadata_kwargs
+from src.utils.ebook_utils import LINKABLE_EBOOK_EXTENSIONS, is_linkable_ebook_filename
 from src.utils.fixed_page_progress import coerce_page, is_cbz_book, is_cbz_filename
 from src.utils.ebook_sources import (
     is_grimmory_source,
@@ -64,9 +67,10 @@ from src.utils.ebook_sources import (
 )
 
 # Service imports
-from src.services.alignment_service import AlignmentService, ingest_storyteller_transcripts
+from src.services.alignment_service import AlignmentService, ContentMatchRejected, ingest_storyteller_transcripts
 from src.services.audio_source_adapters import ABSAudioSourceAdapter, BookLoreAudioSourceAdapter, BookOrbitAudioSourceAdapter
-from src.services.library_service import LibraryService
+from src.services.library_service import EbookInputError, LibraryService
+from src.services.readalong_delivery import is_generated_readalong_epub
 from src.services.migration_service import MigrationService
 from src.services.reading_session_aggregator import (
     MAX_SESSION_SECONDS,
@@ -131,6 +135,12 @@ _HIGH_CONFIDENCE_NORMALIZATION_SOURCES: frozenset[str] = frozenset({
     "href_frag",
     "href_progression",
 })
+
+# How long a follower fill that did not complete waits before it is attempted again.
+_FOLLOWER_INIT_COOLDOWN_SECONDS = 6 * 3600
+# Below this the book is unstarted: a reader opening it starts there anyway, so a
+# fill would only cost a parse and a write per newly matched book.
+_FOLLOWER_FILL_MIN_PCT = 0.001
 
 # Clients that navigate by locator rather than by percentage. ABSEbook rejects a
 # locator whose cfi is None outright; BookOrbit, Grimmory and CWA all back a Kobo
@@ -265,6 +275,10 @@ class SyncManager:
         # Hardcover idle-cooldown tracker (same trailing-edge scheme as StoryGraph).
         self._hardcover_cooldown: dict[tuple[int | None, str], dict] = {}
         self._hardcover_cooldown_lock = threading.Lock()
+        # (user_id, abs_id) -> monotonic time of the last attempt to fill a KoSync
+        # follower; an attempt that never completes is not retried for the cooldown.
+        self._follower_init_attempts: dict[tuple[int | None, str], float] = {}
+        self._follower_init_lock = threading.Lock()
         # One follow-up timer per user/book; both trackers are evaluated by the
         # targeted cycle, so matching deadlines must not launch duplicate cycles.
         self._tracker_cooldown_timers: dict[tuple[int | None, str], dict] = {}
@@ -531,6 +545,64 @@ class SyncManager:
                         logger.warning(f"⚠️ Completion propagation failed for '{client_name}': client reported unsuccessful write")
             except Exception as e:
                 logger.warning(f"⚠️ Completion propagation failed for '{client_name}': {e}", exc_info=True)
+
+    def _should_initialize_followers(self, config: dict, abs_id: str, title_snip: str) -> bool:
+        """True when a follower_only client should be filled now.
+
+        Each attempt is recorded up front and cleared only by a completed write, so
+        a failure or an attempt that cannot produce a position (no locator, no
+        text, an unresolvable XPath) waits out the cooldown instead of repeating
+        every cycle.
+        """
+        if not any(state.follower_only for state in config.values()):
+            return False
+        if max((state.current.get('pct') or 0 for state in config.values() if not state.follower_only),
+               default=0) < _FOLLOWER_FILL_MIN_PCT:
+            return False
+        key = (get_current_user_id(), abs_id)
+        now = time.monotonic()
+        with self._follower_init_lock:
+            last = self._follower_init_attempts.get(key)
+            if last is not None and now - last < _FOLLOWER_INIT_COOLDOWN_SECONDS:
+                get_persistent_condition_logger().warn(
+                    logger, f"follower-init:{key[0]}:{abs_id}",
+                    "'%s' '%s' A previous attempt to fill a client with no position did not complete; "
+                    "not retrying for %d hours unless a client moves",
+                    abs_id, title_snip, _FOLLOWER_INIT_COOLDOWN_SECONDS // 3600,
+                )
+                return False
+            self._follower_init_attempts[key] = now
+        return True
+
+    def _finish_follower_init(self, book: Book, results: dict, abs_id: str, title_snip: str) -> None:
+        """Persist follower writes that landed and clear their attempt record."""
+        key = (get_current_user_id(), abs_id)
+        current_time = time.time()
+        written = False
+        for client_name, result in results.items():
+            if not result.success or result.skipped:
+                logger.info(f"'{abs_id}' '{title_snip}' Could not fill '{client_name}' with a starting position")
+                continue
+            state_data = result.updated_state or {'pct': result.location}
+            self.database_service.save_state(State(
+                abs_id=book.abs_id,
+                client_name=client_name.lower(),
+                last_updated=current_time,
+                percentage=state_data.get('pct'),
+                timestamp=state_data.get('ts'),
+                xpath=state_data.get('xpath'),
+                cfi=state_data.get('cfi'),
+                **state_metadata_kwargs(state_data),
+            ))
+            written = True
+            logger.info(f"💾 '{abs_id}' '{title_snip}' Filled '{client_name}' with the synced position")
+        if written:
+            with self._follower_init_lock:
+                self._follower_init_attempts.pop(key, None)
+            get_persistent_condition_logger().resolve(
+                logger, f"follower-init:{key[0]}:{abs_id}",
+                f"'{abs_id}' '{title_snip}' Client with no position filled",
+            )
 
     def _iter_update_targets(self, active_clients: dict, leader_name: str | None):
         """Yield non-leader clients with KoSync updated last."""
@@ -1709,15 +1781,45 @@ class SyncManager:
                 elif book.status == 'processing':
                      # Only mark processing checks as failed (failed are already failed)
                     logger.info(f"⚡ Recovering interrupted job: {sanitize_log_data(book.abs_title)}")
-                    book.status = 'failed_retry_later'
+                    interrupted_job = self.database_service.get_latest_job(
+                        book.abs_id, kind=JOB_KIND_ALIGNMENT
+                    )
+                    stage = getattr(interrupted_job, "stage", None)
+                    existing_retries = (getattr(interrupted_job, "retry_count", 0) or 0)
+                    recovery_marker = stage in {
+                        "ebook_input_recovery", "ebook_input_recovery_manual",
+                    }
+                    retries = existing_retries if recovery_marker else 0
+                    max_retries = int(os.getenv("JOB_MAX_RETRIES", 5))
+                    recovery_interrupted = stage == "ebook_input_recovery"
+                    if recovery_interrupted:
+                        retries += 1
+                    manual_recovery = (
+                        stage == "ebook_input_recovery_manual"
+                        or (recovery_interrupted and retries >= max_retries)
+                    )
+                    book.status = 'failed_permanent' if manual_recovery else 'failed_retry_later'
                     self.database_service.save_book(book)
 
                     # Also update the job record with error info
                     job = Job(
                         abs_id=book.abs_id,
                         last_attempt=time.time(),
-                        retry_count=0,
-                        last_error=restart_error
+                        retry_count=retries,
+                        last_error=(
+                            f"{restart_error}; recovery needs manual review"
+                            if manual_recovery else restart_error
+                        ),
+                        progress=getattr(interrupted_job, "progress", 0.0) or 0.0,
+                        kind=JOB_KIND_ALIGNMENT,
+                        stage=(
+                            "ebook_input_recovery_manual" if manual_recovery
+                            else stage
+                        ),
+                        recovery_identity=(
+                            getattr(interrupted_job, "recovery_identity", None)
+                            if recovery_marker else None
+                        ),
                     )
                     self.database_service.save_job(job)
 
@@ -1964,8 +2066,12 @@ class SyncManager:
                 getattr(book, 'abs_id', '?'), e, exc_info=True,
             )
 
-    def _fetch_states_parallel(self, book, prev_states_by_client, title_snip, bulk_states_per_client=None, clients_to_use=None):
-        """Fetch states from specified clients (or all if not specified) in parallel."""
+    def _fetch_states_parallel(self, book, prev_states_by_client, title_snip, bulk_states_per_client=None, clients_to_use=None,
+                               executor=None):
+        """Fetch states from specified clients (or all if not specified) in parallel.
+
+        `executor` is the sync cycle's shared pool; without it, one is created for this call.
+        """
         clients_to_use = clients_to_use or self.sync_clients
         config = {}
         bulk_states_per_client = bulk_states_per_client or {}
@@ -1973,7 +2079,8 @@ class SyncManager:
         if not clients_to_use:
             return config
 
-        with ThreadPoolExecutor(max_workers=len(clients_to_use)) as executor:
+        pool = nullcontext(executor) if executor is not None else ThreadPoolExecutor(max_workers=len(clients_to_use))
+        with pool as executor:
             futures = {}
             submitted_at = {}
             for client_name, client in clients_to_use.items():
@@ -2260,7 +2367,7 @@ class SyncManager:
                 return candidate
         return None
 
-    def _promote_alignment_backed_book(self, book: Book | None) -> bool:
+    def _promote_alignment_backed_book(self, book: Book | None, alignment_snapshot=None) -> bool:
         """Repair books whose alignment is stored but whose metadata never finalized.
 
         The job-completion write below is scoped to `kind=JOB_KIND_ALIGNMENT`
@@ -2269,13 +2376,48 @@ class SyncManager:
         never be touched here -- an unrelated in-flight job being newer than
         the real alignment job used to make this method mark it "done"
         (progress=1.0, error cleared) even though its own worker never ran.
+
+        `alignment_snapshot` is the sync cycle's (aligned book ids, latest
+        alignment job per book), read once for all books.
         """
         if not book or not self.alignment_service:
             return False
 
-        alignment = self.alignment_service._get_alignment(book.abs_id)
-        if not alignment:
+        if alignment_snapshot is not None:
+            aligned_ids, latest_jobs = alignment_snapshot
+            if book.abs_id not in aligned_ids:
+                return False
+            latest_job = latest_jobs.get(book.abs_id)
+        else:
+            # Steady-state sync must not load every map and churn the parsed-map cache.
+            if not self.database_service.has_alignment(book.abs_id):
+                return False
+            latest_job = self.database_service.get_latest_job(book.abs_id, kind=JOB_KIND_ALIGNMENT)
+
+        # Recovery replaces a verified-bad source input while keeping the old
+        # alignment until the new timed transcript has produced a usable map.
+        if getattr(latest_job, "stage", None) in {
+            "ebook_input_recovery", "ebook_input_recovery_manual",
+        }:
             return False
+
+        repair_job = latest_job and (
+            (latest_job.progress or 0.0) < 1.0
+            or latest_job.retry_count
+            or latest_job.last_error
+        )
+        if (getattr(book, "transcript_file", None) != "DB_MANAGED"
+                or getattr(book, "status", None) != "active" or repair_job):
+            if alignment_snapshot is not None:
+                # Something may need writing: decide it on the current rows.
+                return self._promote_alignment_backed_book(book)
+            # A row alone cannot prove that an unfinished job produced a usable map.
+            try:
+                if not self.alignment_service._get_alignment(book.abs_id):
+                    return False
+            except (ValueError, TypeError):
+                logger.warning("Cannot repair '%s': stored alignment map is unreadable", book.abs_id, exc_info=True)
+                return False
 
         changed = False
         if getattr(book, "transcript_file", None) != "DB_MANAGED":
@@ -2288,12 +2430,7 @@ class SyncManager:
         if changed:
             self.database_service.save_book(book)
 
-        latest_job = self.database_service.get_latest_job(book.abs_id, kind=JOB_KIND_ALIGNMENT)
-        if latest_job and (
-            (latest_job.progress or 0.0) < 1.0
-            or latest_job.retry_count
-            or latest_job.last_error
-        ):
+        if repair_job:
             self.database_service.update_latest_job(
                 book.abs_id,
                 kind=JOB_KIND_ALIGNMENT,
@@ -2669,9 +2806,9 @@ class SyncManager:
                     bl_results = booklore_client.search_books(search_title)
                     logger.debug(f"Grimmory returned {len(bl_results)} results for '{search_title}'")
                     for b in bl_results:
-                         # Filter for EPUBs
+                         # Filter for linkable ebooks (EPUB + comics)
                          fname = b.get('fileName', '')
-                         if fname.lower().endswith('.epub'):
+                         if is_linkable_ebook_filename(fname):
                              found_filenames.add(fname)
                              matches.append({
                                  "source": "booklore",
@@ -2689,17 +2826,19 @@ class SyncManager:
                 try:
                     clean_title = search_title.lower()
                     fs_matches = 0
-                    for epub in self.books_dir.rglob("*.epub"):
-                         if epub.name in found_filenames:
-                             continue
-                         if clean_title in epub.name.lower():
-                             fs_matches += 1
-                             matches.append({
-                                 "source": "filesystem",
-                                 "filename": epub.name,
-                                 "path": str(epub),
-                                 "confidence": "high"
-                             })
+                    for epub in self.books_dir.rglob('*'):
+                        if epub.suffix.lower() not in LINKABLE_EBOOK_EXTENSIONS or not epub.is_file():
+                            continue
+                        if epub.name in found_filenames or is_generated_readalong_epub(epub.name):
+                            continue
+                        if clean_title in epub.name.lower():
+                            fs_matches += 1
+                            matches.append({
+                                "source": "filesystem",
+                                "filename": epub.name,
+                                "path": str(epub),
+                                "confidence": "high"
+                            })
                     logger.debug(f"Filesystem found {fs_matches} matches")
                 except Exception as e:
                     logger.warning(f"⚠️ Filesystem search failed during suggestion: {e}", exc_info=True)
@@ -2788,6 +2927,166 @@ class SyncManager:
             logger.error(f"❌ Failed to create suggestion for '{abs_id}': {e}", exc_info=True)
             logger.debug(traceback.format_exc())
 
+    def _ebook_input_recovery_candidates(self) -> list[dict]:
+        """Load the narrow, cheap DB candidate set used by recovery and sync gating."""
+        getter = getattr(self.database_service, "get_ebook_input_recovery_candidates", None)
+        if not callable(getter):
+            return []
+        candidates = getter()
+        return candidates if isinstance(candidates, list) else []
+
+    def _is_ebook_input_recovery_stage(self, abs_id: str) -> bool:
+        getter = getattr(self.database_service, "get_latest_job", None)
+        if not callable(getter):
+            return False
+        job = getter(abs_id, kind=JOB_KIND_ALIGNMENT)
+        return getattr(job, "stage", None) in {
+            "ebook_input_recovery", "ebook_input_recovery_manual",
+        }
+
+    def _cached_recovery_evidence(self, candidate: dict) -> tuple[Path, str, str | None] | None:
+        """Return the retained EPUB, its hash, and a proven bad PDF hash."""
+        book = candidate.get("book") if isinstance(candidate, dict) else None
+        if not book or not self.ebook_parser or not self.alignment_service:
+            return None
+        if (
+            str(getattr(book, "ebook_source", "") or "").lower() != "cwa"
+            or not str(getattr(book, "ebook_source_id", "") or "").strip().isdigit()
+            or getattr(book, "sync_mode", "audiobook") != "audiobook"
+        ):
+            return None
+
+        current_name = str(getattr(book, "ebook_filename", "") or "")
+        total_chars = candidate.get("alignment_total_chars")
+        pdf_candidate = current_name.lower().endswith(".pdf")
+        zero_map_candidate = total_chars == 0
+        if not pdf_candidate and not zero_map_candidate:
+            return None
+
+        original_name = str(getattr(book, "original_ebook_filename", "") or "").strip()
+        if not original_name or Path(original_name).name != original_name:
+            return None
+        original_path = safe_cache_path(self.epub_cache_dir, original_name)
+        if (
+            not original_path or not original_path.is_file()
+            or original_path.suffix.lower() != ".epub"
+            or not LibraryService._is_epub_file(str(original_path))
+        ):
+            return None
+        try:
+            ebook_text, _chapters = self.ebook_parser.extract_text_and_map(original_path)
+        except Exception:
+            return None
+        if not ebook_text or not ebook_text.strip():
+            return None
+
+        duration = getattr(book, "audio_duration", None) or getattr(book, "duration", None)
+        cached_transcript = getattr(self.transcriber, "get_cached_word_timed_transcript", None)
+        if not callable(cached_transcript):
+            return None
+        transcript = cached_transcript(book.abs_id, duration)
+        if not transcript:
+            return None
+        transcript_text = " ".join(
+            str(segment.get("text") or " ".join(
+                str(word.get("word") or "") for word in segment.get("words", [])
+            ))
+            for segment in transcript if isinstance(segment, dict)
+        )
+        from src.services import map_quality
+        diagnostics = {}
+        overlap = map_quality.transcript_text_overlap(
+            transcript_text, ebook_text, diagnostics=diagnostics,
+        )
+        if diagnostics.get("sampled", 0) <= 0 or overlap < 0.25:
+            return None
+
+        try:
+            original_hash = self.ebook_parser.get_kosync_id(original_path)
+        except Exception:
+            return None
+        if not original_hash:
+            return None
+
+        bad_hash = None
+        if pdf_candidate:
+            pdf_path = safe_cache_path(self.epub_cache_dir, f"{book.abs_id}_direct.pdf")
+            if not pdf_path or not pdf_path.is_file():
+                return None
+            try:
+                with pdf_path.open("rb") as source:
+                    if source.read(5) != b"%PDF-":
+                        return None
+                pdf_hash = self.ebook_parser.get_kosync_id(pdf_path)
+            except Exception:
+                return None
+            if not pdf_hash or getattr(book, "kosync_doc_id", None) != pdf_hash:
+                return None
+            bad_hash = pdf_hash
+
+        if zero_map_candidate and not pdf_candidate:
+            current_hash = getattr(book, "kosync_doc_id", None)
+            if current_hash not in (None, "", original_hash):
+                return None
+            try:
+                alignment, map_updated, _current_total_chars = (
+                    self.database_service.get_ebook_input_recovery_alignment(book.abs_id)
+                )
+                if map_updated != candidate.get("alignment_last_updated"):
+                    return None
+                if not isinstance(alignment, list) or not alignment:
+                    return None
+                anchors = []
+                for point in alignment:
+                    if not isinstance(point, dict):
+                        return None
+                    value = point.get("global_char", point.get("char"))
+                    if (
+                        isinstance(value, bool) or not isinstance(value, (int, float))
+                        or not math.isfinite(value) or value < 0
+                    ):
+                        return None
+                    anchors.append(value)
+                if not anchors or any(value != 0 for value in anchors):
+                    return None
+            except (ValueError, TypeError, KeyError):
+                return None
+
+        return original_path, original_hash, bad_hash
+
+    def _recover_ebook_input_candidates(self) -> None:
+        """Queue only proof-backed CWA EPUB input repairs; ambiguous rows stay flagged."""
+        flag_manual = getattr(self.database_service, "flag_ebook_input_recovery_manual", None)
+        repair = getattr(self.database_service, "repair_ebook_input_recovery", None)
+        if not callable(flag_manual) or not callable(repair):
+            return
+        for candidate in self._ebook_input_recovery_candidates():
+            if not isinstance(candidate, dict):
+                continue
+            book = candidate.get("book")
+            if not book or self._is_ebook_input_recovery_stage(book.abs_id):
+                continue
+            proof = self._cached_recovery_evidence(candidate)
+            if proof is None:
+                explicit_pdf = str(getattr(book, "ebook_filename", "") or "").lower().endswith(".pdf")
+                zero_map = candidate.get("alignment_total_chars") == 0
+                if explicit_pdf or zero_map:
+                    flag_manual(
+                        book.abs_id, book, candidate.get("job"),
+                        candidate.get("alignment_last_updated"),
+                        "Recovery proof incomplete: retained EPUB, timed transcript, content match, and bad-input identity must all be verified.",
+                    )
+                continue
+            original_path, original_hash, bad_hash = proof
+            try:
+                repair(
+                    book.abs_id, book, candidate.get("job"),
+                    candidate.get("alignment_last_updated"),
+                    original_path.name, original_hash, bad_kosync_doc_id=bad_hash,
+                )
+            except Exception:
+                logger.warning("Could not queue ebook input recovery for %s", book.abs_id, exc_info=True)
+
     def check_pending_jobs(self):
         """
         Check for pending jobs and run them in a BACKGROUND thread
@@ -2796,6 +3095,8 @@ class SyncManager:
         # 1. If a job is already running, let it finish.
         if self._job_thread and self._job_thread.is_alive():
             return
+
+        self._recover_ebook_input_candidates()
 
         max_retries = int(os.getenv("JOB_MAX_RETRIES", 5))
         retry_delay_mins = int(os.getenv("JOB_RETRY_DELAY_MINS", 15))
@@ -2867,6 +3168,8 @@ class SyncManager:
                 # This loop drives alignment-worker retry eligibility.
                 job = self.database_service.get_latest_job(book.abs_id, kind=JOB_KIND_ALIGNMENT)
                 if job:
+                    if getattr(job, "stage", None) == "ebook_input_recovery_manual":
+                        continue
                     retry_count = job.retry_count or 0
                     last_attempt = job.last_attempt or 0
 
@@ -2917,12 +3220,40 @@ class SyncManager:
         self.database_service.save_book(target_book)
 
         # Create or update job record
+        prior_job = retry_job
+        if not prior_job:
+            get_latest_job = getattr(self.database_service, "get_latest_job", None)
+            if callable(get_latest_job):
+                try:
+                    candidate_job = get_latest_job(
+                        target_book.abs_id, kind=JOB_KIND_ALIGNMENT
+                    )
+                except TypeError:
+                    candidate_job = None
+                if getattr(candidate_job, "stage", None) in {
+                    "ebook_input_recovery", "ebook_input_recovery_manual",
+                }:
+                    prior_job = candidate_job
+        prior_stage = getattr(prior_job, "stage", None)
+        prior_retry_count = (prior_job.retry_count or 0) if retry_job else 0
+        if prior_stage == "ebook_input_recovery_manual":
+            # Reaching pending is the explicit Remap/retry path. Let the user's
+            # selected source run through the ordinary pipeline again.
+            prior_stage = None
+            prior_retry_count = 0
+        elif prior_stage != "ebook_input_recovery":
+            prior_stage = None
         job = Job(
             abs_id=target_book.abs_id,
             last_attempt=time.time(),
-            retry_count=(retry_job.retry_count or 0) if retry_job else 0,
+            retry_count=prior_retry_count,
             last_error=None,
-            progress=0.0
+            progress=0.0,
+            stage=prior_stage,
+            recovery_identity=(
+                getattr(prior_job, "recovery_identity", None)
+                if prior_stage == "ebook_input_recovery" else None
+            ),
         )
         self.database_service.save_job(job)
 
@@ -2954,6 +3285,80 @@ class SyncManager:
     def cancel_background_job(self, abs_id: str) -> bool:
         """Request cancellation only when this manager has an active worker."""
         return request_cancel(abs_id)
+
+    def _run_cached_ebook_input_recovery(
+        self, book: Book, ensure_active, update_progress,
+    ) -> None:
+        """Rebuild a proven bad input mapping from retained EPUB and timed transcript caches."""
+        queued_job = self.database_service.get_latest_job(book.abs_id, kind=JOB_KIND_ALIGNMENT)
+        if (
+            not queued_job or not queued_job.recovery_identity
+            or queued_job.recovery_identity != self.database_service.ebook_input_recovery_identity(book)
+        ):
+            raise EbookInputError("Recovery pairing proof is missing or changed; recovery needs manual review.")
+        _, alignment_updated, _ = self.database_service.get_ebook_input_recovery_alignment(book.abs_id)
+        original_name = str(getattr(book, "original_ebook_filename", "") or "").strip()
+        if not original_name or book.ebook_filename != original_name:
+            raise EbookInputError("Recovery input identity changed; choose the retained EPUB and retry.")
+        epub_path = safe_cache_path(self.epub_cache_dir, original_name)
+        if (
+            not epub_path or not epub_path.is_file()
+            or epub_path.suffix.lower() != ".epub"
+            or not LibraryService._is_epub_file(str(epub_path))
+        ):
+            raise EbookInputError("Recovery EPUB cache is missing or invalid; restore the retained EPUB and retry.")
+
+        ensure_active()
+        try:
+            ebook_text, spine_chapters = self.ebook_parser.extract_text_and_map(epub_path)
+        except Exception as exc:
+            raise EbookInputError("Recovery EPUB is no longer readable; restore a valid cached EPUB and retry.") from exc
+        if not ebook_text or not ebook_text.strip():
+            raise EbookInputError("Recovery EPUB has no readable text; restore a valid cached EPUB and retry.")
+        try:
+            retained_hash = self.ebook_parser.get_kosync_id(epub_path)
+        except Exception as exc:
+            raise EbookInputError("Recovery EPUB identity could not be verified; recovery needs manual review.") from exc
+        if not retained_hash or retained_hash != getattr(book, "kosync_doc_id", None):
+            raise EbookInputError("Recovery EPUB hash no longer matches the repaired mapping; recovery needs manual review.")
+        current_book = self.database_service.get_book(book.abs_id)
+        if not self._ebook_recovery_book_matches(book, current_book):
+            raise TranscriptionCancelled(book.abs_id)
+
+        duration = getattr(book, "audio_duration", None) or getattr(book, "duration", None)
+        transcript_getter = getattr(self.transcriber, "get_cached_word_timed_transcript", None)
+        transcript = transcript_getter(book.abs_id, duration) if callable(transcript_getter) else None
+        if not transcript:
+            raise EbookInputError("Completed word-timed transcript cache is missing or incomplete; recovery needs manual review.")
+
+        update_progress(0.5, 3)
+        ensure_active()
+        current_job = self.database_service.get_latest_job(book.abs_id, kind=JOB_KIND_ALIGNMENT)
+        if (
+            not current_job or current_job.id != queued_job.id
+            or current_job.stage != "ebook_input_recovery"
+            or current_job.recovery_identity != queued_job.recovery_identity
+        ):
+            raise TranscriptionCancelled(book.abs_id)
+        if not self.alignment_service.align_and_store(
+            book.abs_id, transcript, ebook_text, spine_chapters,
+            preserve_backup=True, require_recovery_content_match=True,
+            recovery_snapshot=(book, current_job, alignment_updated),
+        ):
+            raise EbookInputError("Cached transcript did not produce a usable recovery alignment; recovery needs manual review.")
+        self._dispatch_readalong_intent(book)
+
+    @staticmethod
+    def _ebook_recovery_book_matches(expected: Book, current: Book | None) -> bool:
+        """Whether the shared catalog still has the proof-backed recovery identity."""
+        return bool(current) and all(
+            getattr(current, field, None) == getattr(expected, field, None)
+            for field in (
+                "status", "audio_source", "audio_source_id", "audio_duration",
+                "duration", "ebook_source", "ebook_source_id", "ebook_filename",
+                "original_ebook_filename", "kosync_doc_id", "sync_mode",
+            )
+        )
 
     def _run_ebook_only_batch(self, abs_ids: list[str]) -> None:
         """
@@ -3089,6 +3494,14 @@ class SyncManager:
                 # Save to DB every time for now (or throttle if too frequent).
                 self.database_service.update_latest_job(abs_id, kind=JOB_KIND_ALIGNMENT, progress=global_pct)
 
+            current_alignment_job = self.database_service.get_latest_job(
+                abs_id, kind=JOB_KIND_ALIGNMENT
+            )
+            if getattr(current_alignment_job, "stage", None) == "ebook_input_recovery":
+                self._run_cached_ebook_input_recovery(book, ensure_active, update_progress)
+                logger.info("✅ Completed cached ebook input recovery: %s", sanitize_log_data(abs_title))
+                return
+
             # --- Heavy Lifting (Blocks this thread, but not the Main thread) ---
             # Step 1: Get EPUB file
             update_progress(0.0, 1)
@@ -3138,6 +3551,14 @@ class SyncManager:
             update_progress(1.0, 1) # Done with step 1
             if not epub_path:
                 raise FileNotFoundError(f"Could not locate or download: {ebook_filename}")
+
+            book_text, spine_chapters = '', []
+            if not (ebook_only_mode and is_cbz_filename(epub_path.name)):
+                if epub_path.suffix.lower() != '.epub':
+                    raise EbookInputError(f"Ebook input refused: {epub_path.name} is not an EPUB. Choose the correct ebook and retry.")
+                book_text, spine_chapters = self.ebook_parser.extract_text_and_map(epub_path)
+                if not book_text.strip():
+                    raise EbookInputError(f"Ebook input refused: {epub_path.name} has no readable EPUB text. Replace the file and retry.")
             
             # acquire_ebook returns a string, so normalize epub_path to Path.
             if epub_path:
@@ -3172,8 +3593,6 @@ class SyncManager:
                     logger.info(
                         f"Ebook-only background prep: skipping EPUB parser warmup for CBZ '{sanitize_log_data(epub_path.name)}'"
                     )
-                else:
-                    self.ebook_parser.extract_text_and_map(epub_path)
                 update_progress(1.0, 3)
                 book.status = 'active'
                 persist_book()
@@ -3204,10 +3623,6 @@ class SyncManager:
             else:
                 chapters = item_details.get('media', {}).get('chapters', []) if item_details else []
             
-            # Pre-fetch book text for validation and alignment.
-            # We need this for Validating SMIL OR for Aligning Whisper
-            book_text, spine_chapters = self.ebook_parser.extract_text_and_map(epub_path)
-
             if (
                 self.alignment_service
                 and (
@@ -3441,6 +3856,19 @@ class SyncManager:
             job = self.database_service.get_latest_job(abs_id, kind=JOB_KIND_ALIGNMENT)
             current_retry_count = job.retry_count if job else 0
             new_retry_count = current_retry_count + 1
+            recovery_mode = getattr(job, "stage", None) == "ebook_input_recovery"
+            if recovery_mode and not self._ebook_recovery_book_matches(
+                book, self.database_service.get_book(abs_id)
+            ):
+                logger.info(
+                    "🛑 Skipping recovery failure save for %s: mapping identity changed",
+                    abs_id,
+                )
+                return
+            recovery_manual = recovery_mode and (
+                isinstance(e, (ContentMatchRejected, EbookInputError))
+                or new_retry_count >= max_retries
+            )
 
             # Update job record
             from src.db.models import Job
@@ -3449,22 +3877,33 @@ class SyncManager:
                 last_attempt=time.time(),
                 retry_count=new_retry_count,
                 last_error=str(e),
-                progress=job.progress if job else 0.0
+                progress=job.progress if job else 0.0,
+                stage=(
+                    "ebook_input_recovery_manual" if recovery_manual
+                    else "ebook_input_recovery" if recovery_mode
+                    else getattr(job, "stage", None)
+                ),
+                recovery_identity=getattr(job, "recovery_identity", None) if recovery_mode else None,
             )
             self.database_service.save_job(updated_job)
 
             # Update book status based on retry count
-            if new_retry_count >= max_retries:
+            if isinstance(e, (ContentMatchRejected, EbookInputError)) or new_retry_count >= max_retries:
                 book.status = 'failed_permanent'
-                logger.warning(f"⚠️ {sanitize_log_data(abs_title)}: Max retries exceeded", exc_info=True)
+                if isinstance(e, ContentMatchRejected):
+                    logger.warning(f"⚠️ {sanitize_log_data(abs_title)}: Alignment refused; awaiting corrected pairing")
+                elif isinstance(e, EbookInputError):
+                    logger.warning(f"⚠️ {sanitize_log_data(abs_title)}: Ebook input refused; awaiting corrected file")
+                else:
+                    logger.warning(f"⚠️ {sanitize_log_data(abs_title)}: Max retries exceeded", exc_info=True)
                 
-                # Clean up audio cache on permanent failure to free disk space
-                if self.data_dir:
-                    import shutil
+                # Keep the completed transcript so correcting the pairing does not repeat Whisper.
+                if self.data_dir and not recovery_mode:
                     audio_cache_dir = Path(self.data_dir) / "audio_cache" / abs_id
                     if audio_cache_dir.exists():
                         try:
-                            shutil.rmtree(audio_cache_dir)
+                            from src.utils.transcriber import AudioTranscriber
+                            AudioTranscriber._prune_audio_cache(audio_cache_dir, remove_directories=True)
                             logger.info(f"✅ Cleaned up audio cache for {sanitize_log_data(abs_title)}")
                         except Exception as cleanup_err:
                             logger.warning(f"⚠️ Failed to clean audio cache: {cleanup_err}", exc_info=True)
@@ -3822,6 +4261,9 @@ class SyncManager:
             # letting it lead would elect our own write-back (see
             # _mark_bookorbit_readalong_mirror). Shrinks the candidate set only.
             if v.current.get('_readalong_mirror'):
+                continue
+            # No record on that service: its position is a placeholder.
+            if v.follower_only:
                 continue
             if client.can_be_leader():
                 pct = v.current.get('pct')
@@ -4503,6 +4945,18 @@ class SyncManager:
         except Exception as e:
             logger.debug(f"Could not persist state snapshot for '{client_name}': {e}")
 
+    def _user_may_sync(self, user_id: int) -> bool:
+        """False for a disabled or deleted account; a failed lookup lets the cycle run."""
+        try:
+            user = self.database_service.get_user(user_id)
+        except Exception as e:
+            logger.debug("Could not check account %s before syncing: %s", user_id, e, exc_info=True)
+            return True
+        if user is not None and getattr(user, "active", 1):
+            return True
+        logger.info("⏸️ Skipping sync for user %s: account is disabled or deleted", user_id)
+        return False
+
     def sync_cycle(self, target_abs_id=None, user_id=None, sessions_only: bool = False):
         """
         Run a sync cycle.
@@ -4515,6 +4969,9 @@ class SyncManager:
                      runs as the default (single-user/admin) exactly as before.
             sessions_only: Deliver buffered sessions using the same user context and lock.
         """
+        if user_id is not None and not self._user_may_sync(user_id):
+            return
+
         # Per-user context: only when an explicit user + a registry are present,
         # so the default cycle is byte-for-byte unchanged.
         clients_token = None
@@ -4674,26 +5131,38 @@ class SyncManager:
         abs_configured = bool(
             abs_client and getattr(abs_client, "is_configured", lambda: False)()
         )
-        abs_bulk = (bulk_states_per_client or {}).get("ABS") or {}
+        # This cycle's GET /api/me showed the user can access every library item
+        abs_bulk = (bulk_states_per_client or {}).get("ABS")
+        abs_sees_all = abs_bulk is not None and getattr(abs_bulk, "can_access_all_items", False) is True
+        abs_bulk = abs_bulk or {}
+        abs_item_ids = None
         abs_bulk_ids = set(abs_bulk.keys()) if isinstance(abs_bulk, dict) else set()
+
+        # Primary ownership gate: only the books this user claimed (linked).
+        try:
+            linked_abs_ids = self.database_service.get_linked_abs_ids(user_id)
+        except Exception as exc:
+            logger.warning(
+                "Skipping all books for user_id=%s: ownership check failed: %s",
+                user_id,
+                exc,
+                exc_info=True,
+            )
+            for book in books or []:
+                logger.warning(
+                    "Skipping '%s' for user_id=%s: ownership check failed: %s",
+                    getattr(book, "abs_id", None),
+                    user_id,
+                    exc,
+                    exc_info=True,
+                )
+            linked_abs_ids = set()
 
         visible = []
         for book in books or []:
             abs_id = getattr(book, "abs_id", None)
 
-            # Primary ownership gate: only the books this user claimed (linked).
-            try:
-                linked = self.database_service.is_user_linked(user_id, abs_id)
-            except Exception as exc:
-                logger.warning(
-                    "Skipping '%s' for user_id=%s: ownership check failed: %s",
-                    abs_id,
-                    user_id,
-                    exc,
-                    exc_info=True,
-                )
-                linked = False
-            if not linked:
+            if abs_id not in linked_abs_ids:
                 logger.debug(
                     "Skipping '%s' for user_id=%s: not linked to this user", abs_id, user_id
                 )
@@ -4715,9 +5184,30 @@ class SyncManager:
                 visible.append(book)
                 continue
 
+            # With access to every item, a listed item is accessible (one cached listing, not a request per
+            # book); a miss may be a new item, so it is checked on its own below.
+            missing_key = f"abs-item-not-listed:{user_id}:{abs_id}"
+            if abs_sees_all and abs_item_ids is None:
+                abs_item_ids = abs_client.get_all_item_ids()
+                abs_sees_all = abs_item_ids is not None  # listing failed: check each book
+            if abs_sees_all and abs_id in abs_item_ids:
+                get_persistent_condition_logger().resolve(
+                    logger, missing_key, "✅ ABS: Item '%s' is back in the library listing", abs_id
+                )
+                visible.append(book)
+                continue
+
             try:
                 if abs_client.get_item_details(abs_id):
+                    get_persistent_condition_logger().resolve(
+                        logger, missing_key, "✅ ABS: Item '%s' is back in the library listing", abs_id
+                    )
                     visible.append(book)
+                elif abs_sees_all:
+                    get_persistent_condition_logger().warn(
+                        logger, missing_key,
+                        "⚠️ ABS: Skipping item '%s' for user_id=%s: not in the library listing", abs_id, user_id,
+                    )
                 else:
                     logger.debug(
                         "Skipping ABS item '%s' for user_id=%s: item is not accessible to this ABS token",
@@ -4740,6 +5230,14 @@ class SyncManager:
         return visible
 
     def _sync_cycle_internal(self, target_abs_id=None):
+        # One state-fetch pool per cycle, sized so each book still fetches all its clients at once.
+        state_fetch_pool = ThreadPoolExecutor(max_workers=max(1, len(self.sync_clients)))
+        try:
+            self._run_sync_cycle(target_abs_id, state_fetch_pool)
+        finally:
+            state_fetch_pool.shutdown()
+
+    def _run_sync_cycle(self, target_abs_id, state_fetch_pool: ThreadPoolExecutor) -> None:
         self._flush_reading_sessions()
         # Clear caches at start of cycle
         self._sync_cycle_ebook_cache.clear()
@@ -4815,11 +5313,15 @@ class SyncManager:
         # Optimization: Pre-fetch bulk data from all clients that support it
         # Only do this if we are in a full cycle (target_abs_id is None)
         bulk_states_per_client = {}
+        # Taken before the bulk reads: a book written after this point is re-read
+        # individually, since every cycle-start read is minutes old by its turn.
+        snapshot_seq = None if target_abs_id else self.database_service.progress_write_seq()
 
         if not target_abs_id:
             for client_name, client in self.sync_clients.items():
                 bulk_data = client.fetch_bulk_state()
-                if bulk_data:
+                # None = the read failed; any dict, even an empty one, is a successful read
+                if bulk_data is not None:
                     bulk_states_per_client[client_name] = bulk_data
                     logger.debug(f"📊 Pre-fetched bulk state for {client_name}")
 
@@ -4836,6 +5338,25 @@ class SyncManager:
 
         active_books = self._filter_books_for_current_user(active_books, bulk_states_per_client)
 
+        blocked_recovery_ids = set()
+        for candidate in self._ebook_input_recovery_candidates():
+            if not isinstance(candidate, dict):
+                continue
+            candidate_book = candidate.get("book")
+            if not candidate_book:
+                continue
+            stage = getattr(candidate.get("job"), "stage", None)
+            if (
+                str(getattr(candidate_book, "ebook_filename", "") or "").lower().endswith(".pdf")
+                or candidate.get("alignment_total_chars") == 0
+                or stage in {"ebook_input_recovery", "ebook_input_recovery_manual"}
+            ):
+                blocked_recovery_ids.add(candidate_book.abs_id)
+        if blocked_recovery_ids:
+            active_books = [book for book in active_books if book.abs_id not in blocked_recovery_ids]
+            if target_abs_id in blocked_recovery_ids:
+                logger.info("⏸️ Skipping sync for '%s' until ebook input recovery is resolved", target_abs_id)
+
         if not active_books:
             return
 
@@ -4843,12 +5364,33 @@ class SyncManager:
             logger.debug(f"🔄 Sync cycle starting - {len(active_books)} active book(s)")
             
             # Check for suggestions
-            if 'ABS' in bulk_states_per_client:
+            if bulk_states_per_client.get('ABS'):
                 self.check_for_suggestions(bulk_states_per_client['ABS'], active_books)
                 
         # Main sync loop - process each active book
         cycle_t0 = time.monotonic()
         book_durations = []
+
+        # Full cycles read every book's saved states and alignment rows once
+        # here; Instant Sync (one book) keeps the per-book reads.
+        states_by_book = alignment_snapshot = None
+        if not target_abs_id:
+            try:
+                states_by_book = {}
+                for state in self.database_service.get_all_states(
+                    user_id=self.database_service._resolve_uid(None),
+                    abs_ids=[b.abs_id for b in active_books],
+                ):
+                    states_by_book.setdefault(state.abs_id, []).append(state)
+                if self.alignment_service:
+                    alignment_snapshot = (
+                        self.database_service.get_aligned_book_ids(),
+                        self.database_service.get_latest_jobs(kind=JOB_KIND_ALIGNMENT),
+                    )
+            except Exception as e:
+                logger.warning("Cycle snapshot read failed, reading per book instead: %s", e, exc_info=True)
+                states_by_book = alignment_snapshot = None
+
         for book in active_books:
             book_t0 = time.monotonic()
             abs_id = book.abs_id
@@ -4860,12 +5402,25 @@ class SyncManager:
                 # MIGRATION UPGRADE
                 # -----------------------------------------------------------------
                 had_db_managed_alignment = getattr(book, 'transcript_file', None) == 'DB_MANAGED'
-                if self._promote_alignment_backed_book(book):
+                if self._promote_alignment_backed_book(book, alignment_snapshot):
                     if not had_db_managed_alignment and getattr(book, 'transcript_file', None) == 'DB_MANAGED':
                         logger.info(f"   🔄 Upgrading '{title_snip}' to DB_MANAGED unified architecture")
 
+                # A write since the snapshot (web route, KoSync PUT) makes both the saved states
+                # and the cycle-start "KoSync would 404" map stale for this book.
+                written_since_snapshot = (
+                    states_by_book is not None
+                    and self.database_service.progress_written_since(abs_id, snapshot_seq) is True
+                )
+                book_bulk_states = bulk_states_per_client
+                if written_since_snapshot:
+                    book_bulk_states = {k: v for k, v in bulk_states_per_client.items() if k != "KoSync"}
+
                 # Get previous state for this book from database
-                previous_states = self.database_service.get_states_for_book(abs_id)
+                if states_by_book is not None and not written_since_snapshot:
+                    previous_states = states_by_book.get(abs_id, [])
+                else:
+                    previous_states = self.database_service.get_states_for_book(abs_id)
 
                 # Create a mapping of client names to their previous states
                 prev_states_by_client = {}
@@ -4885,7 +5440,9 @@ class SyncManager:
                     logger.debug(f"'{abs_id}' '{title_snip}' Ebook-only mode - using clients: {list(active_clients.keys())}")
 
                 # Build config using active_clients - parallel fetch
-                config = self._fetch_states_parallel(book, prev_states_by_client, title_snip, bulk_states_per_client, active_clients)
+                config = self._fetch_states_parallel(
+                    book, prev_states_by_client, title_snip, book_bulk_states, active_clients, executor=state_fetch_pool
+                )
 
                 # Filtered config now only contains non-None states
                 if not config:
@@ -4902,29 +5459,37 @@ class SyncManager:
                         exc_info=True,
                     )
 
+                # A follower_only state (a service with no record of this book) carries a
+                # placeholder position: it receives writes but takes no part in change
+                # detection, trackers or leader selection.
+                decision_config = {k: v for k, v in config.items() if not v.follower_only}
+                if not decision_config:
+                    continue
+                init_followers_only = False
+
                 # StoryGraph and Hardcover are driven by an idle cooldown rather than the
                 # per-cycle dispatch. Evaluate them for every active book each cycle
                 # (including idle books that early-skip below) so the trailing-edge post
                 # can fire.
                 tracker_followup = bool(target_abs_id) or any(
                     self._state_percentage_delta(state) > 0
-                    for state in config.values()
+                    for state in decision_config.values()
                 )
                 self._handle_storygraph_cooldown(
-                    book, config, time.time(), schedule_followup=tracker_followup
+                    book, decision_config, time.time(), schedule_followup=tracker_followup
                 )
                 self._handle_hardcover_cooldown(
-                    book, config, time.time(), schedule_followup=tracker_followup
+                    book, decision_config, time.time(), schedule_followup=tracker_followup
                 )
 
                 # Check for ABS offline condition (only for audiobook mode)
                 # Check for ABS offline condition (only for audiobook mode)
                 if not (hasattr(book, 'sync_mode') and book.sync_mode == 'ebook_only'):
                     primary_audio_client = self._get_primary_audio_client_name(book)
-                    audio_state = config.get(primary_audio_client) if primary_audio_client else None
+                    audio_state = decision_config.get(primary_audio_client) if primary_audio_client else None
                     if audio_state is None:
                         # Fallback logic: If ABS is missing but we have ebook clients, try to sync them as ebook-only
-                        ebook_clients_active = [k for k in config.keys() if k != primary_audio_client]
+                        ebook_clients_active = [k for k in decision_config.keys() if k != primary_audio_client]
                         if ebook_clients_active:
                              logger.info(f"'{abs_id}' '{title_snip}' Primary audio source not found/offline, falling back to ebook-only sync between {ebook_clients_active}")
                         else:
@@ -4934,7 +5499,7 @@ class SyncManager:
 
 
                 # Check for sync delta threshold between clients
-                progress_values = [cfg.current.get('pct', 0) for cfg in config.values() if cfg.current.get('pct') is not None]
+                progress_values = [cfg.current.get('pct', 0) for cfg in decision_config.values() if cfg.current.get('pct') is not None]
                 significant_diff = False
 
                 if len(progress_values) >= 2:
@@ -4960,7 +5525,7 @@ class SyncManager:
                 char_delta_triggered = False  # Track if character delta triggered significance
                 page_delta_triggered = any(
                     self._has_fixed_page_delta(name, state, book)
-                    for name, state in config.items()
+                    for name, state in decision_config.items()
                 )
                 if page_delta_triggered:
                     significant_diff = True
@@ -4970,7 +5535,7 @@ class SyncManager:
                 fixed_page_book = is_cbz_book(book)
                 if (not significant_diff and hasattr(book, 'ebook_filename') and book.ebook_filename
                         and not fixed_page_book):
-                    for client_name_key, client_state in config.items():
+                    for client_name_key, client_state in decision_config.items():
                          percentage_delta = self._state_percentage_delta(client_state)
                          if percentage_delta > 0:
                              try:
@@ -4997,12 +5562,12 @@ class SyncManager:
                 # Check if all 'delta' fields in config are zero
                 # We typically skip if nothing changed, BUT if there is a significant discrepancy
                 # between clients (e.g. from a fresh push to DB), we must proceed to sync them.
-                deltas_zero = all(round(cfg.delta, 4) == 0 for cfg in config.values())
+                deltas_zero = all(round(cfg.delta, 4) == 0 for cfg in decision_config.values())
                 
                 # Check if any client has a significant delta (using time-based threshold)
                 any_significant_delta = any(
-                    self._has_significant_delta(k, config, book) 
-                    for k in config.keys()
+                    self._has_significant_delta(k, decision_config, book) 
+                    for k in decision_config.keys()
                 )
 
                 # If nothing changed AND clients are effectively in sync, skip
@@ -5013,9 +5578,12 @@ class SyncManager:
                     # delta, so gating this on movement would mean it only ever
                     # got a status the next time you happened to open it.
                     # only_if_absent makes this a one-time fill, not per-cycle work.
-                    self._maybe_mark_koreader_reading_from_config(book, config, abs_id, title_snip)
-                    logger.debug(f"'{abs_id}' '{title_snip}' No changes and clients in sync, skipping")
-                    continue
+                    self._maybe_mark_koreader_reading_from_config(book, decision_config, abs_id, title_snip)
+                    if not self._should_initialize_followers(config, abs_id, title_snip):
+                        logger.debug(f"'{abs_id}' '{title_snip}' No changes and clients in sync, skipping")
+                        continue
+                    init_followers_only = True
+                    logger.info(f"🔄 '{abs_id}' '{title_snip}' Clients in sync; filling follower(s) with no position: {[k for k in config if k not in decision_config]}")
                 
                 # If there's a discrepancy but no client actually changed, skip
                 # (discrepancy will resolve next time someone reads)
@@ -5031,7 +5599,7 @@ class SyncManager:
                 #   for a "new" read that will never look new.
                 new_client_in_config = any(
                     client_name.lower() not in prev_states_by_client
-                    for client_name in config.keys()
+                    for client_name in decision_config.keys()
                 )
                 is_instant_target = bool(target_abs_id)
                 if (significant_diff and not any_significant_delta and not char_delta_triggered and not page_delta_triggered
@@ -5047,7 +5615,7 @@ class SyncManager:
 
                 # Small changes (below thresholds) should be noisy-reduced
                 small_changes = []
-                for key, cfg in config.items():
+                for key, cfg in decision_config.items():
                     delta = cfg.delta
                     threshold = cfg.threshold
 
@@ -5060,7 +5628,7 @@ class SyncManager:
                         delta_str = cfg.value_seconds_formatter(delta) if cfg.value_seconds_formatter else cfg.value_formatter(delta)
                         small_changes.append(f"✋ [{abs_id}] [{title_snip}] {label} delta {delta_str} (Below threshold)")
 
-                if small_changes and not any(cfg.delta >= cfg.threshold for cfg in config.values()):
+                if small_changes and not any(cfg.delta >= cfg.threshold for cfg in decision_config.values()):
                     # If we have significant discrepancies between clients, we MUST NOT skip,
                     # even if individual deltas are small (e.g. from DB pre-update).
                     if significant_diff:
@@ -5077,7 +5645,7 @@ class SyncManager:
 
                 # Status block - show only changed lines
                 status_lines = []
-                for key, cfg in config.items():
+                for key, cfg in decision_config.items():
                     if cfg.delta > 0:
                         prev = cfg.previous_pct
                         curr = cfg.current.get('pct')
@@ -5088,7 +5656,7 @@ class SyncManager:
                     logger.info(line)
 
                 # Determine leader
-                leader, leader_pct = self._determine_leader(config, book, abs_id, title_snip)
+                leader, leader_pct = self._determine_leader(decision_config, book, abs_id, title_snip)
                 if not leader:
                     continue
 
@@ -5277,6 +5845,12 @@ class SyncManager:
                             # Driven by the idle-cooldown handlers, not the dispatch loop.
                             continue
                         client_state = config.get(client_name)
+                        is_follower = bool(client_state and client_state.follower_only)
+                        if init_followers_only and not is_follower:
+                            continue
+                        if is_follower:
+                            # Its state is a placeholder, not a prior read to reuse.
+                            client_state = None
                         if client_state and client_state.current.get('_readalong_mirror'):
                             # BookOrbit mirrors this format from the one we do write;
                             # writing it too would race its own derived position.
@@ -5328,6 +5902,7 @@ class SyncManager:
                             # audio still ahead, and the next cycle drags them
                             # forward again (issue #215 / #391).
                             allow_rewind=bool(leader_state.current.get("_approved_rewind")),
+                            fill_if_absent=is_follower,
                         )
                         result = client.update_progress(book, request)
                         results[client_name] = result
@@ -5335,6 +5910,10 @@ class SyncManager:
                     except Exception as e:
                         logger.warning(f"⚠️ Failed to update '{client_name}': {e}", exc_info=True)
                         results[client_name] = SyncResult(None, False)
+
+                if init_followers_only:
+                    self._finish_follower_init(book, results, abs_id, title_snip)
+                    continue
 
                 # A write that failed because the Audiobookshelf library item no
                 # longer exists means the mapping itself is stale (ABS re-ingested a

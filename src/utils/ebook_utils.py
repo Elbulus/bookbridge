@@ -39,6 +39,24 @@ logger = logging.getLogger(__name__)
 # Import epubcfi library for accurate CFI parsing
 import epubcfi
 
+# Comic archives: '.cbz' only, matching is_cbz_filename() in fixed_page_progress.
+# The other CBX containers (.cbr/.cbt/.cb7) are invisible outside the Grimmory
+# client, and the zipfile-based page counter cannot open RAR/7z/tar archives,
+# so a linked .cbr would be sent to the EPUB parser and fail to sync.
+COMIC_EBOOK_EXTENSIONS = frozenset({'.cbz'})
+LINKABLE_EBOOK_EXTENSIONS = frozenset({'.epub', *COMIC_EBOOK_EXTENSIONS})
+
+
+def is_linkable_ebook_filename(name: str | None) -> bool:
+    """True for filenames BookBridge can link (EPUB plus CBZ comics)."""
+    return str(name or '').strip().lower().endswith(tuple(LINKABLE_EBOOK_EXTENSIONS))
+
+
+def is_comic_ebook_filename(name: str | None) -> bool:
+    """True for comic archive filenames (currently CBZ only)."""
+    return str(name or '').strip().lower().endswith(tuple(COMIC_EBOOK_EXTENSIONS))
+
+
 # Names the bridge writes into the epub cache when it acquires an ebook for an
 # ABS item: ``<item_id>_direct.<ext>``, ``<item_id>_cwa.<ext>`` and
 # ``<item_id>_abs_search.<ext>`` (see LibraryService.acquire_ebook).
@@ -194,9 +212,12 @@ class EbookParser:
         with self._path_cache_lock:
             cached = self._path_cache.get(filename)
             if cached is not None:
-                if cached.exists():
-                    self._path_cache.move_to_end(filename)
-                    return cached
+                try:
+                    if cached.exists():
+                        self._path_cache.move_to_end(filename)
+                        return cached
+                except OSError as e:
+                    logger.debug("Could not check cached ebook path '%s': %s", cached, e)
                 # Stale entry (file moved/deleted) — drop and re-resolve.
                 self._path_cache.pop(filename, None)
 
@@ -207,11 +228,14 @@ class EbookParser:
         #    the library costs two full walks — over a minute on a network
         #    share, past the device-sync download stall timeout (#454).
         if is_managed_cache_filename(filename):
-            if self.epub_cache_dir.exists():
-                cached_path = safe_cache_path(self.epub_cache_dir, filename)
-                if cached_path and cached_path.exists():
-                    self._remember_resolved_path(filename, cached_path)
-                    return cached_path
+            try:
+                if self.epub_cache_dir.exists():
+                    cached_path = safe_cache_path(self.epub_cache_dir, filename)
+                    if cached_path and cached_path.exists():
+                        self._remember_resolved_path(filename, cached_path)
+                        return cached_path
+            except OSError as e:
+                logger.debug("Could not check managed ebook cache path for '%s': %s", filename, e)
 
         # 3. Recursive library scans (existing precedence: glob before rglob).
         safe_name = glob.escape(filename)
@@ -223,24 +247,31 @@ class EbookParser:
                     return result
             except StopIteration:
                 continue
+            except OSError as e:
+                logger.debug("Could not glob ebook directory '%s' for '%s': %s", d, filename, e)
+                continue
 
         for d in self.search_dirs():
             try:
                 if not d.exists():
                     continue
-            except OSError:
+                for f in d.rglob("*"):
+                    if f.name == filename:
+                        self._remember_resolved_path(filename, f)
+                        return f
+            except OSError as e:
+                logger.debug("Could not scan ebook directory '%s' for '%s': %s", d, filename, e)
                 continue
-            for f in d.rglob("*"):
-                if f.name == filename:
-                    self._remember_resolved_path(filename, f)
-                    return f
 
         # 4. Fall back to cache directory for ordinary filenames too.
-        if self.epub_cache_dir.exists():
-            cached_path = safe_cache_path(self.epub_cache_dir, filename)
-            if cached_path and cached_path.exists():
-                self._remember_resolved_path(filename, cached_path)
-                return cached_path
+        try:
+            if self.epub_cache_dir.exists():
+                cached_path = safe_cache_path(self.epub_cache_dir, filename)
+                if cached_path and cached_path.exists():
+                    self._remember_resolved_path(filename, cached_path)
+                    return cached_path
+        except OSError as e:
+            logger.debug("Could not check ebook cache path for '%s': %s", filename, e)
 
         raise FileNotFoundError(f"Could not locate {filename}")
 
@@ -1808,15 +1839,18 @@ class EbookParser:
             # Build KOReader-compatible strictly positional XPath using BS4 (Fallback)
             path_segments = []
             curr = target_tag
+            anchored = False
 
             while curr and curr.name != '[document]':
                 if curr.name == 'body':
                     path_segments.append("body")
                     break
                 
-                if curr.name in self.CRENGINE_FRAGILE_INLINE_TAGS:
+                # Fragile tags are skipped only below the anchor; above it they wrap blocks and CREngine keeps them.
+                if curr.name in self.CRENGINE_FRAGILE_INLINE_TAGS and not anchored:
                     curr = curr.parent
                     continue
+                anchored = True
                 
                 index = 1
                 sibling = curr.previous_sibling
@@ -1852,14 +1886,17 @@ class EbookParser:
         """Build XPath for an element, ensuring proper KOReader format."""
         parts = []
         current = element
+        anchored = False
 
         while current is not None and current.tag not in ['html', 'document']:
             tag_name = self._local_tag_name(current)
 
-            if tag_name in self.CRENGINE_FRAGILE_INLINE_TAGS:
+            # Fragile tags are skipped only below the anchor; above it they wrap blocks and CREngine keeps them.
+            if tag_name in self.CRENGINE_FRAGILE_INLINE_TAGS and not anchored:
                 current = current.getparent()
                 continue
-            
+            anchored = True
+
             # Get siblings of same tag to determine index
             parent = current.getparent()
             if parent is not None:
@@ -2023,19 +2060,25 @@ class EbookParser:
                 end = min(len(full_text), index + 600)
                 return strip_inline_joiner(full_text[start:end])
 
-            match = re.search(r'DocFragment\[(\d+)]', xpath_str)
+            match = re.search(r'DocFragment(?:\[(\d+)])?', xpath_str)
             if not match:
                 return None
-            spine_index = int(match.group(1))
 
             book_path = self.resolve_book_path(filename)
             full_text, spine_map = self.extract_text_and_map(book_path)
+            if match.group(1) is None:
+                if len(spine_map) != 1:
+                    return None
+                spine_index = spine_map[0]["spine_index"]
+                relative_path = xpath_str.split("DocFragment", 1)[-1]
+            else:
+                spine_index = int(match.group(1))
+                relative_path = xpath_str.split(f"DocFragment[{spine_index}]")[-1]
 
             # Parse path and offset. KOReader emits two forms for the trailing
             # character offset: "/text().NNN" (single text node) and
             # "/text()[N].MMM" (Nth text node when inline children split a
             # paragraph's text into multiple nodes). Both must be recognised.
-            relative_path = xpath_str.split(f"DocFragment[{spine_index}]")[-1]
             clean_xpath, target_offset = self._split_xpath_char_offset(relative_path)
 
             if clean_xpath.startswith('/'):
@@ -2145,15 +2188,21 @@ class EbookParser:
                     return None, 2
                 return first, 1
 
-            match = re.search(r'DocFragment\[(\d+)]', xpath_str)
+            match = re.search(r'DocFragment(?:\[(\d+)])?', xpath_str)
             if not match:
                 return None
-            spine_index = int(match.group(1))
 
             book_path = self.resolve_book_path(filename)
             full_text, spine_map = self.extract_text_and_map(book_path)
+            if match.group(1) is None:
+                if len(spine_map) != 1:
+                    return None
+                spine_index = spine_map[0]["spine_index"]
+                relative_path = xpath_str.split("DocFragment", 1)[-1]
+            else:
+                spine_index = int(match.group(1))
+                relative_path = xpath_str.split(f"DocFragment[{spine_index}]")[-1]
 
-            relative_path = xpath_str.split(f"DocFragment[{spine_index}]")[-1]
             clean_xpath, target_offset = self._split_xpath_char_offset(relative_path)
 
             if clean_xpath.startswith('/'):

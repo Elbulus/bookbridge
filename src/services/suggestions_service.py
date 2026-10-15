@@ -1,8 +1,10 @@
 import os
 import re
+import unicodedata
 from typing import Callable, List, Set, Any, Dict, Optional
 
 from src.services.llm_matching import craft_search_terms
+from src.utils.local_ebook_metadata import read_local_ebook_metadata
 
 # Provider preference for collapsing the same physical audiobook when more than one
 # provider indexes the same shared library tree (#383): lower index wins ties. A
@@ -54,6 +56,105 @@ class SuggestionsService:
     def _candidate_author(candidate: Any) -> str:
         return (getattr(candidate, 'authors', None) or '').strip()
 
+    @staticmethod
+    def _split_title_author_stem(stem: str) -> tuple:
+        """Split a Calibre "Title - Author" filename stem at its last separator.
+
+        The author is the final part because titles can contain " - " themselves
+        ("Asian Saga 1 - Shogun - James Clavell"). A stem without one is all title.
+        """
+        title, sep, author = stem.rpartition(" - ")
+        if sep and title.strip() and author.strip():
+            return title.strip(), author.strip()
+        return stem, ""
+
+    _PLACEHOLDER_TITLE_RE = re.compile(
+        r"^(untitled|unknown|unnamed|no title|title|book|document|new document|microsoft word\b.*|.*\.(docx?|pdf|txt|html?))$",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _title_author_hypotheses(cls, stem: str, meta_title: str, meta_authors: str) -> List[tuple]:
+        """Every plausible ``(title, authors)`` reading of a Local File candidate.
+
+        Embedded metadata (unless a placeholder), "Title - Author", "Author - Title" and
+        the whole stem as a bare title; scoring takes the best, so a wrong guess about the
+        filename convention can never score below the old whole-stem comparison.
+        """
+        hypotheses = []
+        if meta_title and not cls._PLACEHOLDER_TITLE_RE.match(meta_title.strip()):
+            hypotheses.append((meta_title, meta_authors))
+        title, author = cls._split_title_author_stem(stem)
+        if author:
+            hypotheses.append((title, author))
+            first, _, rest = stem.partition(" - ")
+            hypotheses.append((rest.strip(), first.strip()))
+        hypotheses.append((stem, ""))
+        return hypotheses
+
+    # Role credits and list separators in author strings such as
+    # "Roberto Bolaño, Natasha Wimmer - translator" or "Terry Pratchett & Neil Gaiman".
+    _AUTHOR_ROLE_RE = re.compile(
+        r"\s*(?:-\s*|\()\s*(translator|narrator|editor|illustrator|contributor|foreword|introduction)s?\)?\s*$",
+        re.IGNORECASE,
+    )
+    _AUTHOR_LIST_SPLIT_RE = re.compile(r"\s*(?:&|;|\band\b)\s*", re.IGNORECASE)
+
+    @classmethod
+    def _author_names(cls, text: str) -> List[str]:
+        """Parse an author credit string into individual names.
+
+        Splits on ``&``, ``;`` and "and"; commas separate full names ("Terry Pratchett,
+        Neil Gaiman") while single-word pairs are sort form ("King, Stephen" ->
+        "Stephen King"). Names carrying a role credit are dropped, except that an
+        editor stands in when no author is credited ("Gardner Dozois (Editor)" on an
+        anthology); a narrator, translator or illustrator never does.
+        """
+        text = unicodedata.normalize("NFC", text or "")
+        authors, editors = [], []
+        for credit in cls._AUTHOR_LIST_SPLIT_RE.split(text):
+            segments = []
+            for segment in credit.split(","):
+                match = cls._AUTHOR_ROLE_RE.search(segment)
+                clean = segment[:match.start()].strip() if match else segment.strip()
+                if clean:
+                    segments.append((clean, match.group(1).lower() if match else None))
+            i = 0
+            while i < len(segments):
+                name, role = segments[i]
+                if (len(name.split()) == 1 and i + 1 < len(segments)
+                        and len(segments[i + 1][0].split()) == 1):
+                    given, given_role = segments[i + 1]
+                    name, role, i = f"{given} {name}", role or given_role, i + 1
+                if role is None:
+                    authors.append(name)
+                elif role == "editor":
+                    editors.append(name)
+                i += 1
+        return authors or editors
+
+    @staticmethod
+    def _score_author_names(names: List[str], candidate_names: List[str]) -> float:
+        """Best fuzzy score between two pre-parsed author name lists."""
+        from rapidfuzz import fuzz, utils
+
+        if not names or not candidate_names:
+            return 0.0
+
+        def ratio(a, b):
+            return fuzz.token_sort_ratio(a, b, processor=utils.default_process)
+
+        best = ratio(" & ".join(names), " & ".join(candidate_names))
+        for name in names:
+            for candidate_name in candidate_names:
+                best = max(best, ratio(name, candidate_name))
+        return float(best)
+
+    @classmethod
+    def _author_score(cls, author: str, candidate_author: str) -> float:
+        """Best fuzzy score between complete authors, excluding non-author credits."""
+        return cls._score_author_names(cls._author_names(author), cls._author_names(candidate_author))
+
     def _build_ebook_candidate_pool(self) -> List[dict]:
         """
         Build searchable ebook candidates once per scan to avoid per-book provider calls.
@@ -79,6 +180,15 @@ class SuggestionsService:
             candidate_author = self._candidate_author(candidate)
             candidate_language = str(getattr(candidate, 'language', None) or '').strip()
             candidate_source = (getattr(candidate, 'source', None) or '').strip()
+            hypotheses = [(candidate_title, candidate_author)]
+            # The library scan builds Local File candidates from the filename alone.
+            if candidate_source == "Local File" and not candidate_author:
+                local_path = getattr(candidate, 'path', None)
+                meta_title, meta_authors = (
+                    read_local_ebook_metadata(local_path) if local_path else ("", "")
+                )
+                hypotheses = self._title_author_hypotheses(candidate_title, meta_title, meta_authors)
+                candidate_title, candidate_author = hypotheses[0]
             source_id = getattr(candidate, 'source_id', None) or getattr(candidate, 'booklore_id', None)
             raw_path = getattr(candidate, 'path', None)
             path = str(raw_path) if raw_path else None
@@ -93,6 +203,10 @@ class SuggestionsService:
             prepared.append({
                 "title": candidate_title,
                 "author": candidate_author,
+                "hypotheses": [
+                    (self._normalize_title_for_match(title), self._author_names(author))
+                    for title, author in hypotheses
+                ],
                 "language": candidate_language,
                 "source": candidate_source,
                 "source_id": source_id,
@@ -292,6 +406,7 @@ class SuggestionsService:
     # title alone survives even when the author string differs in format.
     _SUGGEST_FUZZY_FLOOR = 45.0
     _SUGGEST_TITLE_STRONG = 85.0
+    _SUBTITLE_STRIPPED_SCORE_CAP = 89.0
 
     # A same-folder pair is auto-trusted (exact 100, pinned ahead of and skipping the
     # Ollama judge) only when the titles ALSO loosely agree. Without this, a lone
@@ -306,7 +421,7 @@ class SuggestionsService:
         ('01. ', '02 '), trailing parentheticals ('(2024)', '(Unabridged)', '(readaloud)'),
         ', Book N' tails, and a reordered trailing article ('Title, The' -> 'The Title').
         Smart quotes/dashes are normalized to ASCII."""
-        s = (text or "").strip()
+        s = unicodedata.normalize("NFC", (text or "").strip())
         if not s:
             return ""
         for a, b in (("’", "'"), ("‘", "'"), ("“", '"'),
@@ -323,6 +438,21 @@ class SuggestionsService:
         if m:
             s = f"{m.group(2)} {m.group(1)}".strip()
         return s
+
+    @staticmethod
+    def _title_score(audio_title: str, audio_full_title: str, candidate_title: str) -> tuple[float, bool]:
+        from rapidfuzz import fuzz
+
+        score = float(fuzz.token_sort_ratio(audio_title, candidate_title))
+        if audio_full_title:
+            score = max(score, float(fuzz.token_sort_ratio(audio_full_title, candidate_title)))
+        if (":" in audio_title) != (":" in candidate_title):
+            stripped = float(fuzz.token_sort_ratio(
+                audio_title.split(":", 1)[0].strip(), candidate_title.split(":", 1)[0].strip()
+            ))
+            if stripped > score:
+                return stripped, True
+        return score, False
 
     @staticmethod
     def _match_from_pool(candidate_info: dict, score: float) -> dict:
@@ -530,8 +660,6 @@ class SuggestionsService:
 
     def _scan_single_audiobook(self, ab: dict, candidate_pool: List[dict]) -> Optional[dict]:
         """Scan one unmatched audiobook and return a suggestion dict or None."""
-        from rapidfuzz import fuzz
-
         audio_source_id = self._audio_source_id(ab)
         bridge_key = self._audio_bridge_key(ab)
         audio_title = self._audio_title(ab)
@@ -558,30 +686,44 @@ class SuggestionsService:
             return self._suggestion_shell(ab, [authoritative])
 
         norm_audio_title = self._normalize_title_for_match(audio_title)
+        subtitle = str(
+            ab.get("audio_subtitle")
+            or ((ab.get("media") or {}).get("metadata") or {}).get("subtitle")
+            or ""
+        ).strip()
+        norm_audio_full_title = self._normalize_title_for_match(f"{audio_title}: {subtitle}") if subtitle else ""
         matches = []
         audio_path = self._audio_path(ab)
+        audio_names = self._author_names(audio_author)
         same_folder_count = sum(
             1 for candidate_info in per_book_pool
             if self._paths_share_parent(audio_path, candidate_info.get("path"))
         )
         for candidate_info in per_book_pool:
-            candidate_author = candidate_info["author"]
-            norm_candidate_title = self._normalize_title_for_match(candidate_info["title"])
+            scored = [
+                (*self._title_score(norm_audio_title, norm_audio_full_title, norm_title), names)
+                for norm_title, names in candidate_info["hypotheses"]
+            ]
 
             if self._paths_share_parent(audio_path, candidate_info.get("path")):
-                title_score = float(fuzz.token_sort_ratio(norm_audio_title, norm_candidate_title))
+                title_score = max(t for t, _, _ in scored)
                 score, match_reason = self._same_folder_tier(same_folder_count, title_score)
                 match = self._match_from_pool(candidate_info, score)
                 match["match_reason"] = match_reason
                 matches.append(match)
                 continue
 
-            title_score = float(fuzz.token_sort_ratio(norm_audio_title, norm_candidate_title))
-            if audio_author:
-                author_score = float(fuzz.token_sort_ratio(audio_author, candidate_author)) if candidate_author else 0.0
-                score = (title_score * 0.7) + (author_score * 0.3)
-            else:
-                score = title_score
+            best = None
+            for title_score, subtitle_stripped, names in scored:
+                if audio_author:
+                    score = (title_score * 0.7) + (self._score_author_names(audio_names, names) * 0.3)
+                else:
+                    score = title_score
+                if subtitle_stripped:
+                    score = min(score, self._SUBTITLE_STRIPPED_SCORE_CAP)
+                if best is None or score > best[0]:
+                    best = (score, title_score, subtitle_stripped)
+            score, title_score, subtitle_stripped = best
 
             # Low floor on purpose; a strong title also survives a weak/format-mismatched
             # author. Embedding retrieval + the judge gate enforce precision downstream.
@@ -597,6 +739,8 @@ class SuggestionsService:
 
             match = self._match_from_pool(candidate_info, max(score, 0.0))
             match["_direct_match"] = direct_match
+            if subtitle_stripped:
+                match["match_reason"] = "subtitle_only"
             matches.append(match)
 
         if not matches:
@@ -981,6 +1125,9 @@ class SuggestionsService:
             cand_vec = embedded.get(ct)
             cos = cosine_similarity(audio_vec, cand_vec) if cand_vec else 0.0
             m["score"] = round(0.6 * m.get("score", 0) + 40.0 * cos, 1)
+            if m.get("match_reason") == "subtitle_only":
+                # Semantic similarity must not lift a subtitle-only match past the judge.
+                m["score"] = min(m["score"], self._SUBTITLE_STRIPPED_SCORE_CAP)
 
         reordered = rerank + rest
         reordered.sort(key=lambda m: m.get("score", 0), reverse=True)
@@ -1256,7 +1403,7 @@ class SuggestionsService:
 
             title_score = float(fuzz.token_sort_ratio(ebook_title, cand_title))
             if ebook_author:
-                author_score = float(fuzz.token_sort_ratio(ebook_author, cand_author)) if cand_author else 0.0
+                author_score = self._author_score(ebook_author, cand_author)
                 score = (title_score * 0.7) + (author_score * 0.3)
             else:
                 score = title_score

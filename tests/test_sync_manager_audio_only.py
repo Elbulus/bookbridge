@@ -60,3 +60,26 @@ def test_audio_only_cycle_uses_percentage_without_locating_epub(tmp_path):
     assert saved_state.abs_id == "audio-only-1"
     assert saved_state.client_name == "abs"
     assert saved_state.percentage == 0.5
+
+
+def test_cycle_keeps_every_successful_bulk_read_and_drops_failures(tmp_path):
+    """fetch_bulk_state: a dict (even empty) is a successful read for any client; None is a failed one."""
+    clients = {"ABS": MagicMock(), "Storyteller": MagicMock(), "BookFusion": MagicMock()}
+    clients["ABS"].fetch_bulk_state.return_value = {}
+    clients["Storyteller"].fetch_bulk_state.return_value = {}
+    clients["BookFusion"].fetch_bulk_state.return_value = None
+    manager = SyncManager(
+        abs_client=MagicMock(),
+        booklore_client=MagicMock(),
+        transcriber=MagicMock(),
+        ebook_parser=MagicMock(),
+        database_service=MagicMock(),
+        sync_clients=clients,
+        data_dir=tmp_path,
+        books_dir=tmp_path,
+    )
+    manager._filter_books_for_current_user = MagicMock(return_value=[])
+
+    manager._sync_cycle_internal()
+
+    assert manager._filter_books_for_current_user.call_args[0][1] == {"ABS": {}, "Storyteller": {}}
