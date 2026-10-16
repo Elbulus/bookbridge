@@ -99,6 +99,22 @@ jobs:
           fi
           base="$(git describe --tags --abbrev=0 --match 'v*' upstream/main 2>/dev/null || echo v0.0.0)"
           short="$(git rev-parse --short "$AFTER")"
+          # A build that failed after its merge was pushed is never retried by the
+          # "did upstream change" test above, so also build when deploy's current
+          # commit has no image yet. Only a definite 404 counts: a registry outage
+          # or a private package (401) leaves the decision as it was.
+          if [ "$build" = false ]; then
+            repo="${IMAGE#ghcr.io/}"
+            token="$(curl -fsS "https://ghcr.io/token?scope=repository:${repo}:pull" | jq -r '.token // empty' || true)"
+            status="$(curl -s -o /dev/null -w '%{http_code}' -I \
+              -H "Authorization: Bearer ${token}" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+              "https://ghcr.io/v2/${repo}/manifests/deploy-${short}" || true)"
+            if [ "$status" = 404 ]; then
+              echo "::notice::No image for deploy-${short} yet (an earlier build failed); building it."
+              build=true
+            fi
+          fi
           {
             echo "build=$build"
             echo "sha=$AFTER"
