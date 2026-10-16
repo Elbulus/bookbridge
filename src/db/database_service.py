@@ -3,12 +3,15 @@ Unified SQLAlchemy database service for abs-kosync-bridge.
 Direct model-based interface without dictionary conversions.
 """
 
+import hashlib
 import json
 import logging
+import math
 import os
 import re
 import threading
 import time
+import unicodedata
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -39,6 +42,7 @@ from .models import (
     ShelfWatchScan,
     EmbeddingCache,
     BookAlignment,
+    BookAlignmentBackup,
     User,
     UserCredential,
     UserBook,
@@ -57,6 +61,12 @@ logger = logging.getLogger(__name__)
 # Reading-session buffer delivery destinations, mapped to the status column each
 # one owns. A buffered session is delivered to these independently, so one being
 # unreachable never holds up or duplicates the other.
+_EBOOK_INPUT_RECOVERY_IDENTITY_FIELDS = (
+    "abs_id", "audio_source", "audio_source_id", "audio_duration", "duration",
+    "ebook_source", "ebook_source_id", "ebook_filename", "original_ebook_filename",
+    "kosync_doc_id", "sync_mode",
+)
+
 _READING_SESSION_DESTINATIONS = {
     "grimmory": "grimmory_status",
     "bookorbit": "bookorbit_status",
@@ -88,6 +98,14 @@ def _manifest_signature(book) -> tuple:
 # Use 500 to stay well under the cap with room for other query parameters.
 _SQL_IN_CHUNK = 500
 
+_PENDING_SHELF_ADDS_KEY = "BOOKLORE_SHELF_PENDING_ADDS"
+_SHELF_ASSIGNMENTS_KEY = "BOOKLORE_SHELF_ASSIGNMENTS"
+
+
+def _username_key(name: str) -> str:
+    """Unicode-correct comparison key for usernames (SQLite lower() folds ASCII only)."""
+    return unicodedata.normalize("NFC", unicodedata.normalize("NFC", (name or "").strip()).casefold())
+
 
 class DatabaseService:
     """
@@ -97,6 +115,12 @@ class DatabaseService:
     conversions for better type safety and cleaner code.
     """
 
+    # Process-local log of which books had sync-relevant progress written, so a
+    # sync cycle can tell its start-of-cycle snapshot went stale for a book.
+    _progress_lock = threading.Lock()
+    _progress_seq = 0
+    _progress_written_at: dict = {}
+
     def __init__(self, db_path: str):
         import os
         self.db_path = Path(os.path.abspath(db_path))
@@ -105,6 +129,7 @@ class DatabaseService:
         self._default_uid = None  # cached default (admin) user id for state scoping
         self._catalog_change_callbacks: list[Callable[[], None]] = []
         self._ebook_source_claim_lock = threading.Lock()
+        self._pending_shelf_adds_lock = threading.Lock()
 
         # Run Alembic migrations to ensure schema is up to date
         self._run_alembic_migrations()
@@ -214,12 +239,40 @@ class DatabaseService:
         try:
             yield session
             session.commit()
+            written = session.info.pop("progress_written", None)
+            if written:
+                self._note_progress_written(written)
         except Exception as e:
             session.rollback()
             logger.error(f"❌ Database error: {e}", exc_info=True)
             raise
         finally:
             session.close()
+
+    @classmethod
+    def _note_progress_written(cls, abs_ids) -> None:
+        """Record that these books' sync-relevant progress was just committed."""
+        with DatabaseService._progress_lock:
+            DatabaseService._progress_seq += 1
+            for abs_id in abs_ids:
+                DatabaseService._progress_written_at[abs_id] = DatabaseService._progress_seq
+
+    @classmethod
+    def progress_write_seq(cls) -> int:
+        """Current value of the process-wide progress-write counter."""
+        with DatabaseService._progress_lock:
+            return DatabaseService._progress_seq
+
+    @classmethod
+    def progress_written_since(cls, abs_id: str, seq: int) -> bool:
+        """True when a book's progress (State or linked KoSync device progress) was written after ``seq``."""
+        with DatabaseService._progress_lock:
+            return DatabaseService._progress_written_at.get(abs_id, 0) > seq
+
+    @staticmethod
+    def _mark_progress_written(session, *abs_ids) -> None:
+        """Queue books for the progress-write log; it is bumped once the session commits."""
+        session.info.setdefault("progress_written", set()).update(a for a in abs_ids if a)
 
     # Setting operations
     @staticmethod
@@ -298,6 +351,72 @@ class DatabaseService:
                 return True
             return False
 
+    def get_pending_shelf_adds(self) -> list[tuple[str, Optional[int]]]:
+        """Grimmory shelf adds deferred until alignment, as (abs_id, user_id) pairs.
+
+        ``user_id`` is the reader whose login and shelf the add belongs to; None
+        is the global login.
+        """
+        return [
+            (abs_id, user_id)
+            for abs_id, user_id in self.get_json_setting(_PENDING_SHELF_ADDS_KEY, default=[])
+        ]
+
+    def add_pending_shelf_add(self, abs_id: str, user_id: Optional[int]) -> None:
+        """Defer a book's Grimmory shelf add for ``user_id`` until it is aligned."""
+        with self._pending_shelf_adds_lock:
+            pending = self.get_pending_shelf_adds()
+            if (abs_id, user_id) not in pending:
+                self.set_json_setting(_PENDING_SHELF_ADDS_KEY, pending + [(abs_id, user_id)])
+
+    def remove_pending_shelf_adds(
+        self, abs_id: str, user_id: Optional[int] = None, all_users: bool = False
+    ) -> None:
+        """Forget a book's deferred Grimmory shelf add for one user, or for every user."""
+        with self._pending_shelf_adds_lock:
+            pending = self.get_pending_shelf_adds()
+            kept = [
+                entry for entry in pending
+                if entry[0] != abs_id or not (all_users or entry[1] == user_id)
+            ]
+            if len(kept) != len(pending):
+                self.set_json_setting(_PENDING_SHELF_ADDS_KEY, kept)
+
+    def get_shelf_assignments(self, abs_id: Optional[str] = None) -> list[dict]:
+        """Return recorded successful Grimmory shelf targets."""
+        assignments = self.get_json_setting(_SHELF_ASSIGNMENTS_KEY, default=[])
+        if not isinstance(assignments, list):
+            return []
+        valid = [entry for entry in assignments if isinstance(entry, dict)
+                 and isinstance(entry.get("abs_id"), str)
+                 and isinstance(entry.get("shelf_name"), str)
+                 and (entry.get("reader_id") is None or isinstance(entry.get("reader_id"), int))
+                 and (entry.get("target_user_id") is None or isinstance(entry.get("target_user_id"), int))]
+        return [entry for entry in valid if abs_id is None or entry["abs_id"] == abs_id]
+
+    def record_shelf_assignment(
+        self, abs_id: str, reader_id: Optional[int], target_user_id: Optional[int],
+        shelf_name: str, source_id: Optional[str] = None,
+    ) -> None:
+        """Remember where a deferred Grimmory shelf add actually succeeded."""
+        entry = {
+            "abs_id": abs_id, "reader_id": reader_id,
+            "target_user_id": target_user_id, "shelf_name": shelf_name,
+            "source_id": source_id,
+        }
+        with self._pending_shelf_adds_lock:
+            assignments = self.get_shelf_assignments()
+            if entry not in assignments:
+                self.set_json_setting(_SHELF_ASSIGNMENTS_KEY, assignments + [entry])
+
+    def remove_shelf_assignments(self, abs_id: str) -> None:
+        """Forget recorded Grimmory targets after mapping cleanup succeeds."""
+        with self._pending_shelf_adds_lock:
+            assignments = self.get_shelf_assignments()
+            kept = [entry for entry in assignments if entry["abs_id"] != abs_id]
+            if len(kept) != len(assignments):
+                self.set_json_setting(_SHELF_ASSIGNMENTS_KEY, kept)
+
     # ------------------------------------------------------------------
     # Users (multi-user)
     # ------------------------------------------------------------------
@@ -308,14 +427,22 @@ class DatabaseService:
                 session.expunge(user)
             return user
 
+    @staticmethod
+    def _find_user_by_name(session, username: str, exclude_id: Optional[int] = None) -> Optional[User]:
+        """Match a username by NFC + casefold; the users table is tiny so this runs in Python."""
+        key = _username_key(username)
+        if not key:
+            return None
+        for user in session.query(User).order_by(User.id):
+            if user.id != exclude_id and _username_key(user.username) == key:
+                return user
+        return None
+
     def get_user_by_username(self, username: str) -> Optional[User]:
         if not username:
             return None
-        from sqlalchemy import func
         with self.get_session() as session:
-            user = session.query(User).filter(
-                func.lower(User.username) == username.strip().lower()
-            ).first()
+            user = self._find_user_by_name(session, username)
             if user:
                 session.expunge(user)
             return user
@@ -335,28 +462,30 @@ class DatabaseService:
                     active: int = 1) -> User:
         """Create a user with an optional plaintext password (hashed here).
 
-        Enforces case-insensitive username uniqueness. Every lookup (login,
-        KoSync auth, rename) compares via ``func.lower()``, but the DB unique
-        index is case-sensitive, so 'Admin' and 'admin' could otherwise coexist
-        and make those lookups resolve ambiguously. Raises ValueError on a clash.
+        Enforces Unicode case-insensitive username uniqueness (the DB unique
+        index is case-sensitive). The duplicate check and insert share one
+        BEGIN IMMEDIATE transaction so concurrent creators cannot both win.
+        Raises ValueError on a clash.
         """
+        from sqlalchemy import text
         from werkzeug.security import generate_password_hash
-        from sqlalchemy import func
         username = (username or "").strip()
         password_hash = generate_password_hash(password) if password else None
+        clash = False
         with self.get_session() as session:
-            existing = session.query(User).filter(
-                func.lower(User.username) == username.lower()
-            ).first()
-            if existing is not None:
-                raise ValueError(f"Username '{username}' already exists")
-            user = User(username=username, password_hash=password_hash,
-                        role=role, active=active)
-            session.add(user)
-            session.flush()
-            session.refresh(user)
-            session.expunge(user)
-            return user
+            session.execute(text("BEGIN IMMEDIATE"))
+            if self._find_user_by_name(session, username) is not None:
+                clash = True
+            else:
+                user = User(username=username, password_hash=password_hash,
+                            role=role, active=active)
+                session.add(user)
+                session.flush()
+                session.refresh(user)
+                session.expunge(user)
+        if clash:
+            raise ValueError(f"Username '{username}' already exists")
+        return user
 
     def set_user_password(self, user_id: int, password: str) -> bool:
         from werkzeug.security import generate_password_hash
@@ -367,43 +496,60 @@ class DatabaseService:
             user.password_hash = generate_password_hash(password) if password else None
             return True
 
-    def set_user_active(self, user_id: int, active: bool) -> bool:
-        with self.get_session() as session:
-            user = session.query(User).filter(User.id == user_id).first()
-            if not user:
-                return False
-            user.active = 1 if active else 0
-            return True
+    def update_user_account(self, user_id: int, *, password: Optional[str] = None,
+                            role: Optional[str] = None, active: Optional[bool] = None) -> Optional[User]:
+        """Update account fields atomically while retaining the primary and last admin."""
+        from sqlalchemy import text
+        from werkzeug.security import generate_password_hash
 
-    def set_user_role(self, user_id: int, role: str) -> bool:
-        """Set a user's role to 'admin' or 'user'. Returns False if not found."""
-        normalized = (role or "").strip().lower()
-        if normalized not in ('admin', 'user'):
-            raise ValueError(f"Invalid role: {role}")
+        if role is not None:
+            role = role.strip().lower()
+            if role not in ('admin', 'user'):
+                raise ValueError(f"Invalid role: {role}")
+        policy_error = None
         with self.get_session() as session:
+            # Reserve the SQLite writer before reading policy state across processes.
+            session.execute(text("BEGIN IMMEDIATE"))
             user = session.query(User).filter(User.id == user_id).first()
             if not user:
-                return False
-            user.role = normalized
-            # A role change can move which account is the primary admin, and the
-            # default-user id is cached for the process lifetime, so recompute it
-            # on next access — same reason delete_user clears it.
+                return None
+            role_changed = role is not None and role != user.role
+            if role_changed and role == 'user':
+                primary = session.query(User).filter(User.role == 'admin').order_by(User.id).first()
+                if primary and primary.id == user_id:
+                    policy_error = "Can't demote the primary admin — the global service settings belong to that account"
+            if role_changed and role == 'admin':
+                primary = session.query(User).filter(User.role == 'admin').order_by(User.id).first()
+                if primary and user_id < primary.id:
+                    policy_error = "Can't promote this account to admin — it would become the primary admin and take over the global service settings"
+            if not policy_error and user.role == 'admin' and user.active and (role == 'user' or active is False):
+                if session.query(User).filter(User.role == 'admin', User.active == 1).count() <= 1:
+                    policy_error = "Can't demote the last active admin" if role == 'user' else "Can't disable the last active admin"
+            if not policy_error:
+                if password is not None:
+                    user.password_hash = generate_password_hash(password) if password else None
+                if role is not None:
+                    user.role = role
+                if active is not None:
+                    user.active = int(active)
+                session.flush()
+            session.expunge(user)
+        if policy_error:
+            raise ValueError(policy_error)
+        if role_changed:
             self._default_uid = None
-            return True
+        return user
 
     def set_username(self, user_id: int, new_username: str) -> tuple:
         """Rename a user. Returns (ok, error_message). Enforces uniqueness
-        (case-insensitive) and a non-empty name."""
-        from sqlalchemy import func
+        (Unicode case-insensitive) and a non-empty name."""
+        from sqlalchemy import text
         new_username = (new_username or "").strip()
         if not new_username:
             return False, "Username cannot be empty"
         with self.get_session() as session:
-            clash = session.query(User).filter(
-                func.lower(User.username) == new_username.lower(),
-                User.id != user_id,
-            ).first()
-            if clash:
+            session.execute(text("BEGIN IMMEDIATE"))
+            if self._find_user_by_name(session, new_username, exclude_id=user_id) is not None:
                 return False, "That username is already taken"
             user = session.query(User).filter(User.id == user_id).first()
             if not user:
@@ -412,16 +558,44 @@ class DatabaseService:
             return True, None
 
     def delete_user(self, user_id: int) -> bool:
+        """Delete scoped user data while retaining shared catalog, the primary admin and an active admin."""
+        from sqlalchemy import text
+
         with self.get_session() as session:
+            session.execute(text("BEGIN IMMEDIATE"))
             user = session.query(User).filter(User.id == user_id).first()
             if not user:
                 return False
-            session.delete(user)
-            # The default-user id (owner of un-scoped state) is cached for the
-            # process lifetime; deleting a user — especially the original admin —
-            # can make it stale, so recompute it on next access.
-            self._default_uid = None
-            return True
+            primary = session.query(User).filter(User.role == 'admin').order_by(User.id).first()
+            blocked = None
+            if primary and primary.id == user_id:
+                blocked = "Can't delete the primary admin — the global service settings belong to that account"
+            elif user.role == 'admin' and user.active and session.query(User).filter(
+                User.role == 'admin', User.active == 1
+            ).count() <= 1:
+                blocked = "Can't delete the last active admin"
+            if not blocked:
+                # SQLite may not enforce foreign keys; remove scoped data explicitly.
+                annotation_ids = session.query(KoreaderAnnotation.id).filter(KoreaderAnnotation.user_id == user_id)
+                session.query(KoreaderAnnotationDeviceState).filter(
+                    KoreaderAnnotationDeviceState.annotation_id.in_(annotation_ids)
+                ).delete(synchronize_session=False)
+                # Shared catalog rows keep the retired id: ids are never reissued,
+                # while NULL would hand them to the default admin.
+                shared = (Book.__tablename__, KosyncDocument.__tablename__)
+                for table in reversed(Base.metadata.sorted_tables):
+                    if 'user_id' in table.c and table.name not in shared:
+                        session.execute(table.delete().where(table.c.user_id == user_id))
+                session.query(KosyncDocument).filter(KosyncDocument.user_id == user_id).update({
+                    KosyncDocument.percentage: 0, KosyncDocument.progress: None,
+                    KosyncDocument.timestamp: None, KosyncDocument.device: None,
+                    KosyncDocument.device_id: None,
+                }, synchronize_session=False)
+                session.delete(user)
+        if blocked:
+            raise ValueError(blocked)
+        self._default_uid = None
+        return True
 
     def touch_user_login(self, user_id: int) -> None:
         with self.get_session() as session:
@@ -456,29 +630,91 @@ class DatabaseService:
             ).all()
             return {c.key: self._read_value(c.key, c.value) for c in creds}
 
-    def set_user_credential(self, user_id: int, key: str, value: str) -> UserCredential:
-        """Store a per-user credential. Secret keys are encrypted at rest; the
-        returned (detached) row carries the plaintext the caller passed in."""
-        plain = str(value) if value is not None else None
-        value_str = self._store_value(key, value)
+    _READEST_IDENTITY_KEYS = ('READEST_EMAIL', 'READEST_PASSWORD')
+    _READEST_TOKEN_KEYS = ('READEST_ACCESS_TOKEN', 'READEST_REFRESH_TOKEN', 'READEST_TOKEN_EXPIRES_AT')
+
+    def _write_user_credentials(self, user_id: int, values: dict,
+                                expected: Optional[dict] = None) -> bool:
+        """The one credential writer: atomic, and a no-op once the account is gone.
+
+        ``expected`` makes the write a compare-and-set: it is dropped unless every
+        listed key currently holds the given value (missing counts as ''). A change
+        of Readest identity clears that account's cached tokens in the same
+        transaction. Returns False when nothing was written.
+        """
+        from sqlalchemy import exists, literal, select, text
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        updates = dict(values)
+        written = 0
         with self.get_session() as session:
-            existing = session.query(UserCredential).filter(
+            if expected is not None or any(key in updates for key in self._READEST_IDENTITY_KEYS):
+                # Reads that decide the write: hold the writer lock from read to write.
+                session.execute(text("BEGIN IMMEDIATE"))
+                watched = set(self._READEST_IDENTITY_KEYS) | set(expected or {})
+                current = {
+                    row.key: self._read_value(row.key, row.value)
+                    for row in session.query(UserCredential).filter(
+                        UserCredential.user_id == user_id, UserCredential.key.in_(watched)
+                    )
+                }
+                if expected is not None and any(
+                    (current.get(key) or '').strip() != (want or '').strip() for key, want in expected.items()
+                ):
+                    logger.info("🔐 Dropped credential write for user %s: identity changed meanwhile", user_id)
+                    return False
+                if any(updates[key] != current.get(key) for key in self._READEST_IDENTITY_KEYS if key in updates):
+                    updates.update({key: '' for key in self._READEST_TOKEN_KEYS})
+            for key, value in updates.items():
+                stored = self._store_value(key, value)
+                # One statement that writes only while the account exists: atomic against a
+                # concurrent delete_user without serializing every credential writer.
+                row = select(literal(user_id), literal(key), literal(stored)).where(
+                    exists().where(User.id == user_id)
+                )
+                written += session.execute(
+                    sqlite_insert(UserCredential).from_select(['user_id', 'key', 'value'], row)
+                    .on_conflict_do_update(
+                        index_elements=[UserCredential.user_id, UserCredential.key],
+                        set_={"value": stored},
+                    )
+                ).rowcount
+        if updates and not written:
+            # An in-flight token refresh must not outlive its deleted account.
+            logger.info("🔐 Ignored credential write for missing user %s", user_id)
+            return False
+        return True
+
+    def set_user_credential(self, user_id: int, key: str, value: str) -> Optional[UserCredential]:
+        """Store a per-user credential. Secret keys are encrypted at rest; the
+        returned (detached) row carries the plaintext the caller passed in.
+        Returns None when the account no longer exists."""
+        plain = str(value) if value is not None else None
+        if not self._write_user_credentials(user_id, {key: value}):
+            return None
+        with self.get_session() as session:
+            cred = session.query(UserCredential).filter(
                 UserCredential.user_id == user_id, UserCredential.key == key
             ).first()
-            if existing:
-                existing.value = value_str
-                session.flush()
-                session.refresh(existing)
-                session.expunge(existing)
-                existing.value = plain
-                return existing
-            cred = UserCredential(user_id=user_id, key=key, value=value_str)
-            session.add(cred)
-            session.flush()
-            session.refresh(cred)
+            if cred is None:
+                return None
             session.expunge(cred)
             cred.value = plain
             return cred
+
+    def set_user_credentials(self, user_id: int, values: dict[str, str]) -> bool:
+        """Save related credentials atomically, encrypting secret values at rest.
+
+        Returns False (writing nothing) when the account no longer exists."""
+        return self._write_user_credentials(user_id, values)
+
+    def persist_readest_tokens(self, user_id: int, tokens: dict[str, str],
+                               email: str, password: str) -> bool:
+        """Store refreshed Readest tokens only if the account's Readest identity is
+        still the one that obtained them; otherwise drop them."""
+        return self._write_user_credentials(
+            user_id, tokens, expected={'READEST_EMAIL': email, 'READEST_PASSWORD': password}
+        )
 
     def encrypt_plaintext_secrets(self) -> int:
         """Wrap any secret still sitting in plaintext, in both credential stores.
@@ -682,6 +918,11 @@ class DatabaseService:
             if row is None:
                 return None
             return row[0] or ""
+
+    def get_aligned_book_ids(self) -> set[str]:
+        """Every book with a stored alignment map: ``has_alignment`` for all books in one query."""
+        with self.get_session() as session:
+            return {row[0] for row in session.query(BookAlignment.abs_id).all()}
 
     def get_ctc_aligned_book_ids(self) -> set[str]:
         """Return CTC-aligned book IDs in one query without loading map blobs."""
@@ -1013,6 +1254,7 @@ class DatabaseService:
     def save_book(self, book: Book) -> Book:
         """Save or update a book model."""
         from sqlalchemy.exc import IntegrityError
+        from src.utils.config_loader import env_truthy
 
         with self.get_session() as session:
             existing = session.query(Book).filter(Book.abs_id == book.abs_id).first()
@@ -1038,6 +1280,22 @@ class DatabaseService:
                     ).first()
                     if not exists:
                         session.add(UserBook(user_id=creator_uid, abs_id=book.abs_id))
+                if existing is None and env_truthy('SHARE_ALL_BOOKS_WITH_ALL_USERS'):
+                    user_ids = {
+                        row[0] for row in session.query(User.id).filter(User.active == 1).all()
+                    }
+                    claimed = {
+                        row[0] for row in
+                        session.query(UserBook.user_id).filter(UserBook.abs_id == book.abs_id).all()
+                    }
+                    missing = user_ids - claimed
+                    for user_id in missing:
+                        session.add(UserBook(user_id=user_id, abs_id=book.abs_id))
+                    if missing:
+                        logger.info(
+                            "🔗 Shared new book '%s' with %d additional user(s) (share-all-books enabled)",
+                            book.abs_id, len(missing),
+                        )
 
             if existing:
                 # Update existing book
@@ -1170,8 +1428,10 @@ class DatabaseService:
             try:
                 # Migrate Foreign Keys
                 # synchronize_session=False is required for updates on collections
+                self._mark_progress_written(session, old_abs_id, new_abs_id)
                 session.query(State).filter(State.abs_id == old_abs_id).update({State.abs_id: new_abs_id}, synchronize_session=False)
                 session.query(Job).filter(Job.abs_id == old_abs_id).update({Job.abs_id: new_abs_id}, synchronize_session=False)
+                session.query(ReadingSession).filter(ReadingSession.abs_id == old_abs_id).update({ReadingSession.abs_id: new_abs_id}, synchronize_session=False)
                 session.query(KosyncDocument).filter(KosyncDocument.linked_abs_id == old_abs_id).update({KosyncDocument.linked_abs_id: new_abs_id}, synchronize_session=False)
                 # Carry per-user claims across, deduping against any link the user
                 # already has on the new id (the (user_id, abs_id) pair is unique).
@@ -1228,6 +1488,23 @@ class DatabaseService:
             ).first()
             return row[0] if row else None
 
+    def find_duplicate_mapping(self, keep_book) -> Optional[str]:
+        """The abs_id that absorb_duplicate_mapping would fold into ``keep_book``, or None.
+
+        Read-only, so a caller can check it may touch that mapping before saving
+        anything.
+        """
+        keep_abs_id = getattr(keep_book, "abs_id", None)
+        if not keep_abs_id:
+            return None
+        doc_id = str(getattr(keep_book, "kosync_doc_id", None) or "").strip()
+        if doc_id:
+            candidate = self.get_book_by_kosync_id(doc_id)
+            candidate_id = getattr(candidate, "abs_id", None)
+            if candidate_id and candidate_id != keep_abs_id:
+                return candidate_id
+        return self._find_ebook_only_duplicate(keep_book)
+
     def absorb_duplicate_mapping(self, keep_book) -> Optional[str]:
         """Fold a stale mapping for the same ebook into ``keep_book``.
 
@@ -1246,16 +1523,7 @@ class DatabaseService:
         if not keep_abs_id:
             return None
 
-        stale_abs_id = None
-        doc_id = str(getattr(keep_book, "kosync_doc_id", None) or "").strip()
-        if doc_id:
-            candidate = self.get_book_by_kosync_id(doc_id)
-            candidate_id = getattr(candidate, "abs_id", None)
-            if candidate_id and candidate_id != keep_abs_id:
-                stale_abs_id = candidate_id
-
-        if stale_abs_id is None:
-            stale_abs_id = self._find_ebook_only_duplicate(keep_book)
+        stale_abs_id = self.find_duplicate_mapping(keep_book)
 
         if not stale_abs_id:
             # Logged so that "ran and found nothing" is distinguishable from
@@ -1294,7 +1562,7 @@ class DatabaseService:
             
             book = session.query(Book).filter(Book.abs_id == abs_id).first()
             if book:
-                session.delete(book)  # Cascade will handle states and jobs
+                session.delete(book)  # Cascade handles states and jobs; reading sessions are kept as history
                 deleted = True
             else:
                 deleted = False
@@ -1339,6 +1607,352 @@ class DatabaseService:
                 session.expunge(book)
             return books
 
+    @staticmethod
+    def ebook_input_recovery_identity(book: Book | dict) -> str:
+        """Hash the stable audio/ebook pairing fields for recovery CAS checks."""
+        values = {
+            field: book[field] if isinstance(book, dict) else getattr(book, field, None)
+            for field in _EBOOK_INPUT_RECOVERY_IDENTITY_FIELDS
+        }
+        canonical = json.dumps(
+            values, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def get_ebook_input_recovery_candidates(self) -> list[dict]:
+        """Return only CWA audiobook mappings with cheap evidence of bad EPUB input."""
+        from sqlalchemy import func, or_, select
+        from sqlalchemy.orm import aliased
+
+        candidates = []
+        with self.get_session() as session:
+            latest_job = aliased(Job)
+            staged_job = aliased(Job)
+            latest_job_id = select(latest_job.id).where(
+                latest_job.abs_id == Book.abs_id,
+                latest_job.kind == "alignment",
+            ).order_by(latest_job.last_attempt.desc()).limit(1).correlate(Book).scalar_subquery()
+            recovery_stage = session.query(staged_job.id).filter(
+                staged_job.id == latest_job_id,
+                staged_job.stage.in_(("ebook_input_recovery", "ebook_input_recovery_manual")),
+            ).exists()
+            rows = (
+                session.query(
+                    Book, BookAlignment.last_updated, BookAlignment.total_chars
+                )
+                .outerjoin(BookAlignment, BookAlignment.abs_id == Book.abs_id)
+                .filter(
+                    func.lower(Book.ebook_source) == "cwa",
+                    Book.sync_mode == "audiobook",
+                    Book.status.in_(("active", "failed_retry_later", "failed_permanent")),
+                    or_(
+                        Book.ebook_filename.ilike("%.pdf"),
+                        Book.status.in_(("failed_retry_later", "failed_permanent")),
+                        BookAlignment.total_chars == 0,
+                        recovery_stage,
+                    ),
+                )
+                .all()
+            )
+            for book, alignment_last_updated, alignment_total_chars in rows:
+                job = (
+                    session.query(Job)
+                    .filter(Job.abs_id == book.abs_id, Job.kind == "alignment")
+                    .order_by(Job.last_attempt.desc())
+                    .first()
+                )
+                session.expunge(book)
+                if job:
+                    session.expunge(job)
+                candidates.append({
+                    "book": book,
+                    "job": job,
+                    "alignment_last_updated": alignment_last_updated,
+                    "alignment_total_chars": alignment_total_chars,
+                })
+        return candidates
+
+    def get_ebook_input_recovery_alignment(
+        self, abs_id: str
+    ) -> tuple[Optional[list], Optional[datetime], Optional[int]]:
+        """Read one fresh recovery map version and its metadata from the database."""
+        with self.get_session() as session:
+            row = session.query(
+                BookAlignment.alignment_map_json,
+                BookAlignment.last_updated,
+                BookAlignment.total_chars,
+            ).filter(BookAlignment.abs_id == abs_id).first()
+            if not row:
+                return None, None, None
+            try:
+                alignment = json.loads(row.alignment_map_json or "[]")
+            except (TypeError, ValueError):
+                alignment = None
+            return alignment, row.last_updated, row.total_chars
+
+    def repair_ebook_input_recovery(
+        self,
+        abs_id: str,
+        expected_book: Book,
+        expected_job: Optional[Job],
+        expected_alignment_last_updated: Optional[datetime],
+        new_ebook_filename: str,
+        new_kosync_doc_id: str,
+        bad_kosync_doc_id: Optional[str] = None,
+    ) -> bool:
+        """Atomically queue recovery if its inspected book, job, map and links still match."""
+        if not abs_id or not new_ebook_filename or not new_kosync_doc_id:
+            return False
+
+        with self.get_session() as session:
+            changed = self._commit_ebook_input_recovery_state(
+                session, abs_id, expected_book, expected_job,
+                expected_alignment_last_updated,
+                {"ebook_filename": new_ebook_filename,
+                 "kosync_doc_id": new_kosync_doc_id, "status": "pending"},
+                stage="ebook_input_recovery", last_error=None,
+                new_kosync_doc_id=new_kosync_doc_id,
+                bad_kosync_doc_id=bad_kosync_doc_id,
+                recovery_identity=self.ebook_input_recovery_identity({
+                    **{field: getattr(expected_book, field, None)
+                       for field in _EBOOK_INPUT_RECOVERY_IDENTITY_FIELDS},
+                    "ebook_filename": new_ebook_filename,
+                    "kosync_doc_id": new_kosync_doc_id,
+                }),
+            )
+        if changed:
+            self._notify_catalog_change()
+        return changed
+
+    def flag_ebook_input_recovery_manual(
+        self,
+        abs_id: str,
+        expected_book: Book,
+        expected_job: Optional[Job],
+        expected_alignment_last_updated: Optional[datetime],
+        reason: str,
+    ) -> bool:
+        """Flag an unproven damaged input for manual review and block active sync."""
+        if not abs_id:
+            return False
+        with self.get_session() as session:
+            changed = self._commit_ebook_input_recovery_state(
+                session, abs_id, expected_book, expected_job,
+                expected_alignment_last_updated, {"status": "failed_permanent"},
+                stage="ebook_input_recovery_manual", last_error=str(reason)[:1000],
+            )
+        if changed:
+            self._notify_catalog_change()
+        return changed
+
+    def complete_ebook_input_recovery(
+        self,
+        abs_id: str,
+        expected_book: Book,
+        expected_alignment_last_updated: Optional[datetime],
+        *,
+        expected_job: Optional[Job] = None,
+        alignment_map: Optional[list] = None,
+        alignment_method: Optional[str] = None,
+        total_chars: Optional[int] = None,
+        segments_json: Optional[str] = None,
+        quality_score: Optional[float] = None,
+        quality_detail: Optional[str] = None,
+    ) -> bool:
+        """Commit the proven map and activate its repaired book in one transaction."""
+        if (
+            not abs_id or getattr(expected_book, "abs_id", None) != abs_id
+            or expected_job is None or expected_job.stage != "ebook_input_recovery"
+            or not expected_job.recovery_identity
+            or expected_job.recovery_identity != self.ebook_input_recovery_identity(expected_book)
+            or not isinstance(alignment_map, list)
+            or isinstance(total_chars, bool) or not isinstance(total_chars, int) or total_chars <= 0
+            or (segments_json is not None and not isinstance(segments_json, str))
+        ):
+            return False
+        try:
+            if len(alignment_map) < 2:
+                return False
+            chars = []
+            for point in alignment_map:
+                if not isinstance(point, dict):
+                    return False
+                char = point.get("global_char", point.get("char"))
+                timestamp = point.get("ts")
+                if (
+                    isinstance(char, bool) or not isinstance(char, (int, float))
+                    or not math.isfinite(char) or char < 0 or char > total_chars
+                    or isinstance(timestamp, bool) or not isinstance(timestamp, (int, float))
+                    or not math.isfinite(timestamp) or timestamp < 0
+                ):
+                    return False
+                chars.append(char)
+            if any(b < a for a, b in zip(chars, chars[1:])) or max(chars) <= min(chars):
+                return False
+            if quality_score is not None and (
+                isinstance(quality_score, bool) or not isinstance(quality_score, (int, float))
+                or not math.isfinite(quality_score)
+            ):
+                return False
+            alignment_map_json = json.dumps(
+                alignment_map, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+            )
+        except (TypeError, ValueError):
+            return False
+
+        with self.get_session() as session:
+            alignment_row = session.query(BookAlignment).filter_by(abs_id=abs_id).first()
+            if alignment_row is None:
+                if expected_alignment_last_updated is not None:
+                    return False
+            elif (expected_alignment_last_updated is None
+                    or alignment_row.last_updated != expected_alignment_last_updated):
+                return False
+            if not self._commit_ebook_input_recovery_state(
+                session, abs_id, expected_book, expected_job,
+                expected_alignment_last_updated,
+                {"status": "active", "transcript_file": "DB_MANAGED"},
+                stage=None, last_error=None,
+                new_kosync_doc_id=expected_book.kosync_doc_id,
+            ):
+                return False
+
+            if alignment_row is None:
+                alignment_row = BookAlignment(abs_id=abs_id, alignment_map_json=alignment_map_json)
+                session.add(alignment_row)
+            elif not session.query(BookAlignmentBackup).filter_by(abs_id=abs_id).first():
+                session.add(BookAlignmentBackup(
+                    abs_id=abs_id,
+                    alignment_map_json=alignment_row.alignment_map_json,
+                    align_method=alignment_row.align_method,
+                    total_chars=alignment_row.total_chars,
+                    segments_json=alignment_row.segments_json,
+                ))
+            alignment_row.alignment_map_json = alignment_map_json
+            alignment_row.align_method = alignment_method
+            alignment_row.total_chars = total_chars
+            alignment_row.segments_json = segments_json
+            alignment_row.quality_score = quality_score
+            alignment_row.quality_detail = quality_detail
+            alignment_row.last_updated = utcnow()
+            session.query(Job).filter(Job.id == expected_job.id).update(
+                {
+                    Job.retry_count: 0, Job.last_error: None, Job.progress: 1.0,
+                    Job.stage: None, Job.recovery_identity: None,
+                },
+                synchronize_session=False,
+            )
+        self._notify_catalog_change()
+        return True
+
+    def _commit_ebook_input_recovery_state(
+        self,
+        session,
+        abs_id: str,
+        expected_book: Book,
+        expected_job: Optional[Job],
+        expected_alignment_last_updated: Optional[datetime],
+        book_updates: dict,
+        stage: str,
+        last_error: Optional[str],
+        new_kosync_doc_id: Optional[str] = None,
+        bad_kosync_doc_id: Optional[str] = None,
+        recovery_identity: Optional[str] = None,
+    ) -> bool:
+        """Commit a recovery state only while every inspected row still matches."""
+        from sqlalchemy import not_
+
+        latest_job_id = (
+            session.query(Job.id)
+            .filter(Job.abs_id == abs_id, Job.kind == "alignment")
+            .order_by(Job.last_attempt.desc())
+            .limit(1)
+            .scalar_subquery()
+        )
+        if expected_job is None:
+            job_unchanged = not_(
+                session.query(Job.id)
+                .filter(Job.abs_id == abs_id, Job.kind == "alignment")
+                .exists()
+            )
+        else:
+            job_unchanged = session.query(Job.id).filter(
+                Job.id == latest_job_id,
+                Job.id == expected_job.id,
+                Job.last_attempt == expected_job.last_attempt,
+                Job.retry_count == expected_job.retry_count,
+                Job.progress == expected_job.progress,
+                Job.last_error == expected_job.last_error,
+                Job.stage == expected_job.stage,
+                Job.recovery_identity == expected_job.recovery_identity,
+            ).exists()
+        if expected_alignment_last_updated is None:
+            alignment_unchanged = not_(
+                session.query(BookAlignment.abs_id)
+                .filter(BookAlignment.abs_id == abs_id)
+                .exists()
+            )
+        else:
+            alignment_unchanged = session.query(BookAlignment.abs_id).filter(
+                BookAlignment.abs_id == abs_id,
+                BookAlignment.last_updated == expected_alignment_last_updated,
+            ).exists()
+
+        filters = [Book.abs_id == abs_id, job_unchanged, alignment_unchanged]
+        for field in (
+            "status", "audio_source", "audio_source_id", "audio_duration",
+            "duration", "ebook_source", "ebook_source_id", "ebook_filename",
+            "original_ebook_filename", "kosync_doc_id", "sync_mode",
+        ):
+            value = getattr(expected_book, field)
+            column = getattr(Book, field)
+            filters.append(column.is_(None) if value is None else column == value)
+        if new_kosync_doc_id:
+            filters.append(not_(session.query(KosyncDocument.document_hash).filter(
+                KosyncDocument.document_hash == new_kosync_doc_id,
+                KosyncDocument.linked_abs_id.isnot(None),
+                KosyncDocument.linked_abs_id != abs_id,
+            ).exists()))
+
+        values = dict(book_updates)
+        if not values:
+            values["status"] = expected_book.status
+        updated = session.query(Book).filter(*filters).update(values, synchronize_session=False)
+        if updated != 1:
+            return False
+
+        if new_kosync_doc_id:
+            session.query(KosyncDocument).filter(
+                KosyncDocument.document_hash == new_kosync_doc_id,
+                KosyncDocument.linked_abs_id.is_(None),
+            ).update({KosyncDocument.linked_abs_id: abs_id}, synchronize_session=False)
+        if bad_kosync_doc_id and bad_kosync_doc_id != new_kosync_doc_id:
+            session.query(KosyncDocument).filter(
+                KosyncDocument.document_hash == bad_kosync_doc_id,
+                KosyncDocument.linked_abs_id == abs_id,
+            ).update({KosyncDocument.linked_abs_id: None}, synchronize_session=False)
+
+        if expected_job:
+            job_values = {
+                Job.last_attempt: time.time(), Job.last_error: last_error,
+                Job.progress: 0.0 if new_kosync_doc_id else expected_job.progress,
+                Job.stage: stage,
+            }
+            if recovery_identity is not None:
+                job_values[Job.recovery_identity] = recovery_identity
+            if new_kosync_doc_id:
+                job_values[Job.retry_count] = 0
+            session.query(Job).filter(Job.id == expected_job.id).update(
+                job_values, synchronize_session=False,
+            )
+        else:
+            session.add(Job(
+                abs_id=abs_id, last_attempt=time.time(), retry_count=0,
+                last_error=last_error, progress=0.0, kind="alignment", stage=stage,
+                recovery_identity=recovery_identity,
+            ))
+        return True
+
     # ---- per-user book membership (shared catalog, per-user visibility) ----
     def link_user_book(self, user_id: int, abs_id: str) -> None:
         """Claim a book for a user (idempotent). A book can be linked to many users."""
@@ -1350,6 +1964,8 @@ class DatabaseService:
             ).first()
             if not exists:
                 session.add(UserBook(user_id=user_id, abs_id=abs_id))
+        if not exists:
+            self._notify_catalog_change()
 
     def link_book_to_all_active_users(self, abs_id: str) -> int:
         """Claim one book for every active user. Returns links created.
@@ -1371,13 +1987,15 @@ class DatabaseService:
             missing = user_ids - claimed
             for user_id in missing:
                 session.add(UserBook(user_id=user_id, abs_id=abs_id))
-            return len(missing)
+        if missing:
+            self._notify_catalog_change()
+        return len(missing)
 
     def backfill_user_books_for_user(self, user_id: int) -> int:
         """Claim every catalog book for one user. Returns links created.
 
-        Used when a new account is created while share-all-books is on, so they
-        start with the same library everyone else already sees.
+        Used when an account is created or re-enabled while share-all-books is on,
+        so they start with the same library everyone else already sees.
         """
         if user_id is None:
             return 0
@@ -1390,7 +2008,9 @@ class DatabaseService:
             missing = all_ids - claimed
             for abs_id in missing:
                 session.add(UserBook(user_id=user_id, abs_id=abs_id))
-            return len(missing)
+        if missing:
+            self._notify_catalog_change()
+        return len(missing)
 
     def share_all_books_with_active_users(self) -> dict:
         """Claim every catalog book for every active user. Returns {"users": <count>, "links": <count>}.
@@ -1425,16 +2045,21 @@ class DatabaseService:
                     session.add(UserBook(user_id=user_id, abs_id=abs_id))
                     links_created += 1
 
-            return {"users": len(active_user_ids), "links": links_created}
+        if links_created:
+            self._notify_catalog_change()
+        return {"users": len(active_user_ids), "links": links_created}
 
     def unlink_user_book(self, user_id: int, abs_id: str) -> int:
         """Remove a user's claim on a book. Returns rows deleted."""
         if user_id is None or not abs_id:
             return 0
         with self.get_session() as session:
-            return session.query(UserBook).filter(
+            deleted = session.query(UserBook).filter(
                 UserBook.user_id == user_id, UserBook.abs_id == abs_id
             ).delete(synchronize_session=False)
+        if deleted:
+            self._notify_catalog_change()
+        return deleted
 
     def is_user_linked(self, user_id: int, abs_id: str) -> bool:
         """True if the user has claimed this book."""
@@ -1873,19 +2498,26 @@ class DatabaseService:
                 session.expunge(state)
             return states
 
-    def get_all_states(self, user_id: int = None) -> List[State]:
+    def get_all_states(self, user_id: int = None, abs_ids=None) -> List[State]:
         """Get all states. When user_id is given, scope to that user; otherwise
-        return every row (dashboard, until per-user scoping in the UI)."""
+        return every row (dashboard, until per-user scoping in the UI).
+        ``abs_ids`` restricts the read to those books."""
         if user_id is None:
             logger.debug(
                 "get_all_states called with user_id=None — returning unfiltered "
                 "bulk data. Future callers should pass an explicit user_id."
             )
+        wanted = None if abs_ids is None else list(abs_ids)
         with self.get_session() as session:
             query = session.query(State)
             if user_id is not None:
                 query = query.filter(State.user_id == user_id)
-            states = query.all()
+            if wanted is None:
+                states = query.all()
+            else:
+                states = []
+                for i in range(0, len(wanted), 500):  # stay under SQLite's variable limit
+                    states.extend(query.filter(State.abs_id.in_(wanted[i:i + 500])).all())
             for state in states:
                 session.expunge(state)
             return states
@@ -1900,6 +2532,7 @@ class DatabaseService:
                 State.client_name == state.client_name,
                 State.user_id == state.user_id,
             ).first()
+            self._mark_progress_written(session, state.abs_id)
 
             if existing:
                 # Update existing state
@@ -1922,6 +2555,7 @@ class DatabaseService:
     def delete_states_for_book(self, abs_id: str, user_id: int = None) -> int:
         """Delete states for a book. Scoped to a user when user_id is given."""
         with self.get_session() as session:
+            self._mark_progress_written(session, abs_id)
             query = session.query(State).filter(State.abs_id == abs_id)
             if user_id is not None:
                 query = query.filter(State.user_id == user_id)
@@ -1948,6 +2582,26 @@ class DatabaseService:
             if job:
                 session.expunge(job)
             return job
+
+    def get_latest_jobs(self, kind: Optional[str] = None) -> dict:
+        """``get_latest_job`` for all books in one query: abs_id -> latest job."""
+        from sqlalchemy import func
+        with self.get_session() as session:
+            newest = session.query(Job.abs_id, func.max(Job.last_attempt).label("newest"))
+            if kind is not None:
+                newest = newest.filter(Job.kind == kind)
+            newest = newest.group_by(Job.abs_id).subquery()
+            query = session.query(Job).join(
+                newest, (Job.abs_id == newest.c.abs_id) & Job.last_attempt.is_(newest.c.newest)
+            )
+            if kind is not None:
+                query = query.filter(Job.kind == kind)
+            latest = {}
+            for job in query.all():
+                if job.abs_id not in latest:
+                    session.expunge(job)
+                    latest[job.abs_id] = job
+            return latest
 
     def get_jobs_for_book(self, abs_id: str) -> List[Job]:
         """Get all jobs for a book."""
@@ -2213,6 +2867,7 @@ class DatabaseService:
         now = utcnow()
         doc.last_updated = now
         with self.get_session() as session:
+            self._mark_progress_written(session, doc.linked_abs_id)
             stmt = sqlite_insert(KosyncDocument).values(
                 document_hash=doc.document_hash,
                 progress=doc.progress,
@@ -2228,6 +2883,7 @@ class DatabaseService:
                 source=doc.source,
                 booklore_id=doc.booklore_id,
                 mtime=doc.mtime,
+                hash_method=doc.hash_method,
             )
             excluded = stmt.excluded
             session.execute(stmt.on_conflict_do_update(
@@ -2245,6 +2901,7 @@ class DatabaseService:
                     "source": excluded.source,
                     "booklore_id": excluded.booklore_id,
                     "mtime": excluded.mtime,
+                    "hash_method": excluded.hash_method,
                 },
             ))
             saved = session.get(KosyncDocument, doc.document_hash)
@@ -2347,6 +3004,77 @@ class DatabaseService:
                 return True
             return False
 
+    def get_linked_kosync_documents_without_progress(self, user_id: Optional[int] = None) -> dict[str, str]:
+        """Map accessible linked hashes to books whose built-in GET would answer 404.
+
+        Mirrors ``_respond_from_book_states``. A book answers 200 when the user has
+        a State whose served position is not a locator-less non-zero one (the GET
+        suppresses that as a page-0 reset), or when a usable device row (percentage
+        > 0 with a locator) is at least as far as that State. Per-user rows are the
+        device rows; the legacy shared document rows count only when the user has no
+        per-user rows at all, and only when unowned or owned by this user. With no
+        authenticated user every user's rows conservatively count.
+        """
+        from sqlalchemy import func, or_
+
+        def usable(model):
+            return (model.percentage > 0, func.trim(func.coalesce(model.progress, "")) != "")
+
+        with self.get_session() as session:
+            states = session.query(
+                State.abs_id, State.client_name, State.percentage, State.xpath, State.cfi, State.last_updated
+            )
+            user_rows = session.query(KosyncDocument.linked_abs_id, KosyncUserProgress.percentage).join(
+                KosyncUserProgress, KosyncUserProgress.document_hash == KosyncDocument.document_hash
+            ).filter(KosyncDocument.linked_abs_id.isnot(None))
+            legacy = session.query(KosyncDocument.linked_abs_id, KosyncDocument.percentage).filter(
+                KosyncDocument.linked_abs_id.isnot(None), *usable(KosyncDocument)
+            )
+            docs = session.query(KosyncDocument.document_hash, KosyncDocument.linked_abs_id).filter(
+                KosyncDocument.linked_abs_id.isnot(None)
+            )
+            if user_id is not None:
+                states = states.filter(State.user_id == user_id)
+                user_rows = user_rows.filter(KosyncUserProgress.user_id == user_id)
+                legacy = legacy.filter(or_(KosyncDocument.user_id.is_(None), KosyncDocument.user_id == user_id))
+                docs = docs.filter(KosyncDocument.linked_abs_id.in_(
+                    session.query(UserBook.abs_id).filter(UserBook.user_id == user_id)
+                ))
+            has_rows = {abs_id for abs_id, _ in user_rows.all()}
+            good_rows = user_rows.filter(*usable(KosyncUserProgress)).all()
+            best_row: dict[str, float] = {}
+            for abs_id, pct in good_rows + [r for r in legacy.all() if r[0] not in has_rows]:
+                best_row[abs_id] = max(best_row.get(abs_id, 0.0), float(pct))
+
+            chosen: dict = {}
+            for row in states.all():
+                current = chosen.get(row.abs_id)
+                is_kosync = str(row.client_name).lower() == "kosync"
+                if current is None or (is_kosync and not current[0]) or (
+                    is_kosync == current[0] and (row.last_updated or 0) > (current[1].last_updated or 0)
+                ):
+                    chosen[row.abs_id] = (is_kosync, row)
+
+            def answers_200(abs_id: str) -> bool:
+                row_pct = best_row.get(abs_id)
+                if abs_id not in chosen:
+                    return row_pct is not None
+                state = chosen[abs_id][1]
+                state_pct = float(state.percentage or 0)
+                if state_pct > 0 and not str(state.xpath or state.cfi or "").strip():
+                    return row_pct is not None and row_pct >= state_pct - 0.0001
+                return True
+
+            return {h: a for h, a in docs.all() if not answers_200(a)}
+
+    def kosync_document_has_other_user_progress(self, document_hash: str, user_id: int) -> bool:
+        """True when a user other than ``user_id`` has per-user progress on this hash."""
+        with self.get_session() as session:
+            return session.query(KosyncUserProgress.document_hash).filter(
+                KosyncUserProgress.document_hash == document_hash,
+                KosyncUserProgress.user_id != user_id,
+            ).first() is not None
+
     def get_kosync_document_by_linked_book(self, abs_id: str) -> Optional[KosyncDocument]:
         """Get a KOSync document linked to a specific ABS book."""
         with self.get_session() as session:
@@ -2396,15 +3124,82 @@ class DatabaseService:
                 session.expunge(book)
             return book
 
-    def get_kosync_doc_by_filename(self, filename: str) -> Optional[KosyncDocument]:
-        """Find a KOSync document by its associated filename."""
+    def get_kosync_doc_by_filename(self, filename: str, hash_method: Optional[str] = None) -> Optional[KosyncDocument]:
+        """Find a KOSync document by its associated filename.
+
+        ``hash_method`` restricts the lookup to rows cached with that
+        KOSYNC_HASH_METHOD; rows of the other method are invisible to it.
+        """
+        with self.get_session() as session:
+            query = session.query(KosyncDocument).filter(KosyncDocument.filename == filename)
+            if hash_method is not None:
+                query = query.filter(KosyncDocument.hash_method == hash_method)
+            doc = query.first()
+            if doc:
+                session.expunge(doc)
+            return doc
+
+    def get_linked_kosync_sibling_by_filename(self, filename: str, exclude_hash: str) -> Optional[KosyncDocument]:
+        """Find a book-linked KOSync document with this filename other than ``exclude_hash``."""
         with self.get_session() as session:
             doc = session.query(KosyncDocument).filter(
-                KosyncDocument.filename == filename
+                KosyncDocument.filename == filename,
+                KosyncDocument.linked_abs_id.isnot(None),
+                KosyncDocument.document_hash != exclude_hash,
             ).first()
             if doc:
                 session.expunge(doc)
             return doc
+
+    def upsert_kosync_hash_metadata(self, document_hash: str, filename: str, source: str,
+                                    mtime: Optional[float] = None, booklore_id: Optional[str] = None,
+                                    hash_method: Optional[str] = None) -> Optional[KosyncDocument]:
+        """Insert or update ONLY the hash-cache columns of a KOSync document.
+
+        Progress, device, link and owner columns are never touched, so a cache
+        write cannot overwrite them with a stale snapshot or stamp an owner.
+        """
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        if not document_hash:
+            return None
+        now = utcnow()
+        values = {"filename": filename, "source": source}
+        for column, value in (("mtime", mtime), ("hash_method", hash_method),
+                              ("booklore_id", None if booklore_id is None else str(booklore_id))):
+            if value is not None:
+                values[column] = value
+        with self.get_session() as session:
+            stmt = sqlite_insert(KosyncDocument).values(
+                document_hash=document_hash, percentage=0, first_seen=now, last_updated=now, **values,
+            )
+            session.execute(stmt.on_conflict_do_update(index_elements=["document_hash"], set_=values))
+            saved = session.get(KosyncDocument, document_hash)
+            session.expunge(saved)
+            return saved
+
+    def clear_kosync_hash_metadata(self, document_hash: str, filename: Optional[str] = None,
+                                   booklore_id: Optional[str] = None,
+                                   hash_method: Optional[str] = None) -> bool:
+        """Drop cached lookup metadata from a row, keeping progress and link data.
+
+        Only a row cached with ``hash_method`` is touched, so a row belonging to
+        the other hash method (devices may still use it) keeps its metadata.
+        """
+        with self.get_session() as session:
+            doc = session.query(KosyncDocument).filter(
+                KosyncDocument.document_hash == document_hash
+            ).first()
+            if not doc or (hash_method is not None and doc.hash_method != hash_method):
+                return False
+            changed = False
+            if filename is not None and doc.filename == filename:
+                doc.filename = doc.mtime = doc.source = doc.hash_method = None
+                changed = True
+            if booklore_id is not None and str(doc.booklore_id) == str(booklore_id):
+                doc.booklore_id = doc.source = None
+                changed = True
+            return changed
 
     def get_kosync_doc_by_booklore_id(self, booklore_id: str) -> Optional[KosyncDocument]:
         """Find a KOSync document by its Grimmory ID."""
@@ -2449,6 +3244,7 @@ class DatabaseService:
         if uid is None or not document_hash:
             return None
         with self.get_session() as session:
+            self._mark_hash_progress_written(session, document_hash)
             row = session.query(KosyncUserProgress).filter(
                 KosyncUserProgress.document_hash == document_hash,
                 KosyncUserProgress.user_id == uid,
@@ -2475,6 +3271,13 @@ class DatabaseService:
             session.refresh(row)
             session.expunge(row)
             return row
+
+    def _mark_hash_progress_written(self, session, document_hash: str) -> None:
+        """Mark every book a KoSync document hash is linked to (or is the doc id of) as written."""
+        linked = [r[0] for r in session.query(KosyncDocument.linked_abs_id).filter(
+            KosyncDocument.document_hash == document_hash).all()]
+        owners = [r[0] for r in session.query(Book.abs_id).filter(Book.kosync_doc_id == document_hash).all()]
+        self._mark_progress_written(session, *linked, *owners)
 
     def get_user_kosync_progress_for_book(self, abs_id: str, user_id: int = None) -> List[KosyncUserProgress]:
         """Return this user's progress rows across every hash linked to ``abs_id``.
@@ -2610,6 +3413,7 @@ class DatabaseService:
             return 0, 0
 
         with self.get_session() as session:
+            self._mark_progress_written(session, abs_id)
             hashes = {
                 row[0]
                 for row in session.query(KosyncDocument.document_hash)
@@ -2649,6 +3453,7 @@ class DatabaseService:
 
         now = utcnow()
         with self.get_session() as session:
+            self._mark_progress_written(session, abs_id)
             hashes = {
                 row[0]
                 for row in session.query(KosyncDocument.document_hash)
@@ -2886,25 +3691,37 @@ class DatabaseService:
 
     def save_booklore_book(self, booklore_book: BookloreBook) -> BookloreBook:
         """Save or update a Grimmory book."""
+        from sqlalchemy import insert, select, update
+
         with self.get_session() as session:
-            existing = session.query(BookloreBook).filter(
+            existing_id = select(BookloreBook.id).where(
+                BookloreBook.filename == booklore_book.filename
+            ).limit(1).scalar_subquery()
+            updated = session.execute(
+                update(BookloreBook).where(BookloreBook.id == existing_id).values(
+                    title=booklore_book.title,
+                    authors=booklore_book.authors,
+                    raw_metadata=booklore_book.raw_metadata,
+                    last_updated=utcnow(),
+                )
+            )
+            if updated.rowcount == 0:
+                values = {
+                    "filename": booklore_book.filename,
+                    "title": booklore_book.title,
+                    "authors": booklore_book.authors,
+                    "raw_metadata": booklore_book.raw_metadata,
+                    "last_updated": booklore_book.last_updated or utcnow(),
+                }
+                if booklore_book.id is not None:
+                    values["id"] = booklore_book.id
+                session.execute(insert(BookloreBook).values(**values))
+
+            saved = session.query(BookloreBook).filter(
                 BookloreBook.filename == booklore_book.filename
             ).first()
-
-            if existing:
-                for attr in ['title', 'authors', 'raw_metadata']:
-                    if hasattr(booklore_book, attr):
-                        setattr(existing, attr, getattr(booklore_book, attr))
-                session.flush()
-                session.refresh(existing)
-                session.expunge(existing)
-                return existing
-            else:
-                session.add(booklore_book)
-                session.flush()
-                session.refresh(booklore_book)
-                session.expunge(booklore_book)
-                return booklore_book
+            session.expunge(saved)
+            return saved
 
     def delete_booklore_book(self, filename: str) -> bool:
         """Delete a Grimmory book from the cache table."""
@@ -5066,6 +5883,7 @@ class DatabaseService:
     @staticmethod
     def _close_reading_session(session, row: ReadingSessionBuffer, now: float) -> None:
         """Close the buffer and insert local history in the same transaction."""
+        from sqlalchemy import func
         from src.services.reading_session_aggregator import MAX_SESSION_SECONDS
 
         duration = int(min(row.accumulated_seconds,
@@ -5075,12 +5893,15 @@ class DatabaseService:
             row.grimmory_status = "disabled"
             row.bookorbit_status = "disabled"
             return
+        book_title = session.query(
+            func.coalesce(func.nullif(Book.abs_title, ''), func.nullif(Book.audio_title, ''))
+        ).filter(Book.abs_id == row.abs_id).scalar()
         session.add(ReadingSession(
             abs_id=row.abs_id, session_type=row.session_type,
             start_time=row.last_event_at - duration, end_time=row.last_event_at,
             duration_seconds=duration, start_progress=row.start_progress,
             end_progress=row.end_progress, leader_client=row.leader_client,
-            user_id=row.user_id or None,
+            user_id=row.user_id or None, book_title=book_title,
         ))
         logger.info("Reading session closed: user=%s book='%s' type=%s estimated_seconds=%s",
                     row.user_id, row.abs_id, row.session_type, duration)
@@ -5278,6 +6099,8 @@ class DatabaseService:
         Callers must pre-compute duration_seconds (exact telemetry or heuristic).
         This method only persists and applies a safety cap.
         """
+        from sqlalchemy import func
+
         try:
             if duration_seconds <= 0:
                 return
@@ -5285,6 +6108,10 @@ class DatabaseService:
             duration_seconds = min(duration_seconds, 14400)
             uid = self._resolve_uid(user_id)
 
+            with self.get_session() as db_session:
+                book_title = db_session.query(
+                    func.coalesce(func.nullif(Book.abs_title, ''), func.nullif(Book.audio_title, ''))
+                ).filter(Book.abs_id == abs_id).scalar()
             session = ReadingSession(
                 abs_id=abs_id,
                 session_type=session_type,
@@ -5295,6 +6122,7 @@ class DatabaseService:
                 end_progress=end_progress,
                 leader_client=leader_client,
                 user_id=uid,
+                book_title=book_title,
             )
             with self.get_session() as db_session:
                 db_session.add(session)
@@ -5318,6 +6146,7 @@ class DatabaseService:
                 func.count(ReadingSession.id).label('session_count'),
                 func.coalesce(func.sum(ReadingSession.duration_seconds), 0).label('total_duration'),
                 func.max(ReadingSession.end_time).label('last_session_time'),
+                ReadingSession.book_title.label('book_title'),
             ).filter(ReadingSession.abs_id == abs_id)
             uid = self._resolve_uid(user_id)
             if uid is not None:
@@ -5333,6 +6162,7 @@ class DatabaseService:
                 'session_count': int(row.session_count),
                 'avg_session_seconds': int(row.total_duration) // int(row.session_count),
                 'last_session_time': row.last_session_time,
+                'book_title': row.book_title,
             }
 
     def get_all_reading_stats(self, user_id: int = None) -> dict:
@@ -5360,6 +6190,7 @@ class DatabaseService:
                 # This gives us the latest leader per book with no extra query. Do not
                 # "clean this up" into a plain column; it is load-bearing.
                 ReadingSession.leader_client.label('last_leader'),
+                ReadingSession.book_title.label('book_title'),
             )
             uid = self._resolve_uid(user_id)
             if uid is not None:
@@ -5377,8 +6208,43 @@ class DatabaseService:
                     'avg_session_seconds': int(row.total_duration) // int(row.session_count),
                     'last_session_time': row.last_session_time,
                     'last_leader': row.last_leader,
+                    'book_title': row.book_title,
                 }
             return result
+
+    def get_listening_days(self, tz_name: str) -> dict[str, int]:
+        """Seconds of the ambient user's AUDIOBOOK sessions per local date (YYYY-MM-DD)."""
+        uid = self._resolve_uid(None)
+        with self.get_session() as session:
+            rows = session.query(ReadingSession.start_time, ReadingSession.duration_seconds).filter(
+                ReadingSession.session_type == 'AUDIOBOOK', ReadingSession.user_id == uid,
+            ).all()
+        days: dict[str, int] = defaultdict(int)
+        for start_time, duration in rows:
+            days[self._local_date_from_epoch(start_time, tz_name)] += int(max(duration or 0, 0))
+        return dict(days)
+
+    def get_recent_listening_sessions(self, limit: int = 10) -> list[dict]:
+        """Newest-first AUDIOBOOK sessions of the ambient user, in the stats-page session shape."""
+        uid = self._resolve_uid(None)
+        with self.get_session() as session:
+            rows = session.query(ReadingSession, Book.abs_title, Book.audio_title).outerjoin(
+                Book, Book.abs_id == ReadingSession.abs_id,
+            ).filter(
+                ReadingSession.session_type == 'AUDIOBOOK', ReadingSession.user_id == uid,
+            ).order_by(ReadingSession.end_time.desc()).limit(limit).all()
+            return [{
+                "id": f"local-{rs.id}",
+                "activityType": "listening",
+                "absId": rs.abs_id,
+                "title": abs_title or audio_title or rs.book_title or "Unknown title",
+                "subtitle": None,
+                "author": None,
+                "durationSeconds": int(rs.duration_seconds or 0),
+                "startedAt": int(rs.start_time),
+                "endedAt": int(rs.end_time),
+                "coverPath": None,
+            } for rs, abs_title, audio_title in rows]
 
     def delete_recent_estimated_kosync_session(
         self,

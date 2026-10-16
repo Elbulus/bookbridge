@@ -439,6 +439,43 @@ class TestMatchPathsRegression(unittest.TestCase):
         saved_book = db.save_book.call_args[0][0]
         self.assertEqual(saved_book.abs_id, "uuid-legacy-1")
 
+    @patch("src.web_server.get_kosync_id_for_ebook", return_value="hash-bo-2")
+    def test_library_audio_rematch_writes_the_bookorbit_ebook_id_into_the_user_link(self, _mock_kosync):
+        """Re-matching must repair an audio-only per-user BookOrbit link.
+
+        The link outranks Book.ebook_source_id in resolve_bookorbit_ebook_id, so a
+        link stuck at ebook_id=NULL kept the ebook out of sync however often the
+        book was re-matched.
+        """
+        from src.db.models import Book
+
+        existing = Book(
+            abs_id="bookorbit:6277",
+            abs_title="Rematched Book",
+            audio_source="BookOrbit",
+            audio_source_id="6277",
+            audio_provider_book_id="6277",
+            ebook_filename="rematched.epub",
+            kosync_doc_id="hash-bo-2",
+            status="active",
+        )
+        db = self.mock_container.mock_database_service
+        db.get_book.return_value = existing
+        db.save_book.side_effect = lambda book: book
+
+        response = self._post_as_user(1, "/match", {
+            "audio_source": "BookOrbit",
+            "audio_source_id": "6277",
+            "ebook_filename": "rematched.epub",
+            "ebook_source": "BookOrbit",
+            "ebook_source_id": "6264",
+        })
+
+        self.assertEqual(response.status_code, 302)
+        db.set_user_bookorbit_link.assert_called_once_with(
+            1, "bookorbit:6277", ebook_id="6264", audio_id="6277", title="rematched",
+        )
+
     @patch("src.web_server.get_kosync_id_for_ebook", return_value="1234567890abcdef1234567890abcdef")
     def test_library_audio_match_resolves_series_on_match(self, _mock_kosync):
         """A BookOrbit/Grimmory audio match resolves series at match time, so the book
@@ -1640,6 +1677,113 @@ class TestMatchPathsRegression(unittest.TestCase):
         self.assertEqual(queue[0]["ebook_source"], "Grimmory")
         self.assertEqual(queue[0]["ebook_source_path"], "/books/live_ebook.epub")
 
+    def _suggestion_card(self, key, title):
+        return {
+            "bridge_key": key,
+            "abs_id": key,
+            "audio_source": "ABS",
+            "audio_source_id": key,
+            "audio_title": title,
+            "audio_duration": 3600,
+            "audio_cover_url": "",
+            "matches": [{
+                "ebook_filename": f"{key}.epub",
+                "display_name": title,
+                "source": "Grimmory",
+                "source_id": f"g-{key}",
+                "source_path": f"/books/{key}.epub",
+                "score": 95.0,
+                "match_reason": "fuzzy",
+            }],
+        }
+
+    def _open_session_behind_a_newer_scan(self):
+        live = self._suggestion_card("ab-live", "Live Scan Audio")
+        with self.client.session_transaction() as session_data:
+            session_data["suggestions_state_id"] = "state-open"
+        with web_server.SUGGESTIONS_STATE_LOCK:
+            web_server.SUGGESTIONS_STATE_STORE["state-open"] = {
+                "scan_results": [live],
+                "scan_cache_by_abs": {"ab-live": live},
+                "scan_cache_no_match_abs_ids": [],
+                "scan_last_stats": {},
+                "scanned_at": 100.0,
+                "scan_has_run": True,
+                "updated_at": time.time(),
+            }
+
+        self.addCleanup(lambda: web_server._suggestions_cache_file_path().unlink(missing_ok=True))
+        web_server._save_persisted_suggestions_cache({
+            "scan_cache_by_abs": {
+                "ab-scheduled": self._suggestion_card("ab-scheduled", "Scheduled Scan Audio"),
+            },
+            "scan_cache_no_match_abs_ids": [],
+            "scan_last_stats": {"scanned_new": 1, "reused_cached": 0},
+            "scanned_at": 200.0,
+        })
+
+        mapped_book = Mock()
+        mapped_book.abs_id = "ab-mapped"
+        mapped_book.audio_source = "ABS"
+        mapped_book.audio_source_id = "ab-mapped"
+        self.mock_container.mock_database_service.get_all_books.return_value = [mapped_book]
+        return live
+
+    def test_suggestions_get_shows_newer_scan_over_live_state_and_keeps_it_persisted(self):
+        self._open_session_behind_a_newer_scan()
+
+        response = self.client.get("/suggestions")
+        self.assertEqual(response.status_code, 200)
+
+        html = response.get_data(as_text=True)
+        self.assertIn("Scheduled Scan Audio", html)
+        self.assertNotIn("Live Scan Audio", html)
+        persisted = web_server._load_persisted_suggestions_cache()
+        self.assertEqual(list(persisted["scan_cache_by_abs"]), ["ab-scheduled"])
+        self.assertEqual(persisted["scanned_at"], 200.0)
+
+    @patch("src.web_server._start_suggestions_scan_job", return_value="job-1")
+    def test_suggestions_scan_reuses_newer_scan_instead_of_stale_session_cache(self, mock_start_job):
+        self._open_session_behind_a_newer_scan()
+
+        response = self.client.post(
+            "/suggestions",
+            data={"action": "scan"},
+            headers={"X-Requested-With": "XMLHttpRequest"},
+        )
+        self.assertEqual(response.status_code, 200)
+
+        cached = mock_start_job.call_args.kwargs["cached_suggestions_by_abs"]
+        self.assertEqual(list(cached), ["ab-scheduled"])
+
+    def test_suggestions_finished_session_scan_does_not_overwrite_newer_scan(self):
+        live = self._open_session_behind_a_newer_scan()
+        with self.client.session_transaction() as session_data:
+            session_data["suggestions_scan_job_id"] = "job-open"
+        with web_server.SUGGESTIONS_SCAN_JOBS_LOCK:
+            web_server.SUGGESTIONS_SCAN_JOBS["job-open"] = {
+                "status": "done",
+                "results": {
+                    "suggestions": [live],
+                    "cache_by_abs": {"ab-live": live},
+                    "no_match_abs_ids": [],
+                    "stats": {"scanned_new": 1, "reused_cached": 0},
+                },
+                "error": None,
+                "scanned_at": 100.0,
+                "started_at": time.time(),
+                "updated_at": time.time(),
+            }
+
+        response = self.client.get("/suggestions")
+        self.assertEqual(response.status_code, 200)
+
+        html = response.get_data(as_text=True)
+        self.assertIn("Scheduled Scan Audio", html)
+        self.assertNotIn("Live Scan Audio", html)
+        persisted = web_server._load_persisted_suggestions_cache()
+        self.assertEqual(list(persisted["scan_cache_by_abs"]), ["ab-scheduled"])
+
     def test_suggestions_get_rehydrates_scan_results_from_persisted_cache(self):
         # #351 fix: a GET to /suggestions after restart must render the cached
         # suggestions instead of the "No scan results yet" empty state.
@@ -2357,7 +2501,7 @@ class TestMatchPathsRegression(unittest.TestCase):
         self.mock_container.mock_bookorbit_client.move_between_shelves.assert_called_once_with(
             "bookorbit-origin.epub", "Up Next", "Kobo"
         )
-        mock_shelve.assert_called_once_with("source.epub", "BookOrbit", "bo-17")
+        mock_shelve.assert_called_once_with("source.epub", "BookOrbit", "bo-17", book=unittest.mock.ANY)
 
     @patch(
         "src.web_server._create_or_update_bookfusion_progress_mapping",

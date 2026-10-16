@@ -8,24 +8,23 @@ import shutil
 import tempfile
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, call, patch
 
 from src.db.database_service import DatabaseService
-from src.db.models import Book, Job, JOB_KIND_ALIGNMENT, JOB_KIND_READALONG
+from sqlalchemy.exc import OperationalError
+
+from src.db.models import Book, BookAlignment, Job, State, JOB_KIND_ALIGNMENT, JOB_KIND_READALONG
 from src.services.forge_service import ForgeService
+from src.services.alignment_service import AlignmentService
+from src.services.migration_service import MigrationService
 from src.sync_manager import SyncManager
 
 
-class _StubAlignmentService:
-    """Stands in for `AlignmentService`: `_get_alignment` is the only method
-    `_promote_alignment_backed_book` calls on it."""
-
-    def __init__(self, has_alignment: bool = True):
-        self.has_alignment = has_alignment
-
-    def _get_alignment(self, abs_id: str):
-        return {"ok": True} if self.has_alignment else None
+def _store_alignment(db: DatabaseService, abs_id: str) -> None:
+    with db.get_session() as session:
+        session.add(BookAlignment(abs_id=abs_id, alignment_map_json='[{"char": 0, "ts": 0.0}]'))
 
 
 class TestJobKindIsolation(unittest.TestCase):
@@ -35,7 +34,7 @@ class TestJobKindIsolation(unittest.TestCase):
         self.db = DatabaseService(self.db_path)
         self.manager = SyncManager(
             database_service=self.db,
-            alignment_service=_StubAlignmentService(has_alignment=True),
+            alignment_service=AlignmentService(self.db, polisher=None),
             sync_clients={},
             epub_cache_dir=Path(self.temp_dir) / "epub_cache",
             data_dir=Path(self.temp_dir),
@@ -43,6 +42,7 @@ class TestJobKindIsolation(unittest.TestCase):
         )
         self.abs_id = "book-overlap"
         self.db.save_book(Book(abs_id=self.abs_id, abs_title="Overlap Book", status="active"))
+        _store_alignment(self.db, self.abs_id)
 
     def tearDown(self) -> None:
         self.db.db_manager.close()
@@ -78,6 +78,61 @@ class TestJobKindIsolation(unittest.TestCase):
         self.assertEqual(alignment_job.progress, 1.0)
         self.assertEqual(alignment_job.retry_count, 0)
         self.assertIsNone(alignment_job.last_error)
+
+    def test_empty_legacy_maps_preserve_failed_jobs_for_retry(self) -> None:
+        """An imported empty map must not erase a failed job's recovery state."""
+        transcripts = Path(self.temp_dir) / "transcripts"
+        transcripts.mkdir()
+        for index, raw in enumerate(("[]", "{}", "null")):
+            with self.subTest(map=raw):
+                abs_id = f"legacy-empty-{index}"
+                self.db.save_book(Book(abs_id=abs_id, status="failed_retry_later", transcript_file="old.json"))
+                self.db.save_job(Job(abs_id=abs_id, progress=0.4, retry_count=2,
+                                     last_error="retry pending", kind=JOB_KIND_ALIGNMENT))
+                (transcripts / f"{abs_id}_alignment.json").write_text(raw, encoding="utf-8")
+                MigrationService(self.db, self.manager.alignment_service, Path(self.temp_dir))._migrate_alignments()
+
+                self.manager.cleanup_stale_jobs()
+
+                book = self.db.get_book(abs_id)
+                job = self.db.get_latest_job(abs_id, kind=JOB_KIND_ALIGNMENT)
+                self.assertEqual(book.status, "failed_retry_later")
+                self.assertEqual(book.transcript_file, "old.json")
+                self.assertEqual((job.progress, job.retry_count, job.last_error), (0.4, 2, "retry pending"))
+                self.assertIsNone(self.manager.alignment_service.get_time_for_char(abs_id, 200))
+
+    def test_unreadable_map_does_not_abort_other_startup_recovery(self) -> None:
+        """A malformed stored map leaves its job retryable and recovery continues."""
+        for abs_id, raw in (("broken-map", "["), ("valid-map", '[{"char": 0, "ts": 0.0}]')):
+            self.db.save_book(Book(abs_id=abs_id, status="processing"))
+            with self.db.get_session() as session:
+                session.add(BookAlignment(abs_id=abs_id, alignment_map_json=raw))
+        self.db.save_job(Job(abs_id="broken-map", retry_count=4, kind=JOB_KIND_ALIGNMENT))
+
+        self.manager.cleanup_stale_jobs()
+
+        broken = self.db.get_book("broken-map")
+        self.assertEqual(broken.status, "failed_retry_later")
+        self.assertIsNone(broken.transcript_file)
+        self.assertEqual(self.db.get_latest_job("broken-map").last_error, "Interrupted by restart")
+        self.assertEqual(self.db.get_latest_job("broken-map").retry_count, 0)
+        self.assertEqual(self.db.get_book("valid-map").status, "active")
+        self.assertEqual(self.db.get_book("valid-map").transcript_file, "DB_MANAGED")
+
+    def test_unfinished_job_with_finalized_metadata_still_validates_map(self) -> None:
+        """Finalized book metadata alone must not complete a failed alignment job."""
+        book = self.db.get_book(self.abs_id)
+        book.transcript_file = "DB_MANAGED"
+        self.db.save_book(book)
+        with self.db.get_session() as session:
+            session.query(BookAlignment).filter_by(abs_id=self.abs_id).first().alignment_map_json = "[]"
+        self.db.save_job(Job(abs_id=self.abs_id, progress=0.4, retry_count=2,
+                             last_error="retry pending", kind=JOB_KIND_ALIGNMENT))
+
+        self.assertFalse(self.manager._promote_alignment_backed_book(book))
+
+        job = self.db.get_latest_job(self.abs_id, kind=JOB_KIND_ALIGNMENT)
+        self.assertEqual((job.progress, job.retry_count, job.last_error), (0.4, 2, "retry pending"))
 
     def test_readalong_failure_survives_a_subsequent_sync(self) -> None:
         """A generation failure recorded on the read-along job must still be
@@ -154,12 +209,137 @@ class TestJobKindIsolation(unittest.TestCase):
         book = self.db.get_book(self.abs_id)
         book.status = "processing"
         import src.web_server as ws
-        with patch.object(ws, "database_service", self.db):
+        # The module's manager is set only when the app runs; give the URL builder one.
+        manager = MagicMock()
+        manager.abs_client.base_url = "http://abs.example"
+        with patch.object(ws, "database_service", self.db), patch.object(ws, "manager", manager):
             mapping = ws._build_dashboard_mapping(
                 book, {}, {}, {}, {}, {}, {},
             )
         self.assertEqual(mapping["job_progress"], 25.0)
         self.assertEqual(mapping["job_last_error"], "alignment wait")
+
+    def test_bulk_alignment_and_job_reads_match_the_per_book_ones(self) -> None:
+        self.db.save_book(Book(abs_id="unaligned", abs_title="Unaligned", status="active"))
+        for last_attempt, kind in ((1000.0, JOB_KIND_ALIGNMENT), (3000.0, JOB_KIND_READALONG),
+                                   (2000.0, JOB_KIND_ALIGNMENT)):
+            self.db.save_job(Job(abs_id=self.abs_id, last_attempt=last_attempt, kind=kind))
+        self.db.save_job(Job(abs_id="unaligned", last_attempt=500.0, kind=JOB_KIND_ALIGNMENT))
+
+        self.assertEqual(self.db.get_aligned_book_ids(), {self.abs_id})
+        latest = self.db.get_latest_jobs(kind=JOB_KIND_ALIGNMENT)
+        for abs_id in (self.abs_id, "unaligned"):
+            self.assertEqual(latest[abs_id].id, self.db.get_latest_job(abs_id, kind=JOB_KIND_ALIGNMENT).id)
+        self.assertEqual(self.db.get_latest_jobs()[self.abs_id].kind, JOB_KIND_READALONG)
+
+    def test_full_cycle_reads_states_and_alignment_once_with_one_pool(self) -> None:
+        """Only a book whose alignment needs a repair is re-read per book."""
+        book = self.db.get_book(self.abs_id)
+        book.transcript_file = "DB_MANAGED"
+        self.db.save_book(book)
+        self.db.save_job(Job(abs_id=self.abs_id, last_attempt=1000.0, progress=1.0, kind=JOB_KIND_ALIGNMENT))
+        self.db.save_book(Book(abs_id="needs-repair", abs_title="Repair", status="active"))
+        _store_alignment(self.db, "needs-repair")
+        self.db.save_job(Job(abs_id="needs-repair", last_attempt=1000.0, progress=0.4,
+                             last_error="retry pending", kind=JOB_KIND_ALIGNMENT))
+        client = MagicMock()
+        client.fetch_bulk_state.return_value = None
+        client.get_supported_sync_types.return_value = ["audiobook", "ebook"]
+        client.get_service_state.return_value = None
+        self.manager.sync_clients = {"KoSync": client}
+
+        with patch.object(self.db, "get_states_for_book", wraps=self.db.get_states_for_book) as per_book_states, \
+             patch.object(self.db, "has_alignment", wraps=self.db.has_alignment) as per_book_alignment, \
+             patch("src.sync_manager.ThreadPoolExecutor", wraps=ThreadPoolExecutor) as pools:
+            self.manager._sync_cycle_internal()
+
+        self.assertEqual(client.get_service_state.call_count, 2)
+        self.assertEqual(pools.call_count, 1)
+        per_book_states.assert_not_called()
+        self.assertEqual(per_book_alignment.call_args_list, [call("needs-repair")])
+        self.assertEqual(self.db.get_latest_job("needs-repair", kind=JOB_KIND_ALIGNMENT).progress, 1.0)
+
+    def _cycle_client(self) -> MagicMock:
+        client = MagicMock()
+        client.fetch_bulk_state.return_value = {"documents_without_progress": {"hash": self.abs_id}}
+        client.get_supported_sync_types.return_value = ["audiobook", "ebook"]
+        client.get_service_state.return_value = None
+        return client
+
+    def test_book_written_during_cycle_is_reread_and_skips_kosync_bulk_map(self) -> None:
+        """A write after the snapshot (mark-complete, KoSync PUT) must not be compared against stale states."""
+        client = self._cycle_client()
+        self.manager.sync_clients = {"KoSync": client}
+        real_get_all_states = self.db.get_all_states
+
+        def snapshot_then_outside_write(*args, **kwargs):
+            states = real_get_all_states(*args, **kwargs)
+            self.db.save_state(State(abs_id=self.abs_id, client_name="kosync", percentage=0.9, last_updated=5.0))
+            return states
+
+        with patch.object(self.db, "get_all_states", side_effect=snapshot_then_outside_write), \
+             patch.object(self.db, "get_states_for_book", wraps=self.db.get_states_for_book) as per_book_states:
+            self.manager._sync_cycle_internal()
+
+        per_book_states.assert_called_once_with(self.abs_id)
+        self.assertIsNone(client.get_service_state.call_args[0][3])
+
+    def test_write_during_the_bulk_reads_also_invalidates_the_kosync_map(self) -> None:
+        """A device PUT landing while the bulk maps are read must not be hidden by them."""
+        client = self._cycle_client()
+        self.manager.sync_clients = {"KoSync": client}
+
+        def bulk_then_outside_write():
+            self.db.save_state(State(abs_id=self.abs_id, client_name="kosync", percentage=0.9, last_updated=5.0))
+            return {"documents_without_progress": {"hash": self.abs_id}}
+
+        client.fetch_bulk_state.side_effect = bulk_then_outside_write
+        self.manager._sync_cycle_internal()
+        self.assertIsNone(client.get_service_state.call_args[0][3])
+
+    def test_untouched_book_keeps_snapshot_and_kosync_bulk_map(self) -> None:
+        client = self._cycle_client()
+        self.manager.sync_clients = {"KoSync": client}
+        with patch.object(self.db, "get_states_for_book", wraps=self.db.get_states_for_book) as per_book_states:
+            self.manager._sync_cycle_internal()
+        per_book_states.assert_not_called()
+        self.assertEqual(client.get_service_state.call_args[0][3], {"documents_without_progress": {"hash": self.abs_id}})
+
+    def test_failed_snapshot_read_falls_back_to_per_book_reads(self) -> None:
+        client = self._cycle_client()
+        self.manager.sync_clients = {"KoSync": client}
+        with patch.object(self.db, "get_all_states", side_effect=OperationalError("s", {}, Exception("database is locked"))), \
+             patch.object(self.db, "get_states_for_book", wraps=self.db.get_states_for_book) as per_book_states, \
+             self.assertLogs("src.sync_manager", level="WARNING") as logs:
+            self.manager._sync_cycle_internal()
+        per_book_states.assert_called_once_with(self.abs_id)
+        client.get_service_state.assert_called_once()
+        self.assertTrue(any("Cycle snapshot read failed" in line for line in logs.output))
+
+    def test_pool_is_shut_down_when_the_cycle_raises(self) -> None:
+        with patch("src.sync_manager.ThreadPoolExecutor") as pools, \
+             patch.object(self.manager, "_run_sync_cycle", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                self.manager._sync_cycle_internal()
+        pools.return_value.shutdown.assert_called_once()
+
+    def test_states_read_is_limited_to_requested_books(self) -> None:
+        self.db.save_state(State(abs_id=self.abs_id, client_name="kosync", percentage=0.1, last_updated=1.0))
+        self.db.save_book(Book(abs_id="inactive", abs_title="Inactive", status="pending"))
+        self.db.save_state(State(abs_id="inactive", client_name="kosync", percentage=0.2, last_updated=1.0))
+        uid = self.db._resolve_uid(None)
+        self.assertEqual({s.abs_id for s in self.db.get_all_states(user_id=uid)}, {self.abs_id, "inactive"})
+        self.assertEqual({s.abs_id for s in self.db.get_all_states(user_id=uid, abs_ids=[self.abs_id])}, {self.abs_id})
+
+    def test_latest_jobs_picks_newest_per_book_including_null_attempts(self) -> None:
+        self.db.save_job(Job(abs_id=self.abs_id, last_attempt=10.0, progress=0.1, kind=JOB_KIND_ALIGNMENT))
+        newest = self.db.save_job(Job(abs_id=self.abs_id, last_attempt=20.0, progress=0.2, kind=JOB_KIND_ALIGNMENT))
+        self.db.save_job(Job(abs_id=self.abs_id, last_attempt=30.0, progress=0.3, kind=JOB_KIND_READALONG))
+        self.db.save_book(Book(abs_id="never-attempted", abs_title="N", status="active"))
+        self.db.save_job(Job(abs_id="never-attempted", last_attempt=None, progress=0.0, kind=JOB_KIND_ALIGNMENT))
+        latest = self.db.get_latest_jobs(kind=JOB_KIND_ALIGNMENT)
+        self.assertEqual(latest[self.abs_id].id, newest.id)
+        self.assertIn("never-attempted", latest)
 
 
 class TestCheckPendingJobsRetryKindIsolation(unittest.TestCase):
@@ -171,7 +351,7 @@ class TestCheckPendingJobsRetryKindIsolation(unittest.TestCase):
         self.db = DatabaseService(self.db_path)
         self.manager = SyncManager(
             database_service=self.db,
-            alignment_service=_StubAlignmentService(has_alignment=True),
+            alignment_service=AlignmentService(self.db, polisher=None),
             sync_clients={},
             epub_cache_dir=Path(self.temp_dir) / "epub_cache",
             data_dir=Path(self.temp_dir),
@@ -186,6 +366,7 @@ class TestCheckPendingJobsRetryKindIsolation(unittest.TestCase):
             abs_id=self.abs_id, abs_title="Retry Overlap Book",
             status="failed_retry_later", sync_mode="audiobook_only",
         ))
+        _store_alignment(self.db, self.abs_id)
 
     def tearDown(self) -> None:
         self.db.db_manager.close()

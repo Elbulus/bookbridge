@@ -29,8 +29,8 @@ class ABSSyncClient(SyncClient):
     def check_connection(self):
         return self.abs_client.check_connection()
 
-    def fetch_bulk_state(self):
-        """Pre-fetch all ABS progress data at once."""
+    def fetch_bulk_state(self) -> Optional[dict]:
+        """Pre-fetch all ABS progress data at once (an ABSBulkProgress, None when the read failed)."""
         return self.abs_client.get_all_progress_raw()
 
     def get_supported_sync_types(self) -> set:
@@ -52,7 +52,8 @@ class ABSSyncClient(SyncClient):
             abs_duration = item_data.get('duration')
             # Note: Still need to convert to percentage using transcript
         else:
-            response = self.abs_client.get_progress(abs_id)
+            # A book missing from a successful bulk read has no progress (the per-book read would 404)
+            response = self.abs_client.get_progress(abs_id) if bulk_context is None else None
             abs_ts = response.get('currentTime') if response is not None else None
             abs_last_update = response.get('lastUpdate') if response is not None else None
             abs_finished = bool(response.get('isFinished')) if response is not None else False

@@ -2,12 +2,46 @@ import os
 import tempfile
 import shutil
 import unittest
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
 from src.db.database_service import DatabaseService
 from src.db.user_bootstrap import bootstrap_admin_user, create_initial_admin_user
-from src.db.models import Book, State
+import sqlalchemy as sa
+
+from src.db.models import (Base, Book, State, UserBook, KosyncDocument, KosyncUserProgress,
+                          ReadingSessionBuffer, KoreaderAnnotation, KoreaderAnnotationDeviceState,
+                          UserCredential)
+from src.utils.time_utils import utcnow
+
+_SHARED_TABLES = ('books', 'kosync_documents')
+
+
+def _per_user_tables():
+    return [t for t in Base.metadata.sorted_tables if 'user_id' in t.c and t.name not in _SHARED_TABLES]
+
+
+def _seed_minimal_row(session, table, user_id):
+    """Insert one row filling only required columns, so any per-user table can be seeded."""
+    values = {}
+    for col in table.c:
+        if col.name == 'user_id':
+            values[col.name] = user_id
+        elif (col.nullable and not col.primary_key) or col.default is not None or col.server_default is not None:
+            continue
+        elif col.primary_key and isinstance(col.type, sa.Integer) and len(table.primary_key.columns) == 1:
+            continue
+        elif isinstance(col.type, sa.Integer):
+            values[col.name] = user_id
+        elif isinstance(col.type, (sa.Float, sa.Numeric)):
+            values[col.name] = 0.5
+        elif isinstance(col.type, sa.DateTime):
+            values[col.name] = utcnow()
+        else:
+            values[col.name] = f"{col.name}-{user_id}"[:getattr(col.type, 'length', None) or 64]
+    session.execute(table.insert().values(**values))
 
 
 class TestUserDb(unittest.TestCase):
@@ -19,6 +53,119 @@ class TestUserDb(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     # --- users ---
+    def _race_admin_changes(self, delete_first=False):
+        # A disabled primary keeps the race between two deletable active admins.
+        primary = self.svc.create_user('primary-admin', 'password', role='admin')
+        first = self.svc.create_user('first-admin', 'password', role='admin')
+        second = self.svc.create_user('second-admin', 'password', role='admin')
+        self.svc.update_user_account(primary.id, active=False)
+        other = DatabaseService(str(self.svc.db_path))
+        barrier = threading.Barrier(2)
+
+        def change(svc, user_id, delete):
+            barrier.wait(timeout=5)
+            try:
+                if delete:
+                    svc.delete_user(user_id)
+                else:
+                    svc.update_user_account(user_id, active=False)
+                return 'changed'
+            except ValueError:
+                return 'blocked'
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(change, self.svc, first.id, delete_first),
+                           pool.submit(change, other, second.id, False)]
+                self.assertEqual(sorted(f.result() for f in futures), ['blocked', 'changed'])
+            self.assertEqual(sum(u.role == 'admin' and bool(u.active) for u in self.svc.list_users()), 1)
+        finally:
+            other.db_manager.engine.dispose()
+
+    def test_separate_database_instances_serialize_admin_disables(self):
+        self._race_admin_changes()
+
+    def test_delete_and_disable_cannot_remove_all_active_admins(self):
+        self._race_admin_changes(delete_first=True)
+
+    def test_delete_user_removes_scoped_progress_but_keeps_shared_catalog(self):
+        self.svc.create_user('owner', 'password', role='admin')
+        other = self.svc.create_user('other-reader', 'password')
+        reader = self.svc.create_user('deleted-reader', 'password')
+        self.svc.save_book(Book(abs_id='shared-book', abs_title='Shared', user_id=reader.id, status='active'))
+        for user, pct in [(reader, 0.4), (other, 0.7)]:
+            self.svc.link_user_book(user.id, 'shared-book')
+            self.svc.save_state(State(abs_id='shared-book', client_name='kosync', percentage=pct, user_id=user.id))
+            self.svc.upsert_user_kosync_progress('b' * 32, pct, user_id=user.id)
+        self.svc.save_kosync_document(KosyncDocument(document_hash='b' * 32, linked_abs_id='shared-book',
+                                                    filename='Shared.epub', user_id=reader.id,
+                                                    percentage=0.4, progress='deleted-reader-position'))
+        annotation_ids = {}
+        with self.svc.get_session() as session:
+            for user in (reader, other):
+                annotation = KoreaderAnnotation('b' * 32, 'note', '2026-10-12 00:00:00', '/body/p[1]', user_id=user.id)
+                session.add(annotation)
+                session.flush()
+                annotation_ids[user.id] = annotation.id
+                session.add(KoreaderAnnotationDeviceState(annotation.id, 'reader-device'))
+                session.add(ReadingSessionBuffer(user_id=user.id, abs_id='shared-book', session_type='reading',
+                                                 leader_client='KoSync', started_at=0, last_event_at=1,
+                                                 accumulated_seconds=1, start_progress=0.1, end_progress=0.2))
+                for table in _per_user_tables():
+                    _seed_minimal_row(session, table, user.id)
+        self.assertTrue(self.svc.delete_user(reader.id))
+        with self.svc.get_session() as session:
+            tables = _per_user_tables()
+            self.assertGreaterEqual(len(tables), 12)
+            for table in tables:
+                count = lambda uid: session.execute(
+                    sa.select(sa.func.count()).select_from(table).where(table.c.user_id == uid)
+                ).scalar()
+                self.assertEqual(count(reader.id), 0, table.name)
+                self.assertGreaterEqual(count(other.id), 1, table.name)
+            self.assertEqual(session.query(KoreaderAnnotationDeviceState).filter(
+                KoreaderAnnotationDeviceState.annotation_id == annotation_ids[reader.id]
+            ).count(), 0)
+            self.assertEqual(session.query(KoreaderAnnotationDeviceState).filter(
+                KoreaderAnnotationDeviceState.annotation_id == annotation_ids[other.id]
+            ).count(), 1)
+        self.assertTrue(self.svc.is_user_linked(other.id, 'shared-book'))
+        self.assertAlmostEqual(self.svc.get_state('shared-book', 'kosync', user_id=other.id).percentage, 0.7)
+        self.assertAlmostEqual(float(self.svc.get_user_kosync_progress('b' * 32, other.id).percentage), 0.7)
+        # Startup backfill claims NULL owners for the admin; the retired id must survive it.
+        self.svc.assign_orphan_rows_to_user(self.svc.get_user_by_username('owner').id)
+        book = self.svc.get_book('shared-book')
+        self.assertIsNotNone(book)
+        self.assertEqual(book.user_id, reader.id)
+        doc = self.svc.get_kosync_document('b' * 32)
+        self.assertEqual((doc.filename, doc.linked_abs_id), ('Shared.epub', 'shared-book'))
+        self.assertEqual(doc.user_id, reader.id)
+        self.assertFalse(doc.percentage)
+        self.assertFalse(doc.progress)
+
+    def test_delete_user_refuses_primary_admin_even_with_another_admin(self):
+        primary = self.svc.create_user('owner', 'password', role='admin')
+        self.svc.create_user('second-admin', 'password', role='admin')
+        self.svc.set_user_credential(primary.id, 'ABS_KEY', 'primary-token')
+        with self.assertRaisesRegex(ValueError, 'primary admin'):
+            self.svc.delete_user(primary.id)
+        self.assertIsNotNone(self.svc.get_user(primary.id))
+        self.assertEqual(self.svc.get_user_credentials(primary.id).get('ABS_KEY'), 'primary-token')
+
+    def test_deleted_user_id_is_never_reissued(self):
+        self.svc.create_user('owner', 'password', role='admin')
+        reader = self.svc.create_user('deleted-reader', 'password')
+        self.assertTrue(self.svc.delete_user(reader.id))
+        self.assertGreater(self.svc.create_user('newbie', 'password').id, reader.id)
+
+    def test_credential_write_for_deleted_user_is_ignored(self):
+        self.svc.create_user('owner', 'password', role='admin')
+        reader = self.svc.create_user('deleted-reader', 'password')
+        self.assertTrue(self.svc.delete_user(reader.id))
+        self.assertIsNone(self.svc.set_user_credential(reader.id, 'READEST_ACCESS_TOKEN', 'late-token'))
+        with self.svc.get_session() as session:
+            self.assertEqual(session.query(UserCredential).filter(UserCredential.user_id == reader.id).count(), 0)
+
     def test_create_and_lookup_user(self):
         u = self.svc.create_user("Admin", "secret", role="admin")
         self.assertEqual(u.role, "admin")
@@ -44,9 +191,9 @@ class TestUserDb(unittest.TestCase):
 
     def test_disabled_user_cannot_authenticate(self):
         u = self.svc.create_user("bob", "pw")
-        self.svc.set_user_active(u.id, False)
+        self.svc.update_user_account(u.id, active=False)
         self.assertIsNone(self.svc.verify_user_credentials("bob", "pw"))
-        self.svc.set_user_active(u.id, True)
+        self.svc.update_user_account(u.id, active=True)
         self.assertIsNotNone(self.svc.verify_user_credentials("bob", "pw"))
 
     def test_password_is_hashed_not_plaintext(self):

@@ -781,6 +781,15 @@
                             (including your own). The server URL and engine settings here stay global.
                         </div>
                     </div>
+                    <div class="checkbox-wrapper full-width">
+                        <input type="checkbox" id="abs_collection_reconcile" name="ABS_COLLECTION_RECONCILE"
+                            {% if get_bool('ABS_COLLECTION_RECONCILE') %}checked{% endif %}>
+                        <label for="abs_collection_reconcile">Keep every match in its auto-add collection</label>
+                        <small>Every sync cycle, any matched audiobook missing from its owner's auto-add collection
+                            is added again, so an add that failed when the book was matched is not lost. With several
+                            audiobook libraries, a collection of that name is kept in each one. While this is on, a
+                            book removed from the collection by hand is added back.</small>
+                    </div>
 
                     <div class="form-group">
                         <label>Progress Offset (Seconds)</label>
@@ -847,6 +856,17 @@
                                 %}>Filename (Fast)</option>
                         </select>
                     </div>
+                    <div class="checkbox-wrapper full-width">
+                        <input type="checkbox" id="kosync_creds_from_grimmory" name="KOSYNC_CREDENTIALS_FROM_GRIMMORY"
+                            {% if get_bool('KOSYNC_CREDENTIALS_FROM_GRIMMORY') %}checked{% endif %}>
+                        <label for="kosync_creds_from_grimmory">Take each reader's sync login from Grimmory</label>
+                        <div class="help-text">Every sync cycle, a reader's KoSync username and password are taken from
+                            the KOReader login of their Grimmory account and keep following it, so the login is
+                            managed on Grimmory's KOReader settings page. A reader who already has a different
+                            KoSync login set here keeps it (clear their KoSync username to switch to the Grimmory
+                            one), and a Grimmory username another user here already has is skipped; both are
+                            logged as warnings. Readers without a Grimmory KOReader login are left alone.</div>
+                    </div>
                     <div class="form-group full-width">
                         <label>KoSync PUT debounce seconds</label>
                         <input type="number" min="0" name="KOSYNC_PUT_DEBOUNCE_SECONDS"
@@ -891,6 +911,17 @@
                             book lookup: a book whose KOReader hash isn't linked to a mapping still needs linking
                             from Add / Update Book -> Reader Documents before any sync — percentage or text — can happen.</div>
                     </div>
+
+                    <details class="advanced-sub full-width">
+                        <summary>Advanced — behind a reverse proxy</summary>
+                        <div class="section-body" style="padding: 12px 0 0;">
+                            <div class="form-group full-width">
+                                <label>Trusted proxy addresses</label>
+                                <input type="text" name="KOSYNC_TRUSTED_PROXIES" value="{{ get_val('KOSYNC_TRUSTED_PROXIES') }}" placeholder="172.18.0.5, 10.0.0.0/24">
+                                <div class="help-text">Comma-separated IP addresses or CIDR ranges of the reverse proxy or tunnel (nginx, Caddy, cloudflared) in front of the KoSync port. Requests from these addresses are counted under the reader's real address from <code>X-Forwarded-For</code>, so repeated wrong passwords lock out only the sender, not every reader behind the proxy. <strong>Leave blank to trust only localhost.</strong> On Docker, this is the proxy container's address on the shared network (find it with <code>docker inspect</code>). List only your proxy: any address covered here can claim to be any client.</div>
+                            </div>
+                        </div>
+                    </details>
 
                     <details class="advanced-sub full-width" {% if kosync_external %}open{% endif %}>
                         <summary>Advanced — external KoSync server</summary>
@@ -1003,6 +1034,13 @@
                             (including your own). The API URL above stays global.
                         </div>
                     </div>
+                    <div class="form-group">
+                        <label>Library Timeout (seconds)</label>
+                        <input type="number" name="STORYTELLER_LIBRARY_TIMEOUT"
+                            value="{{ get_val('STORYTELLER_LIBRARY_TIMEOUT', '10') }}"
+                            min="5" max="300">
+                        <div class="help-text">How long to wait for Storyteller to send its whole book list, which searching and matching need. Raise this if Storyteller searches come back empty or time out on a large library. 5–300 seconds. Default: 10.</div>
+                    </div>
                     <div class="form-group" style="align-items: center;">
                         <label>Skip ReadAloud EPUB Cache</label>
                         <label class="toggle-switch">
@@ -1077,6 +1115,28 @@
 
                     <!-- Highlight sync is per-user: Settings → Users → (user) → Integrations → Grimmory. -->
 
+                    <div class="checkbox-wrapper full-width">
+                        <input type="checkbox" id="booklore_shelf_require_alignment" name="BOOKLORE_SHELF_REQUIRE_ALIGNMENT"
+                            {% if get_bool('BOOKLORE_SHELF_REQUIRE_ALIGNMENT') %}checked{% endif %}>
+                        <label for="booklore_shelf_require_alignment">Add matched books to the shelf only once they are aligned</label>
+                        <small>A newly matched audiobook-and-ebook pair joins the shelf only once it has a
+                            fine-grained alignment map (the same bar as read-along generation; a coarse fallback map
+                            does not count), so the shelf lists only books whose audio&harr;text sync is precise.
+                            Checked every sync cycle. Each book is added once, with the matching reader's own
+                            Grimmory login and shelf name, so taking it off the shelf later sticks. Ebook-only
+                            matches are shelved at match time as before, and turning this off shelves every book
+                            still waiting.</small>
+                    </div>
+                    <div class="form-group full-width">
+                        <label>Shelf Owner</label>
+                        <input type="text" name="BOOKLORE_SHELF_OWNER"
+                            value="{{ get_val('BOOKLORE_SHELF_OWNER', '') }}" placeholder="BookBridge username">
+                        <div class="help-text">With the option above on, the BookBridge user whose own Grimmory login
+                            adds the waiting books, to the global shelf name, and removes such a book when its match
+                            is deleted. Use the account that owns the shelf in Grimmory when readers share one shelf;
+                            blank uses each reader's own login and shelf.</div>
+                    </div>
+
                     <!-- Separator -->
                     <div class="full-width" style="margin: 10px 0; border-top: 1px solid rgba(255,255,255,0.1);"></div>
                     <h4 class="full-width" style="font-size: 14px; color: #fff; margin-bottom: -10px;">"Up Next" Shelf Auto-Match</h4>
@@ -1087,7 +1147,7 @@
                             {% if get_bool('BOOKLORE_SHELF_WATCH_ENABLED') %}checked{% endif %}>
                         <label for="booklore_shelf_watch">Watch a Grimmory shelf for auto-matching</label>
                     </div>
-                    <div id="shelf_watch_body" class="full-width" {% if not get_bool('BOOKLORE_SHELF_WATCH_ENABLED') %}style="display:none;"{% endif %}>
+                    <div id="shelf_watch_body" class="full-width section-body{% if not get_bool('BOOKLORE_SHELF_WATCH_ENABLED') %} collapsed{% endif %}" style="padding: 0;">
                         <div class="form-group full-width">
                             <label>Watch Shelf Name</label>
                             <div style="display: flex; gap: 10px;">
@@ -1265,7 +1325,7 @@
                             {% if get_bool('BOOKORBIT_SHELF_WATCH_ENABLED') %}checked{% endif %}>
                         <label for="bookorbit_shelf_watch">Watch a BookOrbit collection for auto-matching</label>
                     </div>
-                    <div id="bookorbit_shelf_watch_body" class="full-width" {% if not get_bool('BOOKORBIT_SHELF_WATCH_ENABLED') %}style="display:none;"{% endif %}>
+                    <div id="bookorbit_shelf_watch_body" class="full-width section-body{% if not get_bool('BOOKORBIT_SHELF_WATCH_ENABLED') %} collapsed{% endif %}" style="padding: 0;">
                         <div class="form-group full-width">
                             <label>Watch Collection Name</label>
                             <input type="text" name="BOOKORBIT_SHELF_WATCH_NAME"
@@ -1352,7 +1412,7 @@
                 {% set kavita_enabled = get_bool('KAVITA_ENABLED') %}
                 <div class="section-header">
                     <div class="svc-left">
-                        <span class="svc-chev">â–¶</span>
+                        <span class="svc-chev">▶</span>
                         <div class="svc-chip">KV</div>
                         <div class="svc-title">
                             <h3>Kavita</h3>
@@ -1386,8 +1446,8 @@
                         <div class="help-text" style="background:rgba(102,126,234,.08);border:1px solid rgba(102,126,234,.25);border-radius:8px;padding:10px 12px;">
                             <strong>Per-user account.</strong> Set each user's Kavita authentication key, optional Library ID,
                             and destination Collection under
-                            <a href="{{ url_for('settings') }}#users" style="color:#aab4f5;">Settings â†’ Users â†’ (user) â†’ Integrations</a>.
-                            Generate the authentication key in Kavita's user settings. The server URL and poll settings here stay global.
+                            <a href="{{ url_for('settings') }}#users" style="color:#aab4f5;">Settings → Users → (user) → Integrations</a>.
+                            Generate the authentication key in Kavita's user settings. The server URL here stays global; poll settings are under Polling.
                         </div>
                     </div>
 
@@ -1399,7 +1459,7 @@
                             {% if get_bool('KAVITA_SHELF_WATCH_ENABLED') %}checked{% endif %}>
                         <label for="kavita_shelf_watch">Watch a Kavita collection for auto-matching</label>
                     </div>
-                    <div id="kavita_shelf_watch_body" class="full-width" {% if not get_bool('KAVITA_SHELF_WATCH_ENABLED') %}style="display:none;"{% endif %}>
+                    <div id="kavita_shelf_watch_body" class="full-width section-body{% if not get_bool('KAVITA_SHELF_WATCH_ENABLED') %} collapsed{% endif %}" style="padding: 0;">
                         <div class="form-group full-width">
                             <label>Watch Collection Name</label>
                             <input type="text" name="KAVITA_SHELF_WATCH_NAME"
@@ -1739,9 +1799,9 @@
                 <div class="section-body">
                     <div class="form-group full-width">
                         <div class="help-text">
-                            Every matched book becomes visible to every user, and new accounts start
-                            with the whole library — nobody has to re-match a book someone else already
-                            processed. For a household reading one shared library.
+                            Every matched book becomes visible to every user, and new or re-enabled
+                            accounts start with the whole library — nobody has to re-match a book someone
+                            else already processed. For a household reading one shared library.
                             <strong>Visibility only:</strong> reading progress, KOSync documents and
                             stats stay per-user exactly as they are today, and removing a book still
                             only drops the claim of the user who removed it. Leave off if each user
@@ -1877,6 +1937,35 @@
                             another title in the same series. A wrong link syncs your position into the wrong book.
                         </div>
                     </div>
+                    <div class="form-group">
+                        <label>Scheduled scan interval (minutes)</label>
+                        <input type="number" min="0" step="1" name="SUGGESTIONS_AUTO_SCAN_MINUTES"
+                            value="{{ get_val('SUGGESTIONS_AUTO_SCAN_MINUTES') or '0' }}">
+                        <small>0 turns scheduled scans off; anything from 1 to 4 runs every 5 minutes. The
+                            interval is counted from the end of the previous scheduled scan and survives a restart.
+                            A scheduled scan behaves like pressing Scan on the Suggestions page (cached results
+                            reused, auto-match applied) and runs as the primary admin.</small>
+                    </div>
+                    {% set legacy_days = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'] %}
+                    {% set legacy_day = (get_val('SUGGESTIONS_FULL_REFRESH_DAY') or 'off')|lower %}
+                    {% set legacy_time = (get_val('SUGGESTIONS_FULL_REFRESH_TIME') or '04:00').split(':') %}
+                    {% set legacy_cron = (legacy_time[1]|int ~ ' ' ~ legacy_time[0]|int ~ ' * * ' ~ legacy_day[:3]) if legacy_day in legacy_days and legacy_time|length == 2 else '' %}
+                    {% set full_refresh_on = get_bool('SUGGESTIONS_FULL_REFRESH_ENABLED') or (legacy_cron and not get_val('SUGGESTIONS_FULL_REFRESH_CRON')) %}
+                    <input type="hidden" name="SUGGESTIONS_FULL_REFRESH_DAY" value="off">
+                    <div class="checkbox-wrapper full-width">
+                        <input type="checkbox" id="suggestions_full_refresh" name="SUGGESTIONS_FULL_REFRESH_ENABLED"
+                            onchange="updateFullRefreshFields()"
+                            {% if full_refresh_on %}checked{% endif %}>
+                        <label for="suggestions_full_refresh">Scheduled full refresh</label>
+                        <small>Clear the scan cache and rescan the whole unmatched library from scratch, the same as
+                            Full Refresh on the Suggestions page.</small>
+                    </div>
+                    <div class="form-group{% if not full_refresh_on %} hidden{% endif %}"
+                        id="full_refresh_schedule_group">
+                        <label>Full refresh schedule (cron)</label>
+                        <input type="text" name="SUGGESTIONS_FULL_REFRESH_CRON" placeholder="20 4 * * sun"
+                            value="{{ get_val('SUGGESTIONS_FULL_REFRESH_CRON') or legacy_cron }}">
+                    </div>
                     <div class="checkbox-wrapper full-width">
                         <input type="checkbox" id="kosync_auto_map" name="KOSYNC_AUTO_MAP_ON_AGREEMENT"
                             {% if get_bool('KOSYNC_AUTO_MAP_ON_AGREEMENT') %}checked{% endif %}>
@@ -1894,8 +1983,9 @@
                             a stale spot on the reader can report a higher percentage than the position BookBridge
                             already synced there and win on the number alone — pulling you backwards. When enabled,
                             BookBridge compares where the two positions actually land in the text and lets that
-                            decide. Only applies when both refer to the exact same file and the two percentages are
-                            already close. Off by default: it has to open and read the book to compare, which can add
+                            decide. Only applies when both hashes identify the same cached EPUB file and the two
+                            percentages are already close. Unknown or different copies keep the percentage comparison.
+                            Off by default: it has to open and read the book to compare, which can add
                             a few seconds to the first sync after you move in a book.</small>
                     </div>
                     <div class="checkbox-wrapper full-width">
@@ -2903,8 +2993,27 @@
                         </div>
                     </div>
 
-                    <!-- Wrapper: Local Whisper (device + compute only) -->
+                    <!-- Wrapper: Local Whisper -->
                     <div id="group_local" class="dynamic-group full-width" style="display:contents;">
+                        <div class="form-group">
+                            <label for="whisper_language">Whisper Language</label>
+                            <input type="text" id="whisper_language" name="WHISPER_LANGUAGE"
+                                value="{{ get_val('WHISPER_LANGUAGE', '') }}" placeholder="Auto-detect (e.g. ru, en)">
+                            <div class="help-text">Leave blank to detect each chunk's language, or enter a language
+                                code such as <code>ru</code> for Russian. Applies to new local transcriptions;
+                                saved transcripts are reused.</div>
+                        </div>
+                        <div class="form-group" style="align-items: center;">
+                            <label for="whisper_vad_filter">Filter Non-Speech Audio</label>
+                            <label class="toggle-switch">
+                                <input type="checkbox" id="whisper_vad_filter" name="WHISPER_VAD_FILTER"
+                                    {% if get_bool('WHISPER_VAD_FILTER') %}checked{% endif %}>
+                                <span class="slider"></span>
+                            </label>
+                            <div class="help-text">Use voice activity detection (VAD) to reduce transcription over
+                                music and silence. Off by default; check quiet narration before using it broadly.
+                                Audio timestamps are preserved. Applies to new local transcriptions.</div>
+                        </div>
                         <div class="form-group">
                             <label>Whisper Device</label>
                             <select name="WHISPER_DEVICE">
@@ -3274,7 +3383,7 @@
             if (singleSelect) {
                 // Watch shelf: a single shelf name, not a comma-separated list.
                 input.value = select.value;
-                if (typeof markDirty === 'function') markDirty();
+                if (typeof markDirty === 'function') markDirty(input);
                 select.value = "";
                 return;
             }
@@ -3284,7 +3393,7 @@
             if (!current.includes(select.value)) {
                 current.push(select.value);
                 input.value = current.join(', ');
-                if (typeof markDirty === 'function') markDirty();
+                if (typeof markDirty === 'function') markDirty(input);
             }
             select.value = ""; // Reset select
         }
@@ -4059,6 +4168,15 @@
             window.updateAutoMatchFields = updateAutoMatchFields;
             updateAutoMatchFields();
 
+            function updateFullRefreshFields() {
+                const toggle = document.getElementById('suggestions_full_refresh');
+                const group = document.getElementById('full_refresh_schedule_group');
+                if (!toggle || !group) return;
+                group.classList.toggle('hidden', !toggle.checked);
+            }
+            window.updateFullRefreshFields = updateFullRefreshFields;
+            updateFullRefreshFields();
+
             // 1. ABS Library ID Toggle
             const absCheckbox = document.getElementById('abs_only_lib');
             const absServerInput = document.querySelector('input[name="ABS_SERVER"]');
@@ -4144,14 +4262,21 @@
         // --- Unsaved Changes Guard ---
         let isFormDirty = false;
         const dirtyFields = new Set();
+        const initialFieldValues = new Map();
+
+        function settingFieldValue(field) {
+            return field.type === 'checkbox' || field.type === 'radio' ? field.checked : field.value;
+        }
 
         function markDirty(field) {
-            isFormDirty = true;
-            dirtyFields.add(field && (field.name || field.id) ? (field.name || field.id) : '__misc__');
+            if (!initialFieldValues.has(field)) return;
+            if (settingFieldValue(field) === initialFieldValues.get(field)) dirtyFields.delete(field);
+            else dirtyFields.add(field);
+            isFormDirty = dirtyFields.size > 0;
             const note = document.getElementById('dirty_note');
             if (note) {
                 const n = dirtyFields.size;
-                note.style.display = '';
+                note.style.display = n ? '' : 'none';
                 note.textContent = n === 1 ? '1 unsaved change' : n + ' unsaved changes';
             }
         }
@@ -4168,7 +4293,8 @@
             // has its own forms that navigate immediately on submit.
             const inputs = document.querySelectorAll('#settingsForm input, #settingsForm select, #settingsForm textarea');
             inputs.forEach(input => {
-                if (input.id === 'settings_search') return;
+                if (!input.name || input.type === 'hidden' || input.type === 'submit' || input.type === 'button') return;
+                initialFieldValues.set(input, settingFieldValue(input));
                 input.addEventListener('change', function () { markDirty(input); });
                 input.addEventListener('input', function () { markDirty(input); });
             });

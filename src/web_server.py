@@ -1,4 +1,5 @@
 import glob
+import hashlib
 import hmac
 import html
 import logging
@@ -17,7 +18,7 @@ import time
 import uuid
 import zipfile
 from collections import defaultdict, deque
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import unquote, urljoin, urlparse
@@ -27,28 +28,36 @@ from zoneinfo import ZoneInfo
 import requests
 import schedule
 from dependency_injector import providers
-from flask import Flask, render_template, render_template_string, request, redirect, url_for, jsonify, session, send_from_directory, make_response, g, current_app, flash
+from flask import Flask, render_template, render_template_string, request, redirect, url_for, jsonify, session, send_from_directory, make_response, g, current_app, flash, has_request_context
 from functools import wraps
 from src.utils.user_context import (
     set_current_user_id, reset_current_user_id,
     set_current_user_credentials, reset_current_user_credentials,
     get_current_user_credentials, get_current_user_id,
 )
-from src.utils.user_config import user_setting
+from src.utils.user_config import resolve_setting, user_setting
 from src.utils.user_config import global_fallback_allowed as _global_fallback_allowed
 from src.utils.user_config import SERVICE_ENABLE_KEYS
+from src.utils.kosync_url import is_builtin_kosync_url
 
 from src.utils.config_loader import ConfigLoader, KNOWN_SETTING_KEYS, env_truthy
 from src.utils.cache_paths import safe_cache_path, safe_library_path, is_plain_basename
-from src.utils.ebook_utils import LRUCache
+from src.utils.ebook_utils import (
+    LINKABLE_EBOOK_EXTENSIONS,
+    LRUCache,
+    is_comic_ebook_filename,
+    is_linkable_ebook_filename,
+)
 from src.utils.ebook_sources import is_grimmory_source, local_ebook_filename, normalize_ebook_source
 from src.utils.logging_utils import memory_log_handler, LOG_PATH
 from src.utils.logging_utils import sanitize_log_data
 from src.utils.logging_utils import get_persistent_condition_logger
 from src.services.diagnostics import setup_diagnostics_logging
+from src.services.aligned_shelf import defer_shelf_add, shelf_add_waits_for_alignment
 from src.services import whats_new
 from src.api.api_clients import ABS_DISABLED_SENTINEL, is_abs_disabled_value
 from src.api.kosync_server import kosync_sync_bp, kosync_admin_bp, init_kosync_server, signal_manifest_rebuild
+from src.api.admin_api import admin_api_bp, init_admin_api
 from src.api.hardcover_routes import hardcover_bp, init_hardcover_routes
 from src.api.storygraph_routes import storygraph_bp, init_storygraph_routes
 from src.api.bookfusion_upload_client import extract_epub_metadata, _S3_TIMEOUT_LARGE
@@ -62,6 +71,7 @@ from src.services.readalong_delivery import (
     resolve_audiobook_folder,
     remove_readalong_epub as _remove_readalong_epub_file,
     _readalong_filename,
+    is_generated_readalong_epub,
 )
 from src.utils.kosync_headers import kosync_request_kwargs
 from src.utils.series_metadata import (
@@ -91,6 +101,7 @@ def _reconfigure_logging():
 container = None
 manager = None
 database_service = None
+abs_socket_manager = None
 SUGGESTIONS_SCAN_JOBS = {}
 SUGGESTIONS_SCAN_JOBS_LOCK = threading.Lock()
 SUGGESTIONS_SCAN_JOB_TTL_SECONDS = 3600
@@ -101,7 +112,7 @@ SUGGESTIONS_STATE_TTL_SECONDS = 86400
 # APP_VERSION the "what's new" banner/page was shown/dismissed for.
 WHATS_NEW_SEEN_KEY = "WHATS_NEW_SEEN_VERSION"
 SUGGESTIONS_CACHE_FILE_NAME = "suggestions_scan_cache.json"
-SUGGESTIONS_CACHE_LOCK = threading.Lock()
+SUGGESTIONS_CACHE_LOCK = threading.RLock()
 # Batch-match queue lives on disk (under DATA_DIR) instead of the Flask session cookie:
 # the cookie caps at ~4KB (~a dozen items) and is per-browser; the file store is
 # unbounded, survives container rebuilds, and is shared across the admin's tabs.
@@ -431,6 +442,13 @@ def setup_dependencies(app, test_container=None):
     app.register_blueprint(hardcover_bp)
     init_storygraph_routes(database_service, container)
     app.register_blueprint(storygraph_bp)
+
+    # Token-authenticated admin API (disabled unless ADMIN_API_TOKEN is set)
+    init_admin_api(
+        database_service, _share_library_with_new_user, _after_user_integrations_saved,
+        _after_user_account_changed, on_user_enabled=_share_library_with_returning_user,
+    )
+    app.register_blueprint(admin_api_bp)
 
     logger.info(f"🚀 Web server dependencies initialized (DATA_DIR={DATA_DIR})")
 
@@ -796,6 +814,8 @@ def require_login_guard():
     if endpoint in _AUTH_EXEMPT_ENDPOINTS:
         return None
     if request.blueprint == 'kosync':  # device sync API — own auth
+        return None
+    if request.blueprint == 'admin_api':  # bearer-token admin API, own auth
         return None
     user = current_user()
     if user is None:
@@ -1277,28 +1297,26 @@ def _apply_user_integrations(user_id):
     libraries.
     """
     from src.utils.user_config import PER_USER_FIELD_GROUPS
+    values = {}
     for _group, fields in PER_USER_FIELD_GROUPS:
         for key, _label, ftype in fields:
             if ftype == 'bool':
-                database_service.set_user_credential(user_id, key, 'true' if key in request.form else 'false')
+                values[key] = 'true' if key in request.form else 'false'
             elif ftype == 'secret':
                 submitted = request.form.get(key, '')
                 if submitted:  # blank => keep existing secret
-                    database_service.set_user_credential(user_id, key, submitted)
+                    values[key] = submitted
             else:  # text/select: blank clears => inherit master/default
-                database_service.set_user_credential(user_id, key, request.form.get(key, ''))
+                values[key] = request.form.get(key, '')
 
-    # A newly-entered Readest password belongs to a (possibly different) account,
-    # so any cached Supabase tokens are stale — drop them so the next sync logs in
-    # fresh with the new credentials rather than refreshing the old session.
-    if request.form.get('READEST_PASSWORD'):
-        for _tok in ('READEST_ACCESS_TOKEN', 'READEST_REFRESH_TOKEN', 'READEST_TOKEN_EXPIRES_AT'):
-            database_service.set_user_credential(user_id, _tok, '')
+    database_service.set_user_credentials(user_id, values)
+    _after_user_integrations_saved(user_id)
 
-    try:
-        container.user_client_registry().invalidate(user_id)
-    except Exception as e:
-        logger.debug("Could not invalidate client bundle for user %s: %s", user_id, e)
+
+def _after_user_integrations_saved(user_id):
+    """Refresh a user's cached clients after their integrations change, and mirror
+    the primary admin's library-lookup creds to the global settings."""
+    _invalidate_user_clients(user_id)
 
     # Keep the engine's global config in sync with the primary admin's account.
     # The global singletons (shelf-watch, library scans, suggestions, the global
@@ -1318,6 +1336,13 @@ def _apply_user_integrations(user_id):
             if val or (val == '' and key in {'ABS_LIBRARY_ID', 'BOOKLORE_LIBRARY_ID'}):
                 database_service.set_setting(key, val)
                 os.environ[key] = val
+
+    # The user's ABS Socket.IO listener authenticates with their own key, so a
+    # new or rotated key has to reach it: reconnect a running listener, or start
+    # one for an account that only now has a key. This runs after the mirror
+    # above so the primary admin's token still matches the global key and is
+    # not given a second, per-user listener.
+    _refresh_user_abs_listener(user_id)
 
 
 @admin_required
@@ -1528,6 +1553,58 @@ def account_booklore_libraries():
 _USER_ADMIN_ACTIONS = {'create', 'reset_password', 'toggle_active', 'set_role', 'delete', 'share_library'}
 
 
+
+def _invalidate_user_clients(user_id: int) -> None:
+    """Refresh cached credentials and access policy after a user's account changes."""
+    try:
+        container.user_client_registry().invalidate(user_id)
+    except Exception as e:
+        logger.debug("Could not invalidate client bundle for user %s: %s", user_id, e)
+
+
+def _refresh_user_abs_listener(user_id: int) -> None:
+    """Re-evaluate the user's ABS Socket.IO listener after their account or credentials changed."""
+    if abs_socket_manager is None:
+        return
+    try:
+        abs_socket_manager.refresh_user(user_id)
+    except Exception as e:
+        logger.warning("Could not refresh the ABS listener for user %s: %s", user_id, e, exc_info=True)
+
+
+def _after_user_account_changed(user_id: int) -> None:
+    """Apply an enable/disable/role change: refresh cached clients and the user's ABS listener."""
+    _invalidate_user_clients(user_id)
+    _refresh_user_abs_listener(user_id)
+
+
+def _share_library_with_new_user(new_user, returning: bool = False) -> int:
+    """With share-all-books on, a new or re-enabled account starts with the whole
+    library rather than only books matched from now on. Returns the number of
+    books shared."""
+    if not env_truthy('SHARE_ALL_BOOKS_WITH_ALL_USERS'):
+        return 0
+    kind = "re-enabled" if returning else "new"
+    try:
+        linked = database_service.backfill_user_books_for_user(new_user.id)
+        logger.info(
+            "🔗 Shared %d existing book(s) with %s user '%s' (share-all-books enabled)",
+            linked, kind, sanitize_log_data(new_user.username),
+        )
+        return linked
+    except Exception as share_err:
+        logger.warning(
+            "Could not backfill shared books for %s user '%s': %s",
+            kind, sanitize_log_data(new_user.username), share_err, exc_info=True,
+        )
+        return 0
+
+
+def _share_library_with_returning_user(user) -> int:
+    """Share-on-enable for an account that already existed."""
+    return _share_library_with_new_user(user, returning=True)
+
+
 def _apply_user_admin_action(form):
     """Handle a single user-management action (create/reset/toggle/delete).
 
@@ -1535,9 +1612,6 @@ def _apply_user_admin_action(form):
     Returns (message, error)."""
     message = None
     error = None
-
-    def _active_admin_count():
-        return sum(1 for u in database_service.list_users() if u.role == 'admin' and u.active)
 
     action = form.get('action')
     try:
@@ -1552,23 +1626,9 @@ def _apply_user_admin_action(form):
             else:
                 new_user = database_service.create_user(username, password, role=role)
                 message = f"Created user '{username}'"
-                # Share-all-books is about the household seeing one library, so a
-                # new account starts with everything rather than only books matched
-                # from now on.
-                if env_truthy('SHARE_ALL_BOOKS_WITH_ALL_USERS'):
-                    try:
-                        linked = database_service.backfill_user_books_for_user(new_user.id)
-                        logger.info(
-                            "🔗 Shared %d existing book(s) with new user '%s' (share-all-books enabled)",
-                            linked, sanitize_log_data(username),
-                        )
-                        if linked:
-                            message = f"Created user '{username}' and shared {linked} book(s)"
-                    except Exception as share_err:
-                        logger.warning(
-                            "Could not backfill shared books for new user '%s': %s",
-                            sanitize_log_data(username), share_err, exc_info=True,
-                        )
+                linked = _share_library_with_new_user(new_user)
+                if linked:
+                    message = f"Created user '{username}' and shared {linked} book(s)"
         elif action == 'reset_password':
             uid = int(form.get('user_id'))
             new_pw = form.get('password') or ''
@@ -1582,15 +1642,17 @@ def _apply_user_admin_action(form):
             target = database_service.get_user(uid)
             if target:
                 disabling = bool(target.active)
-                if disabling and target.role == 'admin' and _active_admin_count() <= 1:
-                    error = "Can't disable the last active admin"
+                try:
+                    database_service.update_user_account(uid, active=not disabling)
+                except ValueError as policy_error:
+                    error = str(policy_error)
                 else:
-                    database_service.set_user_active(uid, not target.active)
-                    try:
-                        container.user_client_registry().invalidate(uid)
-                    except Exception:
-                        pass
+                    _after_user_account_changed(uid)
                     message = f"{'Disabled' if disabling else 'Enabled'} '{target.username}'"
+                    if not disabling:
+                        linked = _share_library_with_returning_user(target)
+                        if linked:
+                            message = f"Enabled '{target.username}' and shared {linked} book(s)"
         elif action == 'set_role':
             uid = int(form.get('user_id'))
             new_role = (form.get('role') or '').strip().lower()
@@ -1602,32 +1664,26 @@ def _apply_user_admin_action(form):
                 error = "Invalid role"
             elif target.role == new_role:
                 error = f"'{target.username}' is already {new_role}"
-            elif demoting and database_service.is_primary_admin(uid):
-                # The global service settings are this account mirrored outward
-                # (ENGINE_MIRROR_KEYS) and it owns un-scoped rows, so demoting it
-                # would leave the engine authenticating as a regular user.
-                error = "Can't demote the primary admin — the global service settings belong to that account"
-            elif demoting and _active_admin_count() <= 1:
-                error = "Can't demote the last active admin"
             else:
-                database_service.set_user_role(uid, new_role)
-                # The cached client bundle carries the global-fallback flag, which
-                # this change flips.
                 try:
-                    container.user_client_registry().invalidate(uid)
-                except Exception:
-                    pass
-                logger.info(
-                    "👤 Role change: '%s' is now '%s'",
-                    sanitize_log_data(target.username), new_role,
-                )
-                if demoting:
-                    message = f"'{target.username}' is now a regular user"
+                    database_service.update_user_account(uid, role=new_role)
+                except ValueError as policy_error:
+                    error = str(policy_error)
                 else:
-                    message = (
-                        f"'{target.username}' is now an admin. They still use their own "
-                        f"service logins — set them under Integrations."
+                    # The cached client bundle carries the global-fallback flag, which
+                    # this change flips.
+                    _after_user_account_changed(uid)
+                    logger.info(
+                        "👤 Role change: '%s' is now '%s'",
+                        sanitize_log_data(target.username), new_role,
                     )
+                    if demoting:
+                        message = f"'{target.username}' is now a regular user"
+                    else:
+                        message = (
+                            f"'{target.username}' is now an admin. They still use their own "
+                            f"service logins — set them under Integrations."
+                        )
         elif action == 'delete':
             uid = int(form.get('user_id'))
             target = database_service.get_user(uid)
@@ -1635,18 +1691,20 @@ def _apply_user_admin_action(form):
                 error = "User not found"
             elif uid == current_user().id:
                 error = "You can't delete your own account"
-            elif target.role == 'admin' and _active_admin_count() <= 1:
-                error = "Can't delete the last active admin"
             else:
-                if database_service.delete_user(uid):
-                    _clear_match_queue_for_user_id(uid)
-                    try:
-                        container.user_client_registry().invalidate(uid)
-                    except Exception:
-                        pass
-                    message = f"Deleted '{target.username}'"
+                try:
+                    deleted = database_service.delete_user(uid)
+                except ValueError as policy_error:
+                    error = str(policy_error)
                 else:
-                    error = "User not found"
+                    if deleted:
+                        _clear_match_queue_for_user_id(uid)
+                        _invalidate_user_clients(uid)
+                        if abs_socket_manager is not None:
+                            abs_socket_manager.stop_user(uid)
+                        message = f"Deleted '{target.username}'"
+                    else:
+                        error = "User not found"
         elif action == 'share_library':
             if not env_truthy('SHARE_ALL_BOOKS_WITH_ALL_USERS'):
                 error = "Enable Features → Shared Library first, then share the existing catalog."
@@ -1830,17 +1888,132 @@ def _run_diagnostics_send(
     )
 
 
+KOSYNC_MIRRORED_LOGIN_KEY = "KOSYNC_MIRRORED_LOGIN"
+
+
+def _kosync_login_fingerprint(username, password):
+    return hashlib.sha256(f"{username}\0{password}".encode("utf-8")).hexdigest()
+
+
+def _mirror_kosync_login(user, registry, holders):
+    client = registry.get_clients(user.id).booklore_client
+    if not client.is_configured():
+        return False
+    login = client.get_koreader_sync_login()
+    if not login:
+        return False
+    username, password = login
+    conditions = get_persistent_condition_logger()
+    reader = sanitize_log_data(user.username)
+
+    collision_key = f"kosync_login_mirror_collision:{user.id}"
+    holder = holders.get(username.lower())
+    if holder is not None and holder.id != user.id:
+        conditions.warn(
+            logger, collision_key,
+            "⚠️ KoSync login for '%s' not taken from Grimmory: the username '%s' already belongs to '%s'",
+            reader, sanitize_log_data(username), sanitize_log_data(holder.username),
+        )
+        return False
+    conditions.resolve(logger, collision_key, "KoSync username for '%s' no longer belongs to another user", reader)
+
+    creds = database_service.get_user_credentials(user.id)
+    stored_user = creds.get("KOSYNC_USER") or ""
+    stored_key = creds.get("KOSYNC_KEY") or ""
+    mirrored = creds.get(KOSYNC_MIRRORED_LOGIN_KEY)
+    own_login_key = f"kosync_login_mirror_kept:{user.id}"
+    if (
+        stored_user and stored_key
+        and (stored_user, stored_key) != (username, password)
+        and mirrored != _kosync_login_fingerprint(stored_user, stored_key)
+    ):
+        conditions.warn(
+            logger, own_login_key,
+            "⚠️ KoSync login for '%s' was set in BookBridge and is kept; clear their KoSync username "
+            "to take the login from Grimmory",
+            reader,
+        )
+        return False
+    conditions.resolve(logger, own_login_key, "KoSync login for '%s' now follows Grimmory", reader)
+
+    changed = []
+    if stored_user != username:
+        changed.append("username")
+    if stored_key != password:
+        changed.append("password")
+    fingerprint = _kosync_login_fingerprint(username, password)
+    if changed or mirrored != fingerprint:
+        database_service.set_user_credentials(user.id, {
+            "KOSYNC_USER": username,
+            "KOSYNC_KEY": password,
+            KOSYNC_MIRRORED_LOGIN_KEY: fingerprint,
+        })
+    if not changed:
+        return False
+    registry.invalidate(user.id)
+    holders[username.lower()] = user
+    logger.info("🔑 KoSync login for '%s' taken from Grimmory (%s)", reader, ", ".join(changed))
+    return True
+
+
+def _mirror_kosync_logins_from_grimmory():
+    if not env_truthy('KOSYNC_CREDENTIALS_FROM_GRIMMORY') or database_service is None:
+        return
+    conditions = get_persistent_condition_logger()
+    try:
+        registry = container.user_client_registry()
+        users = database_service.list_users()
+        holders = {}
+        for user in users:
+            name = (database_service.get_user_credentials(user.id).get("KOSYNC_USER") or "").lower()
+            if name:
+                holders.setdefault(name, user)
+        global_name = os.environ.get("KOSYNC_USER", "").lower()
+        default_user_id = database_service._default_user_id()
+        default_user = next((user for user in users if user.id == default_user_id), None)
+        if global_name and default_user is not None:
+            holders.setdefault(global_name, default_user)
+    except Exception as e:
+        conditions.warn(
+            logger, "kosync_login_mirror", "KoSync login mirror: could not list users: %s", e, exc_info=True,
+        )
+        return
+    conditions.resolve(logger, "kosync_login_mirror", "KoSync login mirror: users listed again")
+
+    updated = 0
+    for user in users:
+        if not user.active:
+            continue
+        failure_key = f"kosync_login_mirror:{user.id}"
+        try:
+            if _mirror_kosync_login(user, registry, holders):
+                updated += 1
+        except Exception as e:
+            conditions.warn(
+                logger, failure_key, "KoSync login mirror failed for user %s: %s", user.id, e, exc_info=True,
+            )
+        else:
+            conditions.resolve(logger, failure_key, "KoSync login mirror works again for user %s", user.id)
+    return updated
+
+
 def sync_daemon():
     """Background sync daemon running in a separate thread."""
     try:
         # Setup schedule for sync operations
         # Use the global SYNC_PERIOD_MINS which is validated
         schedule.every(int(SYNC_PERIOD_MINS)).minutes.do(manager.run_sync_for_all_users)
+        schedule.every(int(SYNC_PERIOD_MINS)).minutes.do(_mirror_kosync_logins_from_grimmory)
         schedule.every(1).minutes.do(manager.check_pending_jobs)
+        schedule.every(1).minutes.do(_suggestions_auto_scan_tick)
         schedule.every(1).minutes.do(manager.flush_reading_sessions_for_all_users)
+        schedule.every(int(SYNC_PERIOD_MINS)).minutes.do(_reconcile_aligned_shelf)
         schedule.every(1).hours.do(_run_diagnostics_send)
+        schedule.every(int(SYNC_PERIOD_MINS)).minutes.do(_reconcile_abs_collection)
 
         logger.info(f"🔄 Sync daemon started (period: {SYNC_PERIOD_MINS} minutes)")
+
+        _mirror_kosync_logins_from_grimmory()
 
         # Run initial sync cycle (per user)
         try:
@@ -1848,11 +2021,15 @@ def sync_daemon():
         except Exception as e:
             logger.error(f"❌ Initial sync cycle failed: {e}", exc_info=True)
 
+        _reconcile_aligned_shelf()
+
         # Catch-up diagnostics send on startup (24h guard inside is a no-op when not due)
         try:
             _run_diagnostics_send()
         except Exception:
             pass
+
+        _reconcile_abs_collection()
 
         # Main daemon loop
         while True:
@@ -1866,6 +2043,67 @@ def sync_daemon():
 
     except Exception as e:
         logger.error(f"❌ Sync daemon crashed: {e}", exc_info=True)
+
+
+def _is_abs_audio_book(book):
+    if (book.sync_mode or '') == 'ebook_only':
+        return False
+    if (book.audio_source or 'ABS').strip().lower() != 'abs':
+        return False
+    return not str(book.abs_id).startswith(('booklore:', 'bookorbit:', 'ebook-'))
+
+
+def _reconcile_abs_collection():
+    if not env_truthy('ABS_COLLECTION_RECONCILE') or database_service is None:
+        return
+    conditions = get_persistent_condition_logger()
+    try:
+        default_owner = database_service._default_user_id()
+        by_owner = {}
+        for book in database_service.get_books_by_status('active'):
+            if _is_abs_audio_book(book):
+                by_owner.setdefault(book.user_id or default_owner, []).append(book.abs_id)
+        registry = container.user_client_registry()
+    except Exception as e:
+        conditions.warn(
+            logger, "abs_collection_reconcile", "ABS collection reconcile failed: %s", e, exc_info=True,
+        )
+        return
+    conditions.resolve(logger, "abs_collection_reconcile", "ABS collection reconcile resumed")
+    added = 0
+    for owner, item_ids in by_owner.items():
+        if owner is None:
+            continue
+        try:
+            bundle = registry.get_clients(owner)
+            if not bundle.abs_client.is_configured():
+                continue
+            collection = resolve_setting(bundle.credentials, "ABS_COLLECTION_NAME", "Synced with KOReader")
+            count, refused = bundle.abs_client.add_missing_to_collection(item_ids, collection)
+        except Exception as e:
+            conditions.warn(
+                logger, f"abs_collection_reconcile:{owner}",
+                "ABS collection reconcile failed for user %s: %s", owner, e, exc_info=True,
+            )
+            continue
+        conditions.resolve(
+            logger, f"abs_collection_reconcile:{owner}", "ABS collection reconcile resumed for user %s", owner,
+        )
+        added += count
+        refused_key = f"abs_collection_refused:{owner}:{collection}"
+        if refused:
+            conditions.warn(
+                logger, refused_key,
+                "ABS collection '%s' of user %s is missing %d matched audiobook(s) that could not be added: %s",
+                collection, owner, len(refused), refused[0],
+            )
+        else:
+            conditions.resolve(
+                logger, refused_key, "ABS collection '%s' of user %s is complete again", collection, owner,
+            )
+    if added:
+        logger.info("🏷️ ABS collection reconcile added %d matched audiobook(s)", added)
+    return added
 
 
 # ---------------- ORIGINAL ABS-KOSYNC HELPERS ----------------
@@ -2116,7 +2354,92 @@ def _is_abs_hosted_ebook_filename(filename) -> bool:
         return False
     return "_abs." in filename
 
-def _shelve_matched_ebook(shelf_filename, ebook_source=None, ebook_source_id=None):
+
+def _aligned_shelf_target(user_id):
+    client, shelf, _ = _aligned_shelf_assignment(user_id)
+    return client, shelf
+
+
+def _aligned_shelf_assignment(user_id):
+    global_shelf = (os.environ.get('BOOKLORE_SHELF_NAME') or 'Kobo').strip()
+    owner = (os.environ.get('BOOKLORE_SHELF_OWNER') or '').strip()
+    if owner:
+        user = database_service.get_user_by_username(owner)
+        if user is None or not user.active:
+            get_persistent_condition_logger().warn(
+                logger,
+                "grimmory_shelf_owner_inactive",
+                "⚠️ Grimmory shelf owner '%s' is not an active BookBridge user — "
+                "the shelf is left alone until it is",
+                sanitize_log_data(owner),
+            )
+            return None, None, None
+        get_persistent_condition_logger().resolve(
+            logger,
+            "grimmory_shelf_owner_inactive",
+            "✅ Grimmory shelf owner '%s' is an active BookBridge user again",
+            sanitize_log_data(owner),
+        )
+        return container.user_client_registry().get_clients(user.id).booklore_client, global_shelf, user.id
+    if user_id is None:
+        return _global_clients.booklore_client, global_shelf, None
+    bundle = container.user_client_registry().get_clients(user_id)
+    return (bundle.booklore_client,
+            resolve_setting(bundle.credentials, 'BOOKLORE_SHELF_NAME', 'Kobo'), user_id)
+
+
+def _reconcile_aligned_shelf():
+    if database_service is None:
+        return
+    try:
+        pending = database_service.get_pending_shelf_adds()
+        if not pending:
+            get_persistent_condition_logger().resolve(
+                logger, "aligned_shelf_reconcile", "Aligned-shelf reconcile recovered"
+            )
+            return
+        required = env_truthy('BOOKLORE_SHELF_REQUIRE_ALIGNMENT')
+        aligned = database_service.get_readalong_alignment_book_ids() if required else set()
+        users = {user.id: user for user in database_service.list_users()}
+        added = 0
+        for abs_id, user_id in pending:
+            if required and abs_id not in aligned:
+                continue
+            book = database_service.get_book(abs_id)
+            reader = users.get(user_id)
+            if (
+                book is None
+                or not is_grimmory_source(book.ebook_source)
+                or not book.ebook_source_id
+                or (user_id is not None and reader is None)
+            ):
+                database_service.remove_pending_shelf_adds(abs_id, user_id)
+                continue
+            if (required and book.status != 'active') or (reader is not None and not reader.active):
+                continue
+            client, shelf, target_user_id = _aligned_shelf_assignment(user_id)
+            if client is None or not client.is_configured():
+                continue
+            if client.add_book_id_to_shelf(book.ebook_source_id, shelf):
+                database_service.record_shelf_assignment(
+                    abs_id, user_id, target_user_id, shelf, book.ebook_source_id
+                )
+                database_service.remove_pending_shelf_adds(abs_id, user_id)
+                added += 1
+                logger.info("🏷️ '%s' added to Grimmory shelf '%s'",
+                            sanitize_log_data(book.abs_title or book.abs_id), shelf)
+        get_persistent_condition_logger().resolve(
+            logger, "aligned_shelf_reconcile", "Aligned-shelf reconcile recovered"
+        )
+        return added
+    except Exception as e:
+        get_persistent_condition_logger().warn(
+            logger, "aligned_shelf_reconcile",
+            "Aligned-shelf reconcile failed: %s", e, exc_info=True,
+        )
+
+
+def _shelve_matched_ebook(shelf_filename, ebook_source=None, ebook_source_id=None, book=None):
     """Add a newly matched ebook to the Kobo shelf and clear it from the
     shelf-watch "Up Next" shelf, on whichever library hosts the ebook.
 
@@ -2178,6 +2501,8 @@ def _shelve_matched_ebook(shelf_filename, ebook_source=None, ebook_source_id=Non
     try:
         if use_id:
             added = client.add_book_id_to_shelf(ebook_source_id, kobo_shelf)
+        elif defer_shelf_add(database_service, book, get_current_user_id()):
+            added = True
         else:
             added = client.add_to_shelf(shelf_filename, kobo_shelf)
     except Exception as e:
@@ -2223,6 +2548,7 @@ def _shelve_saved_ebook(book) -> None:
         shelf_filename,
         getattr(book, 'ebook_source', None),
         getattr(book, 'ebook_source_id', None),
+        book=book,
     )
     _spawn_user_background(_publish_saved_ebook_to_readest, book, label="Readest upload")
 
@@ -2329,6 +2655,13 @@ def _download_storyteller_artifact(storyteller_uuid, abs_title=None, *, original
     if downloaded:
         return artifact_filename, target_path
 
+    if target_path.exists():
+        # This uuid's own earlier artifact (downloads are staged and swapped in, so
+        # a failed one never leaves a partial file). The title-matched local copy
+        # below must never replace it: the title comes from the caller.
+        logger.warning(f"Storyteller local fallback used: '{target_path}'")
+        return artifact_filename, target_path
+
     st_lib = Path(os.environ.get("STORYTELLER_LIBRARY_DIR", "/storyteller_library"))
     if abs_title and st_lib.exists():
         for child in st_lib.iterdir():
@@ -2362,6 +2695,59 @@ def _resolve_abs_chapters_for_storyteller_ingest(book):
     if not item_details:
         return []
     return item_details.get("media", {}).get("chapters", []) or []
+
+
+def _mapping_identity_changes(
+    target_book,
+    *,
+    kosync_doc_id=None,
+    ebook_filename=None,
+    audio_source_id=None,
+    storyteller_uuid=None,
+    ebook_source=None,
+    ebook_source_id=None,
+) -> tuple[list, bool]:
+    """Which pairing fields a re-match would change on ``target_book``.
+
+    Returns ``(changed, same_stable_ebook)``. A field going from empty to populated
+    is not a change. Shared by the status guard below and the cross-user guard.
+    """
+    existing_source = _normalize_text_source_type(getattr(target_book, "ebook_source", None))
+    next_source = _normalize_text_source_type(ebook_source) if ebook_source is not None else existing_source
+    existing_source_id = str(getattr(target_book, "ebook_source_id", None) or "").strip()
+    next_source_id = str(ebook_source_id or "").strip()
+    same_stable_ebook = bool(
+        existing_source
+        and next_source
+        and existing_source.lower() == next_source.lower()
+        and existing_source_id
+        and next_source_id
+        and existing_source_id == next_source_id
+    )
+
+    candidates = (
+        ("kosync_doc_id", kosync_doc_id),
+        ("ebook_filename", None if same_stable_ebook else ebook_filename),
+        ("audio_source_id", audio_source_id),
+        ("storyteller_uuid", storyteller_uuid),
+        ("ebook_source_id", ebook_source_id),
+    )
+
+    changed = []
+    for attr, new_value in candidates:
+        if new_value is None:
+            continue
+        existing = getattr(target_book, attr, None)
+        # Only a value that actually differs counts. A field going from empty to
+        # populated is deliberately NOT a change: legacy rows have blanks that get
+        # backfilled with the same effective pairing, and treating that as a re-map
+        # would re-transcribe books this guard exists to spare.
+        if existing and str(existing) != str(new_value):
+            changed.append(attr)
+
+    if ebook_source is not None and existing_source and existing_source.lower() != next_source.lower():
+        changed.append("ebook_source")
+    return changed, same_stable_ebook
 
 
 def _preserve_or_reset_mapping_status(
@@ -2398,41 +2784,15 @@ def _preserve_or_reset_mapping_status(
     # readalong uuid and the ebook source id are as much a part of the pairing as
     # the filename — swapping a book to a different Storyteller readalong changes
     # the audio the map was built against.
-    existing_source = _normalize_text_source_type(getattr(target_book, "ebook_source", None))
-    next_source = _normalize_text_source_type(ebook_source) if ebook_source is not None else existing_source
-    existing_source_id = str(getattr(target_book, "ebook_source_id", None) or "").strip()
-    next_source_id = str(ebook_source_id or "").strip()
-    same_stable_ebook = bool(
-        existing_source
-        and next_source
-        and existing_source.lower() == next_source.lower()
-        and existing_source_id
-        and next_source_id
-        and existing_source_id == next_source_id
+    changed, same_stable_ebook = _mapping_identity_changes(
+        target_book,
+        kosync_doc_id=kosync_doc_id,
+        ebook_filename=ebook_filename,
+        audio_source_id=audio_source_id,
+        storyteller_uuid=storyteller_uuid,
+        ebook_source=ebook_source,
+        ebook_source_id=ebook_source_id,
     )
-
-    candidates = (
-        ("kosync_doc_id", kosync_doc_id),
-        ("ebook_filename", None if same_stable_ebook else ebook_filename),
-        ("audio_source_id", audio_source_id),
-        ("storyteller_uuid", storyteller_uuid),
-        ("ebook_source_id", ebook_source_id),
-    )
-
-    changed = []
-    for attr, new_value in candidates:
-        if new_value is None:
-            continue
-        existing = getattr(target_book, attr, None)
-        # Only a value that actually differs counts. A field going from empty to
-        # populated is deliberately NOT a change: legacy rows have blanks that get
-        # backfilled with the same effective pairing, and treating that as a re-map
-        # would re-transcribe books this guard exists to spare.
-        if existing and str(existing) != str(new_value):
-            changed.append(attr)
-
-    if ebook_source is not None and existing_source and existing_source.lower() != next_source.lower():
-        changed.append("ebook_source")
 
     if same_stable_ebook and not changed:
         logger.info(
@@ -2694,6 +3054,21 @@ def _upsert_storyteller_mapping(
 
     if not target_book:
         return None, "Book not found", 404
+
+    if not _may_absorb_mapping(migration_source_id):
+        return None, _FOREIGN_MAPPING_MESSAGE, 403
+    access = _existing_mapping_access(
+        None if created_ebook_only else target_book,
+        kosync_doc_id=kosync_doc_id,
+        ebook_filename=resolved_ebook_filename,
+        storyteller_uuid=selected_storyteller_uuid,
+        ebook_source=selected_ebook_source,
+        ebook_source_id=selected_ebook_source_id,
+    )
+    if access == "join":
+        return target_book, None, None
+    if access == "deny":
+        return None, _FOREIGN_MAPPING_MESSAGE, 403
 
     _preserve_or_reset_mapping_status(
         target_book,
@@ -3098,6 +3473,7 @@ def get_suggestion_audiobooks():
                 "audio_source": audio_source,
                 "audio_source_id": source_id,
                 "audio_title": title,
+                "audio_subtitle": (item.subtitle or "").strip(),
                 "audio_author": author,
                 "audio_language": item.language or "",
                 "audio_duration": item.duration,
@@ -3132,7 +3508,11 @@ def _build_local_ebook_title_index():
     index = {}
     try:
         if EBOOK_DIR.exists():
-            for eb in EBOOK_DIR.glob("**/*.epub"):
+            for eb in EBOOK_DIR.rglob('*'):
+                if eb.suffix.lower() not in LINKABLE_EBOOK_EXTENSIONS or not eb.is_file():
+                    continue
+                if is_generated_readalong_epub(eb.name):
+                    continue
                 stem = eb.stem
                 title_part = stem.split(" - ", 1)[0]
                 for key in (_ebook_title_key(title_part), _ebook_title_key(stem)):
@@ -3164,7 +3544,7 @@ def get_searchable_ebooks(search_term):
             if books:
                 for b in books:
                     fname = b.get('fileName', '')
-                    if fname.lower().endswith('.epub'):
+                    if is_linkable_ebook_filename(fname):
                         found_filenames.add(fname.lower())
                         found_stems.add(Path(fname).stem.lower())
                         results.append(EbookResult(
@@ -3197,7 +3577,7 @@ def get_searchable_ebooks(search_term):
                 fname = b.get('fileName') or ''
                 if not fname and local_index is not None:
                     fname = local_index.get(_ebook_title_key(b.get('title'))) or ''
-                if not fname.lower().endswith('.epub'):
+                if not is_linkable_ebook_filename(fname):
                     continue
                 if fname.lower() in found_filenames:
                     continue
@@ -3255,7 +3635,7 @@ def get_searchable_ebooks(search_term):
             )
             for book in kavita_books or []:
                 filename = book.get('fileName') or book.get('filename') or ''
-                if not filename.lower().endswith('.epub'):
+                if not is_linkable_ebook_filename(filename):
                     continue
                 if filename.lower() in found_filenames:
                     continue
@@ -3344,8 +3724,12 @@ def get_searchable_ebooks(search_term):
     # 4. Search filesystem (Local) - LOW PRIORITY
     if EBOOK_DIR.exists():
         try:
-            all_epubs = list(EBOOK_DIR.glob("**/*.epub"))
-            for eb in all_epubs:
+            all_ebooks = [
+                eb for eb in EBOOK_DIR.rglob('*')
+                if eb.suffix.lower() in LINKABLE_EBOOK_EXTENSIONS and eb.is_file()
+                and not is_generated_readalong_epub(eb.name)
+            ]
+            for eb in all_ebooks:
                 fname_lower = eb.name.lower()
                 stem_lower = eb.stem.lower()
 
@@ -3533,6 +3917,30 @@ def _parse_audio_duration(raw_value):
         return None
 
 
+def _set_bookorbit_link_for_current_user(book, audio_source) -> None:
+    """Point the acting user's BookOrbit link at ``book``.
+
+    The per-user link outranks the book row in the BookOrbit resolvers, so a link
+    created audio-only (e.g. by shelf-watch) hides the ebook until it is refreshed
+    here, and a reader joining a shared book has no usable BookOrbit id without one.
+    """
+    user_id = get_current_user_id()
+    if user_id is not None and "BookOrbit" in (audio_source, book.ebook_source):
+        try:
+            database_service.set_user_bookorbit_link(
+                user_id,
+                book.abs_id,
+                ebook_id=book.ebook_source_id if book.ebook_source == "BookOrbit" else None,
+                audio_id=book.audio_provider_book_id if audio_source == "BookOrbit" else None,
+                title=book.abs_title,
+            )
+        except Exception as link_err:
+            logger.warning(
+                "Failed to set BookOrbit link for user %s on '%s': %s",
+                user_id, sanitize_log_data(book.abs_id), link_err, exc_info=True,
+            )
+
+
 def _create_or_update_library_audio_mapping(
     *,
     audio_source="BookLore",
@@ -3617,6 +4025,20 @@ def _create_or_update_library_audio_mapping(
     # can return a row whose abs_id is not the bridge key, and re-keying it here would
     # strand the states, annotations and per-user claims filed against the old id.
     # Consolidating a genuine duplicate is `absorb_duplicate_mapping`'s job, below.
+    access = _existing_mapping_access(
+        existing_book,
+        kosync_doc_id=kosync_doc_id,
+        ebook_filename=resolved_ebook_filename,
+        audio_source_id=str(audio_source_id),
+        storyteller_uuid=storyteller_uuid,
+        ebook_source=ebook_source,
+        ebook_source_id=ebook_source_id,
+    )
+    if access == "join":
+        _set_bookorbit_link_for_current_user(existing_book, audio_source)
+        return existing_book, None, None
+    if access == "deny":
+        return None, _FOREIGN_MAPPING_MESSAGE, 403
     target_book = existing_book or Book(abs_id=bridge_key, sync_mode="audiobook")
     target_book.abs_title = audio_title or target_book.abs_title or bridge_key
     _preserve_or_reset_mapping_status(
@@ -3682,6 +4104,9 @@ def _create_or_update_library_audio_mapping(
                 sanitize_log_data(target_book.abs_title), series_err, exc_info=True,
             )
 
+    if not _may_absorb_mapping(database_service.find_duplicate_mapping(target_book)):
+        return None, _FOREIGN_MAPPING_MESSAGE, 403
+
     saved_book = database_service.save_book(target_book)
 
     # An ebook-only mapping for this same ebook may already exist -- adding an
@@ -3689,6 +4114,8 @@ def _create_or_update_library_audio_mapping(
     # this, both rows survive and only one can own the KOSync document hash, so the
     # loser is served to devices but can never receive progress.
     database_service.absorb_duplicate_mapping(saved_book)
+
+    _set_bookorbit_link_for_current_user(saved_book, audio_source)
 
     if uc().storyteller_client.is_configured() and saved_book.storyteller_uuid:
         try:
@@ -3703,6 +4130,7 @@ def _create_or_update_library_audio_mapping(
                 shelf_filename,
                 ebook_source=saved_book.ebook_source,
                 ebook_source_id=saved_book.ebook_source_id,
+                book=saved_book,
             )
         except Exception as shelf_err:
             logger.warning(f"Failed to shelve matched ebook '{shelf_filename}': {shelf_err}", exc_info=True)
@@ -3747,6 +4175,21 @@ def _create_or_update_audio_only_mapping(
         database_service.get_book(bridge_key)
         or database_service.get_book_by_audio_source(audio_source, audio_source_id)
     )
+
+    if existing_book is not None and not _acting_user_may_modify_book(existing_book.abs_id):
+        # An audio-only re-match strips the text side, so it only leaves another
+        # reader's mapping untouched when that mapping is audio-only already.
+        if getattr(existing_book, "sync_mode", None) == "audiobook_only":
+            logger.info(
+                "🔗 '%s' is already mapped by another reader with the same text — adding it to this reader's library unchanged",
+                sanitize_log_data(existing_book.abs_id),
+            )
+            return existing_book, None, None
+        logger.info(
+            "🔒 Refused to change mapping '%s': it belongs to another reader (%s would change)",
+            sanitize_log_data(existing_book.abs_id), "text source",
+        )
+        return None, _FOREIGN_MAPPING_MESSAGE, 403
 
     clients = uc()
     default_cover = None
@@ -3933,6 +4376,24 @@ def _create_or_update_bookfusion_progress_mapping(
         default_cover = audio_cover_url
         resolved_title = audio_title or bookfusion_title or abs_id
 
+    access = _existing_mapping_access(
+        existing_book,
+        audio_source_id=str(audio_source_id),
+        storyteller_uuid=storyteller_uuid,
+        ebook_source="BookFusion",
+        ebook_source_id=str(bookfusion_id),
+    )
+    if access == "join":
+        _persist_bookfusion_link_for_current_user(
+            existing_book.abs_id,
+            "BookFusion",
+            str(bookfusion_id),
+            title=bookfusion_title or existing_book.abs_title,
+            author=bookfusion_author,
+        )
+        return existing_book, None, None
+    if access == "deny":
+        return None, _FOREIGN_MAPPING_MESSAGE, 403
     target_book = existing_book or Book(abs_id=abs_id, sync_mode="audiobook")
     _preserve_or_reset_mapping_status(
         target_book,
@@ -3985,6 +4446,11 @@ def _create_or_update_bookfusion_progress_mapping(
                 "⚠️ BookFusion tri-link: could not obtain Storyteller artifact '%s' for '%s'",
                 storyteller_uuid, target_book.abs_title,
             )
+
+    if getattr(target_book, "kosync_doc_id", None) and not _may_absorb_mapping(
+        database_service.find_duplicate_mapping(target_book)
+    ):
+        return None, _FOREIGN_MAPPING_MESSAGE, 403
 
     saved_book = database_service.save_book(target_book)
     if not isinstance(getattr(saved_book, "abs_id", None), str):
@@ -4078,6 +4544,7 @@ def settings():
             return redirect(url_for('settings') + '#users')
 
         bool_keys = [
+            'KOSYNC_CREDENTIALS_FROM_GRIMMORY',
             'KOSYNC_USE_PERCENTAGE_FROM_SERVER',
             'KOSYNC_AUTO_MAP_ON_AGREEMENT',
             'KOSYNC_HASH_RECONCILE_ENABLED',
@@ -4106,7 +4573,9 @@ def settings():
             'TELEGRAM_ENABLED',
             'SUGGESTIONS_ENABLED',
             'SUGGESTIONS_AUTO_MATCH_ENABLED',
+            'SUGGESTIONS_FULL_REFRESH_ENABLED',
             'ABS_ONLY_SEARCH_IN_ABS_LIBRARY_ID',
+            'ABS_COLLECTION_RECONCILE',
             'REPROCESS_ON_CLEAR_IF_NO_ALIGNMENT',
             'INSTANT_SYNC_ENABLED',
             'STORYTELLER_POLL_WAIT_FOR_SETTLE',
@@ -4120,6 +4589,7 @@ def settings():
             'STORYTELLER_LISTENING_SESSIONS',
             'STORYTELLER_NO_EPUB_CACHE',
             'BOOKLORE_SHELF_WATCH_ENABLED',
+            'BOOKLORE_SHELF_REQUIRE_ALIGNMENT',
             'BOOKORBIT_ENABLED',
             'BOOKORBIT_READING_SESSIONS',
             'BOOKORBIT_SHELF_WATCH_ENABLED',
@@ -4141,6 +4611,7 @@ def settings():
             'OLLAMA_EBOOK_TEXT_FALLBACK',
             'DIAGNOSTICS_OPT_IN',
             'WHISPER_CPP_SEND_ORIGINAL',
+            'WHISPER_VAD_FILTER',
             'CTC_ENABLED',
             'ALIGNMENT_SEGMENTED_MAPS',
             'CONTENT_MATCH_GUARD',
@@ -4966,7 +5437,7 @@ def _queue_item_shelf_watch_metadata(item: dict) -> "dict | None":
     return None
 
 
-def _complete_shelf_watch_approval(meta: dict, *, remove_only: bool = False) -> bool:
+def _complete_shelf_watch_approval(meta: dict, *, remove_only: bool = False, book=None) -> bool:
     """Finish the recorded shelf-watch move without failing a saved mapping."""
     if not meta:
         return False
@@ -4979,7 +5450,7 @@ def _complete_shelf_watch_approval(meta: dict, *, remove_only: bool = False) -> 
             return False
         if watch_shelf == kobo_shelf:
             return True
-        if remove_only:
+        if remove_only or defer_shelf_add(database_service, book, get_current_user_id()):
             success = library_client.remove_from_shelf(filename, watch_shelf)
             action = f"remove from '{watch_shelf}'"
         else:
@@ -5348,7 +5819,7 @@ def _build_dashboard_mapping(
         "states": {},
     }
 
-    if book.status in ("processing", "forging"):
+    if book.status in ("processing", "forging", "failed_retry_later", "failed_permanent", "error"):
         job = database_service.get_latest_job(book.abs_id, kind=JOB_KIND_ALIGNMENT)
         if job:
             mapping["job_progress"] = round((job.progress or 0.0) * 100, 1)
@@ -6186,7 +6657,7 @@ def forge_search_text():
         local_books_dir = Path(os.environ.get("BOOKS_DIR", "/books"))
         if local_books_dir.exists():
             for epub in local_books_dir.rglob("*.epub"):
-                if "(readaloud)" in epub.name.lower():
+                if "(readaloud)" in epub.name.lower() or is_generated_readalong_epub(epub.name):
                     continue
                 if query_lower in epub.name.lower():
                     key = f"local_{epub.name}"
@@ -6409,6 +6880,12 @@ def match():
         forge_stage_mode = (request.form.get('forge_stage_mode') or '').strip() or None
         ebook_filename = selected_filename
         original_ebook_filename = selected_filename
+        if selected_filename and audio_source and is_comic_ebook_filename(selected_filename):
+            return (
+                "Comic archives (CBZ) cannot be linked to an audiobook: the audio path "
+                "would see empty ebook text. Link the comic as an ebook-only mapping instead.",
+                400,
+            )
         clients = uc()
         if request.form.get('action') == 'forge_match' and not clients.storyteller_client.is_configured():
             return "Storyteller is not configured", 409
@@ -6586,6 +7063,13 @@ def match():
 
             from src.db.models import Book
 
+            forge_target_id = (
+                _build_bridge_key(audio_source, audio_source_id)
+                if audio_source in _LIBRARY_AUDIO_SOURCES else abs_id
+            )
+            if not _may_replace_mapping(forge_target_id):
+                return _FOREIGN_MAPPING_MESSAGE, 403
+
             if audio_source in _LIBRARY_AUDIO_SOURCES:
                 forge_title = audio_title or Path(selected_filename or f"{audio_source.lower()}_{audio_source_id}").stem
                 forge_id = _build_bridge_key(audio_source, audio_source_id)
@@ -6724,6 +7208,21 @@ def match():
 
         # [DUPLICATE MERGE] Check if this ebook is already linked to another ABS ID (e.g. ebook-only entry)
         existing_book = database_service.get_book_by_kosync_id(kosync_doc_id)
+        if existing_book and existing_book.abs_id != abs_id and not _may_absorb_mapping(existing_book.abs_id):
+            return _FOREIGN_MAPPING_MESSAGE, 403
+        access = _existing_mapping_access(
+            current_book_entry,
+            ebook_filename=ebook_filename,
+            audio_source_id=abs_id,
+            storyteller_uuid=storyteller_uuid,
+            ebook_source=ebook_source,
+            ebook_source_id=ebook_source_id,
+        )
+        if access == "deny":
+            return _FOREIGN_MAPPING_MESSAGE, 403
+        if access == "join":
+            _claim_book_for_current_user(abs_id)
+            return redirect(url_for('index'))
         migration_source_id = None
         abs_ebook_item_id = None
         preserved_storyteller_uuid = current_book_entry.storyteller_uuid if current_book_entry else None
@@ -6841,7 +7340,7 @@ def match():
         shelf_filename = original_ebook_filename or ebook_filename
         if shelf_filename and not _is_storyteller_artifact_filename(shelf_filename):
             _shelve_matched_ebook(shelf_filename, getattr(book, "ebook_source", None),
-                                  getattr(book, "ebook_source_id", None))
+                                  getattr(book, "ebook_source_id", None), book=book)
         if clients.storyteller_client.is_configured():
             if book.storyteller_uuid:
                 clients.storyteller_client.add_to_collection_by_uuid(book.storyteller_uuid)
@@ -7222,6 +7721,19 @@ def _process_batch_queue(queue_items):
         if current_book_entry and current_book_entry.kosync_doc_id:
             logger.info(f"🔄 Preserving existing hash '{current_book_entry.kosync_doc_id}' for '{item['abs_id']}' instead of new hash '{kosync_doc_id}'")
             kosync_doc_id = current_book_entry.kosync_doc_id
+        access = _existing_mapping_access(
+            current_book_entry,
+            ebook_filename=ebook_filename,
+            audio_source_id=item['abs_id'],
+            storyteller_uuid=storyteller_uuid or None,
+            ebook_source=item.get('ebook_source'),
+            ebook_source_id=item.get('ebook_source_id'),
+        )
+        if access == "deny":
+            continue
+        if access == "join":
+            _claim_book_for_user_id(get_current_user_id(), item['abs_id'])
+            continue
 
         item_details = clients.abs_client.get_item_details(item['abs_id'])
         chapters = item_details.get('media', {}).get('chapters', []) if item_details else []
@@ -7263,9 +7775,9 @@ def _process_batch_queue(queue_items):
         if not str(item['abs_id']).startswith('booklore:'):
             clients.abs_client.add_to_collection(item['abs_id'], user_setting("ABS_COLLECTION_NAME", "Synced with KOReader"))
         shelf_filename = original_ebook_filename or ebook_filename
-        if not _complete_shelf_watch_approval(shelf_watch_meta) and shelf_filename:
+        if not _complete_shelf_watch_approval(shelf_watch_meta, book=book) and shelf_filename:
             _shelve_matched_ebook(shelf_filename, item.get('ebook_source'),
-                                  item.get('ebook_source_id'))
+                                  item.get('ebook_source_id'), book=book)
         if clients.storyteller_client.is_configured():
             if book.storyteller_uuid:
                 clients.storyteller_client.add_to_collection_by_uuid(book.storyteller_uuid)
@@ -7409,6 +7921,19 @@ def _process_forge_match_queue(queue_items):
             current_book_entry = database_service.get_book(item['abs_id'])
             if current_book_entry and current_book_entry.kosync_doc_id:
                 kosync_doc_id = current_book_entry.kosync_doc_id
+            access = _existing_mapping_access(
+                current_book_entry,
+                ebook_filename=ebook_filename,
+                audio_source_id=item['abs_id'],
+                storyteller_uuid=storyteller_uuid or None,
+                ebook_source=item.get('ebook_source'),
+                ebook_source_id=item.get('ebook_source_id'),
+            )
+            if access == "deny":
+                continue
+            if access == "join":
+                _claim_book_for_user_id(get_current_user_id(), item['abs_id'])
+                continue
 
             item_details = clients.abs_client.get_item_details(item['abs_id'])
             chapters = item_details.get('media', {}).get('chapters', []) if item_details else []
@@ -7448,9 +7973,9 @@ def _process_forge_match_queue(queue_items):
             if not str(item['abs_id']).startswith('booklore:'):
                 clients.abs_client.add_to_collection(item['abs_id'], user_setting("ABS_COLLECTION_NAME", "Synced with KOReader"))
             shelf_filename = original_ebook_filename or ebook_filename
-            if not _complete_shelf_watch_approval(shelf_watch_meta) and shelf_filename:
+            if not _complete_shelf_watch_approval(shelf_watch_meta, book=book) and shelf_filename:
                 _shelve_matched_ebook(
-                    shelf_filename, item.get('ebook_source'), item.get('ebook_source_id')
+                    shelf_filename, item.get('ebook_source'), item.get('ebook_source_id'), book=book
                 )
             if clients.storyteller_client.is_configured() and book.storyteller_uuid:
                 clients.storyteller_client.add_to_collection_by_uuid(book.storyteller_uuid)
@@ -7531,6 +8056,8 @@ def _process_forge_match_queue(queue_items):
                 )
                 continue
 
+            if not _may_replace_mapping(forge_id):
+                continue
             forge_title = item.get('audio_title') or item.get('abs_title') or Path(original_filename).stem
             book = Book(
                 abs_id=forge_id,
@@ -7582,6 +8109,8 @@ def _process_forge_match_queue(queue_items):
                 )
                 continue
 
+            if not _may_replace_mapping(forge_id):
+                continue
             forge_title = item.get('abs_title') or item.get('audio_title') or forge_id
             book = Book(
                 abs_id=forge_id,
@@ -7615,7 +8144,7 @@ def _process_forge_match_queue(queue_items):
                 **_client_bundle_kwargs(clients),
             )
 
-        _complete_shelf_watch_approval(shelf_watch_meta)
+        _complete_shelf_watch_approval(shelf_watch_meta, book=book)
         database_service.dismiss_suggestion(forge_id)
         if kosync_doc_id:
             database_service.dismiss_suggestion(kosync_doc_id)
@@ -7656,6 +8185,15 @@ def _queue_item_from_match_form(clients) -> "dict | None":
     ebook_source_path = (
         request.form.get('ebook_source_path') or request.form.get('source_path') or ''
     ).strip() or None
+    if audio_source and ebook_filename and is_comic_ebook_filename(ebook_filename):
+        # Comics cannot pair with audiobooks: the audio path would see empty ebook
+        # text and could queue a pointless Whisper transcription. Queue the comic
+        # as an ebook-only item instead.
+        audio_source = None
+        audio_source_id = None
+        audio_provider_book_id = None
+        audio_provider_file_id = None
+        audio_duration = None
     storyteller_uuid = request.form.get('storyteller_uuid', '') or ''
     audio_only = (request.form.get('audio_only') or '').strip().lower() in {
         'true', '1', 'yes', 'on'
@@ -7783,6 +8321,7 @@ def _add_book_view():
 
     search = request.args.get('search', '').strip().lower()
     audiobooks, ebooks, storyteller_books = [], [], []
+    storyteller_search_failed = False
     if search:
         audiobooks = _search_audiobooks_with_fallback(search)
 
@@ -7795,11 +8334,16 @@ def _add_book_view():
         if storyteller_enabled:
             try:
                 storyteller_books = clients.storyteller_client.search_books(search)
+                if storyteller_books is None:
+                    storyteller_books = []
+                    storyteller_search_failed = True
             except Exception as e:
                 logger.warning(f"⚠️ Storyteller search failed in add_book route: {e}", exc_info=True)
+                storyteller_search_failed = True
 
     return render_template('add_book.html', audiobooks=audiobooks, ebooks=ebooks,
                            storyteller_books=storyteller_books,
+                           storyteller_search_failed=storyteller_search_failed,
                            queue=_load_match_queue(), search=search,
                            storyteller_enabled=storyteller_enabled)
 
@@ -7867,6 +8411,231 @@ def _prune_suggestions_scan_jobs():
         ]
         for job_id in stale_ids:
             SUGGESTIONS_SCAN_JOBS.pop(job_id, None)
+
+
+SUGGESTIONS_AUTO_SCAN_STATE_KEY = "SUGGESTIONS_AUTO_SCAN_STATE"
+SUGGESTIONS_AUTO_SCAN_MIN_MINUTES = 5
+_SUGGESTIONS_AUTO_SCAN_JOB = {}
+
+
+_CRON_FIELDS = (
+    (0, 59, {}),
+    (0, 23, {}),
+    (1, 31, {}),
+    (1, 12, {name: i for i, name in enumerate(
+        ('jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'), start=1)}),
+    (0, 7, {name: i for i, name in enumerate(('sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'))}),
+)
+_SUGGESTIONS_WEEKDAYS = ('sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday')
+
+
+def parse_cron_expression(expression: str):
+    """Parse a five-field cron expression into the set of values each field allows.
+
+    Supports `*`, numbers, `a-b` ranges, `/step`, comma lists and three-letter month and
+    weekday names. Day of week accepts 0-7, where 0 and 7 are both Sunday. Raises
+    ValueError for anything else.
+    """
+    fields = expression.split()
+    if len(fields) != 5:
+        raise ValueError(f"expected 5 fields, got {len(fields)}")
+    allowed = []
+    for text, (low, high, names) in zip(fields, _CRON_FIELDS):
+        values = set()
+        for part in text.lower().split(','):
+            span, _, step = part.partition('/')
+            if span == '*':
+                start, end = low, high
+            else:
+                first, _, last = span.partition('-')
+                start = names[first] if first in names else int(first)
+                end = (names[last] if last in names else int(last)) if last else (high if step else start)
+            stride = int(step) if step else 1
+            if not low <= start <= end <= high or stride < 1:
+                raise ValueError(f"'{part}' is outside {low}-{high}")
+            values.update(range(start, end + 1, stride))
+        allowed.append(values)
+    if 7 in allowed[4]:
+        allowed[4].add(0)
+    # As in cronie, a field starting with '*' (including '*/n') leaves its day unrestricted.
+    return allowed, not fields[2].startswith('*'), not fields[4].startswith('*')
+
+
+def cron_matches(cron, when) -> bool:
+    """Whether a parsed cron expression fires at `when`, to the minute.
+
+    As in standard cron, when both day of month and day of week are restricted, a day
+    matching either one fires.
+    """
+    (minutes, hours, days, months, weekdays), day_restricted, weekday_restricted = cron
+    if when.minute not in minutes or when.hour not in hours or when.month not in months:
+        return False
+    day_ok = when.day in days
+    weekday_ok = when.isoweekday() % 7 in weekdays
+    if day_restricted and weekday_restricted:
+        return day_ok or weekday_ok
+    return day_ok and weekday_ok
+
+
+def _suggestions_full_refresh_schedule():
+    if env_truthy('SUGGESTIONS_FULL_REFRESH_ENABLED'):
+        expression = (os.environ.get('SUGGESTIONS_FULL_REFRESH_CRON') or '').strip()
+        return ('SUGGESTIONS_FULL_REFRESH_CRON', expression) if expression else (None, None)
+    day = (os.environ.get('SUGGESTIONS_FULL_REFRESH_DAY') or 'off').strip().lower()
+    if day not in _SUGGESTIONS_WEEKDAYS:
+        return None, None
+    raw_time = (os.environ.get('SUGGESTIONS_FULL_REFRESH_TIME') or '04:00').strip()
+    try:
+        refresh_time = datetime.strptime(raw_time, '%H:%M').time()
+    except ValueError:
+        return 'SUGGESTIONS_FULL_REFRESH_TIME', raw_time
+    return 'SUGGESTIONS_FULL_REFRESH_DAY', f"{refresh_time.minute} {refresh_time.hour} * * {day[:3]}"
+
+
+def _suggestions_full_refresh_due(now, state) -> Optional[str]:
+    """The cron fire a full refresh is owed for, as an ISO string, or None.
+
+    The latest fire within the past day stays owed until a refresh has run for it, so a
+    fire missed while BookBridge was down still runs once it is back.
+    """
+    source, expression = _suggestions_full_refresh_schedule()
+    if not expression:
+        return None
+    try:
+        cron = parse_cron_expression(expression)
+    except ValueError:
+        get_persistent_condition_logger().warn(
+            logger,
+            "suggestions-full-refresh-schedule",
+            "⚠️ %s '%s' is not a valid schedule — full refresh is off",
+            source,
+            sanitize_log_data(expression),
+            exc_info=True,
+        )
+        return None
+    get_persistent_condition_logger().resolve(
+        logger, "suggestions-full-refresh-schedule", "Full refresh schedule is valid again",
+    )
+    # Step back through real instants (UTC) so the repeated hour of a fall-back change is
+    # walked in order instead of being skipped by wall-clock arithmetic.
+    fire = now.replace(second=0, microsecond=0)
+    instant = fire.astimezone(timezone.utc) if fire.tzinfo else None
+    for _ in range(24 * 60 + 1):
+        if cron_matches(cron, fire):
+            return None if _suggestions_full_refresh_done(fire, state) else fire.isoformat()
+        if instant is None:
+            fire -= timedelta(minutes=1)
+        else:
+            instant -= timedelta(minutes=1)
+            fire = instant.astimezone(fire.tzinfo)
+    return None
+
+
+def _suggestions_full_refresh_done(fire: datetime, state: dict) -> bool:
+    """Whether a full refresh already covers the cron fire at `fire`.
+
+    A recorded fire covers every fire at or before it, and also the same wall-clock time
+    repeated by a fall-back change, so one schedule slot never runs twice.
+    """
+    if state.get("last_full_date") == fire.date().isoformat():
+        return True
+    try:
+        last = datetime.fromisoformat(state.get("last_full_fire") or "")
+    except (TypeError, ValueError):
+        return False
+    if last.tzinfo is None or fire.tzinfo is None:
+        return fire.replace(tzinfo=None) <= last.replace(tzinfo=None)
+    return fire <= last or fire.replace(tzinfo=None) == last.replace(tzinfo=None)
+
+
+def _suggestions_auto_scan_due(now, state):
+    if _suggestions_full_refresh_due(now, state):
+        return 'full'
+
+    try:
+        minutes = int(float(os.environ.get('SUGGESTIONS_AUTO_SCAN_MINUTES') or 0))
+    except (TypeError, ValueError):
+        minutes = 0
+    if minutes <= 0:
+        return None
+    interval_seconds = max(minutes, SUGGESTIONS_AUTO_SCAN_MIN_MINUTES) * 60
+    if now.timestamp() - float(state.get("last_finished") or 0) >= interval_seconds:
+        return 'incremental'
+    return None
+
+
+def _run_scheduled_suggestions_scan(full: bool):
+    from src.utils.user_config import _ALLOW_GLOBAL_FALLBACK_KEY
+
+    user_id = database_service._default_user_id()
+    if user_id is None:
+        return None
+    creds = dict(database_service.get_user_credentials(user_id) or {})
+    creds[_ALLOW_GLOBAL_FALLBACK_KEY] = _global_fallback_allowed(
+        database_service, database_service.get_user(user_id),
+    )
+
+    tok_bundle = _active_bundle.set(container.user_client_registry().get_clients(user_id))
+    tok_uid = set_current_user_id(user_id)
+    tok_creds = set_current_user_credentials(creds)
+    try:
+        if full:
+            _save_persisted_suggestions_cache(_empty_suggestions_cache_payload(scanned_at=time.time()))
+            cached_by_abs, cached_no_match = {}, []
+        else:
+            persisted = _load_persisted_suggestions_cache()
+            cached_by_abs = persisted.get('scan_cache_by_abs', {}) or {}
+            cached_no_match = persisted.get('scan_cache_no_match_abs_ids', []) or []
+        return _start_suggestions_scan_job(
+            cached_suggestions_by_abs=cached_by_abs,
+            cached_no_match_abs_ids=cached_no_match,
+        )
+    finally:
+        reset_current_user_credentials(tok_creds)
+        reset_current_user_id(tok_uid)
+        _active_bundle.reset(tok_bundle)
+
+
+def _suggestions_auto_scan_tick():
+    if not env_truthy('SUGGESTIONS_ENABLED'):
+        return
+    try:
+        state = database_service.get_json_setting(SUGGESTIONS_AUTO_SCAN_STATE_KEY, default={})
+        if not isinstance(state, dict):
+            state = {}
+
+        if _SUGGESTIONS_AUTO_SCAN_JOB:
+            job = _get_suggestions_scan_job(_SUGGESTIONS_AUTO_SCAN_JOB["job_id"])
+            if job and job["status"] == "running":
+                return
+            state["last_finished"] = job["updated_at"] if job else time.time()
+            if _SUGGESTIONS_AUTO_SCAN_JOB["full_fire"]:
+                state["last_full_fire"] = _SUGGESTIONS_AUTO_SCAN_JOB["full_fire"]
+                state.pop("last_full_date", None)
+            database_service.set_json_setting(SUGGESTIONS_AUTO_SCAN_STATE_KEY, state)
+            with SUGGESTIONS_SCAN_JOBS_LOCK:
+                SUGGESTIONS_SCAN_JOBS.pop(_SUGGESTIONS_AUTO_SCAN_JOB["job_id"], None)
+            _SUGGESTIONS_AUTO_SCAN_JOB.clear()
+
+        now = datetime.now(_get_stats_timezone())
+        due = _suggestions_auto_scan_due(now, state)
+        with SUGGESTIONS_SCAN_JOBS_LOCK:
+            scan_running = any(job.get("status") == "running" for job in SUGGESTIONS_SCAN_JOBS.values())
+        if due and not scan_running:
+            job_id = _run_scheduled_suggestions_scan(full=(due == 'full'))
+            if job_id:
+                _SUGGESTIONS_AUTO_SCAN_JOB.update(
+                    job_id=job_id,
+                    full_fire=_suggestions_full_refresh_due(now, state) if due == 'full' else None,
+                )
+                logger.info("🔎 Scheduled suggestions scan started (%s)", due)
+        get_persistent_condition_logger().resolve(
+            logger, "suggestions-auto-scan", "Scheduled suggestions scans resumed",
+        )
+    except Exception as e:
+        get_persistent_condition_logger().warn(
+            logger, "suggestions-auto-scan", "Scheduled suggestions scan tick failed: %s", e, exc_info=True,
+        )
 
 
 def _start_suggestions_scan_job(cached_suggestions_by_abs=None, cached_no_match_abs_ids=None):
@@ -7983,7 +8752,8 @@ def _auto_match_suggestions(results: object, user_id: int | None) -> object:
 
     for suggestion in suggestions:
         matches = suggestion.get('matches') or []
-        eligible_matches = [m for m in matches if not _is_same_folder_match(m)]
+        eligible_matches = [m for m in matches if not _is_same_folder_match(m)
+                            and not is_comic_ebook_filename(m.get('ebook_filename'))]
         best_overall = max(matches, key=lambda m: m.get('score') or 0.0) if matches else None
         top = max(eligible_matches, key=lambda m: m.get('score') or 0.0) if eligible_matches else None
         if best_overall is not None and _is_same_folder_match(best_overall):
@@ -8025,6 +8795,13 @@ def _auto_match_suggestions(results: object, user_id: int | None) -> object:
             f"🔗 Auto-matched '{suggestion.get('abs_title')}' to "
             f"'{top.get('display_name') or top.get('ebook_filename')}' at {score:.1f}%"
         )
+        try:
+            _shelve_saved_ebook(saved)
+        except Exception as shelf_err:
+            logger.warning(
+                f"Failed to shelve auto-matched ebook for '{suggestion.get('abs_title')}': {shelf_err}",
+                exc_info=True,
+            )
 
     if matched:
         results['suggestions'] = remaining
@@ -8050,16 +8827,19 @@ def _run_suggestions_scan_job(job_id, cached_suggestions_by_abs=None, cached_no_
             progress_callback=update_progress,
         )
         results = _auto_match_suggestions(results, get_current_user_id())
+        scanned_at = time.time()
         _save_persisted_suggestions_cache({
             "scan_cache_by_abs": results.get('cache_by_abs', {}) if isinstance(results, dict) else {},
             "scan_cache_no_match_abs_ids": results.get('no_match_abs_ids', []) if isinstance(results, dict) else [],
             "scan_last_stats": results.get('stats', {}) if isinstance(results, dict) else {},
+            "scanned_at": scanned_at,
         })
         status = "done"
         error = None
     except Exception as e:
         logger.exception(f"Suggestions scan job failed ({job_id}): {e}")
         results = {}
+        scanned_at = 0.0
         status = "error"
         error = str(e)
         update_progress({
@@ -8078,6 +8858,7 @@ def _run_suggestions_scan_job(job_id, cached_suggestions_by_abs=None, cached_no_
                 "status": status,
                 "results": results,
                 "error": error,
+                "scanned_at": scanned_at,
                 "updated_at": time.time(),
             })
 
@@ -8127,6 +8908,7 @@ def _default_suggestions_state():
         "scan_cache_by_abs": {},
         "scan_cache_no_match_abs_ids": [],
         "scan_last_stats": {},
+        "scanned_at": 0.0,
         "scan_has_run": False,
         "created_at": now,
         "updated_at": now,
@@ -8173,11 +8955,12 @@ def _suggestions_cache_file_path(user_id=None):
     return DATA_DIR / f"suggestions_scan_cache_{scope}.json"
 
 
-def _empty_suggestions_cache_payload():
+def _empty_suggestions_cache_payload(scanned_at=0.0):
     return {
         "scan_cache_by_abs": {},
         "scan_cache_no_match_abs_ids": [],
         "scan_last_stats": {},
+        "scanned_at": scanned_at,
         "updated_at": time.time(),
     }
 
@@ -8199,10 +8982,12 @@ def _load_persisted_suggestions_cache():
         cache_by_abs = raw.get('scan_cache_by_abs', {})
         no_match = raw.get('scan_cache_no_match_abs_ids', [])
         stats = raw.get('scan_last_stats', {})
+        scanned_at = raw.get('scanned_at', 0.0)
 
         payload['scan_cache_by_abs'] = cache_by_abs if isinstance(cache_by_abs, dict) else {}
         payload['scan_cache_no_match_abs_ids'] = no_match if isinstance(no_match, list) else []
         payload['scan_last_stats'] = stats if isinstance(stats, dict) else {}
+        payload['scanned_at'] = scanned_at if isinstance(scanned_at, (int, float)) else 0.0
 
     return payload
 
@@ -8215,6 +9000,7 @@ def _save_persisted_suggestions_cache(payload):
         "scan_cache_by_abs": payload.get('scan_cache_by_abs', {}) if isinstance(payload.get('scan_cache_by_abs', {}), dict) else {},
         "scan_cache_no_match_abs_ids": payload.get('scan_cache_no_match_abs_ids', []) if isinstance(payload.get('scan_cache_no_match_abs_ids', []), list) else [],
         "scan_last_stats": payload.get('scan_last_stats', {}) if isinstance(payload.get('scan_last_stats', {}), dict) else {},
+        "scanned_at": payload.get('scanned_at') or 0.0,
         "updated_at": time.time(),
     }
 
@@ -8236,25 +9022,29 @@ def _rehydrate_suggestions_state_from_cache(suggestions_state: dict) -> dict:
     """Rehydrate in-memory suggestions state from the persisted per-user cache.
 
     If the state already has scan results (non-empty scan_cache_by_abs), the
-    in-memory state wins and the cache is not applied. Otherwise, loads the
-    persisted cache and populates the state with its contents, including
-    rebuilding scan_results sorted by top match score descending.
+    in-memory state wins unless the persisted cache comes from a newer scan
+    (its scanned_at is ahead of the state's), as after a scheduled scan.
+    Otherwise, loads the persisted cache and populates the state with its
+    contents, including rebuilding scan_results sorted by top match score
+    descending.
     """
     if not suggestions_state:
         return suggestions_state
 
-    if suggestions_state.get('scan_cache_by_abs'):
+    persisted = _load_persisted_suggestions_cache()
+    newer_scan = persisted['scanned_at'] > suggestions_state.get('scanned_at', 0.0)
+    if suggestions_state.get('scan_cache_by_abs') and not newer_scan:
         return suggestions_state
 
-    persisted = _load_persisted_suggestions_cache()
     cache_by_abs = persisted.get('scan_cache_by_abs', {}) or {}
-    if not cache_by_abs:
+    if not cache_by_abs and not newer_scan:
         return suggestions_state
 
     suggestions_state['scan_cache_by_abs'] = cache_by_abs
     suggestions_state['scan_cache_no_match_abs_ids'] = persisted.get('scan_cache_no_match_abs_ids', []) or []
     suggestions_state['scan_last_stats'] = persisted.get('scan_last_stats', {}) or {}
-    suggestions_state['scan_has_run'] = True
+    suggestions_state['scanned_at'] = persisted['scanned_at']
+    suggestions_state['scan_has_run'] = bool(cache_by_abs or suggestions_state['scan_last_stats'])
     suggestions_state['updated_at'] = time.time()
 
     suggestions_list = list(cache_by_abs.values())
@@ -8266,6 +9056,18 @@ def _rehydrate_suggestions_state_from_cache(suggestions_state: dict) -> dict:
 
     logger.info(f"♻️ Restored {len(suggestions_list)} cached suggestion(s) from the persisted scan cache")
     return suggestions_state
+
+
+def _persist_suggestions_state(suggestions_state: dict) -> None:
+    with SUGGESTIONS_CACHE_LOCK:
+        if _load_persisted_suggestions_cache()['scanned_at'] > suggestions_state.get('scanned_at', 0.0):
+            return
+        _save_persisted_suggestions_cache({
+            "scan_cache_by_abs": suggestions_state.get('scan_cache_by_abs', {}),
+            "scan_cache_no_match_abs_ids": suggestions_state.get('scan_cache_no_match_abs_ids', []),
+            "scan_last_stats": suggestions_state.get('scan_last_stats', {}),
+            "scanned_at": suggestions_state.get('scanned_at', 0.0),
+        })
 
 
 def _match_queue_file_path():
@@ -8488,7 +9290,10 @@ def _queue_item_from_suggestion(suggestion: dict) -> "dict | None":
     bridge_key = (suggestion or {}).get('bridge_key') or (suggestion or {}).get('abs_id')
     if not matches or not bridge_key:
         return None
-    top = matches[0]
+    top = next((match for match in matches
+                if not is_comic_ebook_filename(match.get('ebook_filename'))), None)
+    if top is None:
+        return None
     ebook_filename = top.get('ebook_filename') or ''
     if not ebook_filename:
         return None
@@ -8544,8 +9349,12 @@ def suggestions_page():
                 suggestions_state['scan_results'] = []
                 suggestions_state['scan_has_run'] = False
                 suggestions_state['updated_at'] = time.time()
-                _save_persisted_suggestions_cache(_empty_suggestions_cache_payload())
+                suggestions_state['scanned_at'] = suggestions_state['updated_at']
+                _save_persisted_suggestions_cache(
+                    _empty_suggestions_cache_payload(scanned_at=suggestions_state['scanned_at'])
+                )
             else:
+                suggestions_state = _rehydrate_suggestions_state_from_cache(suggestions_state)
                 state_cache = suggestions_state.get('scan_cache_by_abs', {}) or {}
                 state_no_match = suggestions_state.get('scan_cache_no_match_abs_ids', []) or []
                 if state_cache or state_no_match:
@@ -8711,13 +9520,10 @@ def suggestions_page():
                 suggestions_state['scan_cache_by_abs'] = scan_payload.get('cache_by_abs', {})
                 suggestions_state['scan_cache_no_match_abs_ids'] = scan_payload.get('no_match_abs_ids', [])
                 suggestions_state['scan_last_stats'] = scan_payload.get('stats', {})
+                suggestions_state['scanned_at'] = scan_job.get('scanned_at') or time.time()
                 suggestions_state['scan_has_run'] = True
                 suggestions_state['updated_at'] = time.time()
-                _save_persisted_suggestions_cache({
-                    "scan_cache_by_abs": suggestions_state.get('scan_cache_by_abs', {}),
-                    "scan_cache_no_match_abs_ids": suggestions_state.get('scan_cache_no_match_abs_ids', []),
-                    "scan_last_stats": suggestions_state.get('scan_last_stats', {}),
-                })
+                _persist_suggestions_state(suggestions_state)
                 session.pop('suggestions_scan_job_id', None)
                 session.modified = True
                 with SUGGESTIONS_SCAN_JOBS_LOCK:
@@ -8760,11 +9566,7 @@ def suggestions_page():
             suggestions_state['scan_cache_no_match_abs_ids'] = filtered_no_match_abs_ids
             no_match_abs_ids = filtered_no_match_abs_ids
             suggestions_state['updated_at'] = time.time()
-        _save_persisted_suggestions_cache({
-            "scan_cache_by_abs": suggestions_state.get('scan_cache_by_abs', {}),
-            "scan_cache_no_match_abs_ids": suggestions_state.get('scan_cache_no_match_abs_ids', []),
-            "scan_last_stats": suggestions_state.get('scan_last_stats', {}),
-        })
+        _persist_suggestions_state(suggestions_state)
 
     active_suggestion_keys = set()
     for book in database_service.get_all_books():
@@ -8808,11 +9610,7 @@ def suggestions_page():
             suggestions_state['scan_cache_no_match_abs_ids'] = filtered_no_match_abs_ids
             no_match_abs_ids = filtered_no_match_abs_ids
             suggestions_state['updated_at'] = time.time()
-        _save_persisted_suggestions_cache({
-            "scan_cache_by_abs": suggestions_state.get('scan_cache_by_abs', {}),
-            "scan_cache_no_match_abs_ids": suggestions_state.get('scan_cache_no_match_abs_ids', []),
-            "scan_last_stats": suggestions_state.get('scan_last_stats', {}),
-        })
+        _persist_suggestions_state(suggestions_state)
 
     def _normalize_suggestion_identity_part(value):
         normalized = re.sub(r'[\W_]+', ' ', str(value or '').lower()).strip()
@@ -8850,11 +9648,7 @@ def suggestions_page():
             cache_by_abs = filtered_cache_by_abs
             suggestions_state['scan_cache_by_abs'] = filtered_cache_by_abs
         suggestions_state['updated_at'] = time.time()
-        _save_persisted_suggestions_cache({
-            "scan_cache_by_abs": suggestions_state.get('scan_cache_by_abs', {}),
-            "scan_cache_no_match_abs_ids": suggestions_state.get('scan_cache_no_match_abs_ids', []),
-            "scan_last_stats": suggestions_state.get('scan_last_stats', {}),
-        })
+        _persist_suggestions_state(suggestions_state)
 
     return render_template(
         'suggestions.html',
@@ -9057,6 +9851,11 @@ def cleanup_mapping_resources(book, defer_audio_cache: bool = False):
         is_bookorbit = (getattr(book, 'ebook_source', None) or '').strip().lower() == 'bookorbit'
         is_kavita = (getattr(book, 'ebook_source', None) or '').strip().lower() == 'kavita'
         try:
+            shelf_assignments = (
+                database_service.get_shelf_assignments(book.abs_id)
+                if not is_bookorbit and not is_kavita else []
+            )
+            database_service.remove_pending_shelf_adds(book.abs_id, all_users=True)
             if is_bookorbit:
                 client = clients.bookorbit_client
                 if client.is_configured():
@@ -9075,6 +9874,37 @@ def cleanup_mapping_resources(book, defer_audio_cache: bool = False):
                         client.remove_book_id_from_shelf(ebook_source_id, shelf_name)
                     else:
                         client.remove_from_shelf(shelf_filename, shelf_name)
+            elif shelf_assignments:
+                removed_targets = set()
+                cleanup_succeeded = True
+                for assignment in shelf_assignments:
+                    source_id = assignment.get('source_id') or book.ebook_source_id
+                    target = (assignment['target_user_id'], assignment['shelf_name'], source_id)
+                    if target in removed_targets:
+                        continue
+                    removed_targets.add(target)
+                    target_user_id, shelf_name, source_id = target
+                    if target_user_id is None:
+                        client = _global_clients.booklore_client
+                    else:
+                        try:
+                            client = container.user_client_registry().get_clients(
+                                target_user_id
+                            ).booklore_client
+                        except Exception:
+                            cleanup_succeeded = False
+                            continue
+                    if (not client.is_configured()
+                            or not client.remove_book_id_from_shelf(
+                                source_id, shelf_name
+                            )):
+                        cleanup_succeeded = False
+                if cleanup_succeeded:
+                    database_service.remove_shelf_assignments(book.abs_id)
+            elif shelf_add_waits_for_alignment(book):
+                client, shelf_name = _aligned_shelf_target(get_current_user_id())
+                if client is not None and client.is_configured():
+                    client.remove_book_id_from_shelf(book.ebook_source_id, shelf_name)
             else:
                 client = clients.booklore_client
                 if client.is_configured():
@@ -9099,6 +9929,94 @@ def _user_may_modify_book(user, abs_id) -> bool:
         return database_service.is_user_linked(user.id, abs_id)
     except Exception:
         return False
+
+
+_FOREIGN_MAPPING_MESSAGE = (
+    "Forbidden: another reader's mapping already uses this book. Ask an admin to change it."
+)
+
+
+def _acting_user_may_modify_book(abs_id) -> bool:
+    """_user_may_modify_book for whoever is acting right now.
+
+    In a request that is the signed-in user; in a user-scoped background job
+    (the Add Book queue) it is the user the job runs for. Work with no user at
+    all is system work and may.
+    """
+    if has_request_context():
+        return _user_may_modify_book(current_user(), abs_id)
+    user_id = get_current_user_id()
+    if user_id is None:
+        return True
+    try:
+        user = database_service.get_user(user_id)
+        if user is None:
+            return False
+        return bool(getattr(user, "is_admin", False)) or database_service.is_user_linked(user_id, abs_id)
+    except Exception:
+        return False
+
+
+def _existing_mapping_access(existing_book, **identity) -> str:
+    """Whether a match may rewrite ``existing_book`` for the acting user.
+
+    'modify' when there is no such mapping or the user may change it. Otherwise
+    the mapping is another reader's: 'join' when the request names the pairing it
+    already has, so the caller only adds it to this reader's library, and 'deny'
+    when the match would change it. ``identity`` takes the keyword arguments of
+    _mapping_identity_changes.
+    """
+    if existing_book is None or _acting_user_may_modify_book(existing_book.abs_id):
+        return "modify"
+    changed, _ = _mapping_identity_changes(existing_book, **identity)
+    if changed:
+        logger.info(
+            "🔒 Refused to change mapping '%s': it belongs to another reader (%s would change)",
+            sanitize_log_data(existing_book.abs_id), ", ".join(changed),
+        )
+        return "deny"
+    logger.info(
+        "🔗 '%s' is already mapped by another reader with the same text — adding it to this reader's library unchanged",
+        sanitize_log_data(existing_book.abs_id),
+    )
+    return "join"
+
+
+def _may_absorb_mapping(abs_id) -> bool:
+    """Whether a match may fold the mapping ``abs_id`` into another one."""
+    if not abs_id or _acting_user_may_modify_book(abs_id):
+        return True
+    logger.info(
+        "🔒 Refused to absorb mapping '%s': it belongs to another reader",
+        sanitize_log_data(abs_id),
+    )
+    return False
+
+
+def _may_replace_mapping(abs_id) -> bool:
+    """Whether a match may overwrite the stored mapping ``abs_id`` wholesale (Forge)."""
+    if not abs_id or database_service.get_book(abs_id) is None or _acting_user_may_modify_book(abs_id):
+        return True
+    logger.info(
+        "🔒 Refused to change mapping '%s': it belongs to another reader (%s would change)",
+        sanitize_log_data(abs_id), "the whole mapping",
+    )
+    return False
+
+
+def _hash_owned_by_foreign_mapping(doc_hash, abs_id) -> bool:
+    """Whether ``doc_hash`` belongs to another mapping the acting user may not modify."""
+    doc = database_service.get_kosync_document(doc_hash)
+    owner = getattr(doc, "linked_abs_id", None) if doc else None
+    if not owner:
+        owner = getattr(database_service.get_book_by_kosync_id(doc_hash), "abs_id", None)
+    if not owner or owner == abs_id or _acting_user_may_modify_book(owner):
+        return False
+    logger.info(
+        "ðŸ”’ Refused to move KoSync document '%s' from mapping '%s': it belongs to another reader",
+        sanitize_log_data(doc_hash), sanitize_log_data(owner),
+    )
+    return True
 
 
 def _forbidden_book_response(json_response: bool = False):
@@ -9299,6 +10217,7 @@ def _delete_or_unlink_book(user, abs_id, book) -> None:
     if user is not None and user.id in claimants and len(claimants) > 1:
         database_service.unlink_user_book(user.id, abs_id)
         database_service.delete_states_for_book(abs_id, user_id=user.id)
+        database_service.remove_pending_shelf_adds(abs_id, user.id)
         return
     worker_cancelled = manager.cancel_background_job(abs_id)
     database_service.delete_book(abs_id)
@@ -9405,7 +10324,8 @@ def remap_alignment(abs_id):
         transcriber = getattr(manager, "transcriber", None) if manager else None
         if transcriber is not None:
             try:
-                transcriber.invalidate_transcript_cache(abs_id)
+                if not transcriber.has_word_timed_transcript(abs_id):
+                    transcriber.invalidate_transcript_cache(abs_id)
             except Exception as e:
                 logger.warning(
                     f"⚠️ Remap: could not invalidate transcript for '{abs_id}': {e}",
@@ -9727,10 +10647,6 @@ def remove_readalong_epub_route(abs_id: str):
     if audio_book_id is None:
         return jsonify({"success": True, "removed": False, "message": "No resolvable BookOrbit audio entry for this book."})
 
-    resolved = resolve_audiobook_folder(clients.bookorbit_client, audio_book_id)
-    if resolved is None:
-        return jsonify({"success": True, "removed": False, "message": "Could not resolve the BookOrbit audio folder."})
-
     epub_filename = getattr(book, "original_ebook_filename", None) or getattr(book, "ebook_filename", None)
     if not epub_filename:
         return jsonify({"success": True, "removed": False, "message": "No source EPUB on file."})
@@ -9739,7 +10655,9 @@ def remove_readalong_epub_route(abs_id: str):
     except FileNotFoundError:
         return jsonify({"success": True, "removed": False, "message": "Source EPUB not found on disk."})
 
-    output_path = resolved.folder / _readalong_filename(Path(epub_path))
+    resolved = resolve_audiobook_folder(clients.bookorbit_client, audio_book_id)
+    output_name = _readalong_filename(Path(epub_path))
+    output_path = resolved.folder / output_name if resolved else Path(output_name)
     ok = _remove_readalong_epub_file(clients.bookorbit_client, audio_book_id, output_path)
     if ok:
         logger.info("🗑️ Removed read-along EPUB for %s", sanitize_log_data(book.abs_title or abs_id))
@@ -9899,6 +10817,8 @@ def update_hash(abs_id):
     old_hash = book.kosync_doc_id
 
     if new_hash:
+        if _hash_owned_by_foreign_mapping(new_hash, abs_id):
+            return _FOREIGN_MAPPING_MESSAGE, 403
         book.kosync_doc_id = new_hash
         database_service.save_book(book)
         logger.info(f"✅ Updated KoSync hash for '{sanitize_log_data(book.abs_title)}' to manual input: '{new_hash}'")
@@ -9921,6 +10841,8 @@ def update_hash(abs_id):
         if recalc_hash:
             # [CHANGED] Manual update (via UI) should always succeed, even if it changes a linked hash.
             # The protection logic remains in match() and batch_match() to prevent automated overwrites.
+            if _hash_owned_by_foreign_mapping(recalc_hash, abs_id):
+                return _FOREIGN_MAPPING_MESSAGE, 403
             book.kosync_doc_id = recalc_hash
             database_service.save_book(book)
             logger.info(f"✅ Auto-regenerated KoSync hash for '{sanitize_log_data(book.abs_title)}': '{recalc_hash}'")
@@ -10069,6 +10991,8 @@ def api_storyteller_search():
     if not query:
         return jsonify({"error": "Query parameter 'q' is required"}), 400
     results = uc().storyteller_client.search_books(query)
+    if results is None:
+        return jsonify({"error": "Storyteller didn't respond in time or returned an error. If your library is large, raise Settings → Storyteller → Library Timeout."}), 502
     return jsonify(results)
 
 
@@ -10152,12 +11076,23 @@ def _get_stats_timezone():
     try:
         return ZoneInfo(tz_name)
     except Exception:
-        logger.warning("Invalid TZ '%s' for stats, falling back to America/New_York", tz_name, exc_info=True)
+        get_persistent_condition_logger().warn(
+            logger,
+            f"invalid-tz:{tz_name}",
+            "Invalid TZ '%s' for stats, falling back to America/New_York",
+            tz_name,
+            exc_info=True,
+        )
         return ZoneInfo("America/New_York")
 
 
 def _build_stats_cache_key():
-    return f"stats::{os.environ.get('TZ', 'America/New_York')}"
+    try:
+        user = current_user()
+    except RuntimeError:
+        user = None
+    user_id = user.id if user is not None else "anon"
+    return f"stats::{user_id}::{os.environ.get('TZ', 'America/New_York')}"
 
 
 def _read_cached_stats():
@@ -10338,7 +11273,7 @@ def _build_listening_book_list():
             "bookKey": f"abs:{abs_id}",
             "absId": abs_id,
             "isLinked": True,
-            "title": getattr(book, "abs_title", None) or "Unknown book",
+            "title": getattr(book, "abs_title", None) or stats.get("book_title") or "Unknown book",
             "author": None,
             "totalSeconds": listen_seconds,
             "sessionCount": int(stats.get("session_count") or 0),
@@ -10349,13 +11284,39 @@ def _build_listening_book_list():
     return result
 
 
-def _build_listening_stats_payload(tz):
+def _local_listening_stats(tz):
+    """ABS-shaped listening stats from the bridge's own AUDIOBOOK sessions, or None if empty."""
+    days = database_service.get_listening_days(getattr(tz, "key", str(tz)))
+    if not days:
+        return None
+    return {
+        "days": days,
+        "totalTime": sum(days.values()),
+        "items": {
+            abs_id: stats for abs_id, stats in database_service.get_all_reading_stats().items()
+            if int(stats.get("listen_seconds") or 0) > 0
+        },
+    }
+
+
+def _stats_abs_client():
+    """The request user's own configured ABS client, or None. Never falls back to
+    the global (primary admin) client when the user's bundle cannot be built."""
     try:
-        abs_client = container.abs_client()
-    except Exception:
+        abs_client = container.user_client_registry().get_clients(current_user().id).abs_client
+        return abs_client if abs_client and abs_client.is_configured() else None
+    except Exception as e:
+        logger.warning("Stats: user ABS client unavailable, using local sessions: %s", e, exc_info=True)
         return None
 
-    raw_stats = abs_client.get_listening_stats()
+
+def _build_listening_stats_payload(tz):
+    abs_client = _stats_abs_client()
+    use_abs = abs_client is not None
+    if use_abs:
+        raw_stats = abs_client.get_listening_stats()
+    else:
+        raw_stats = _local_listening_stats(tz)
     if not raw_stats:
         return None
 
@@ -10367,14 +11328,17 @@ def _build_listening_stats_payload(tz):
         for key, value in all_days.items()
     ])
 
-    recent_sessions = raw_stats.get("recentSessions")
-    if not isinstance(recent_sessions, list) or not recent_sessions:
-        recent_sessions = abs_client.get_listening_sessions(limit=10)
-    normalized_sessions = [
-        _normalize_listening_session(session_data)
-        for session_data in (recent_sessions or [])[:10]
-        if isinstance(session_data, dict)
-    ]
+    if use_abs:
+        recent_sessions = raw_stats.get("recentSessions")
+        if not isinstance(recent_sessions, list) or not recent_sessions:
+            recent_sessions = abs_client.get_listening_sessions(limit=10)
+        normalized_sessions = [
+            _normalize_listening_session(session_data)
+            for session_data in (recent_sessions or [])[:10]
+            if isinstance(session_data, dict)
+        ]
+    else:
+        normalized_sessions = database_service.get_recent_listening_sessions(10)
 
     summary = _summarize_activity(
         daily=daily,
@@ -10776,7 +11740,7 @@ def api_stats_book_detail():
                 book = database_service.get_book(abs_id)
                 listening = {
                     "absId": abs_id,
-                    "title": getattr(book, "abs_title", None),
+                    "title": getattr(book, "abs_title", None) or row.get("book_title"),
                     "totalSeconds": int(row.get("listen_seconds") or 0),
                     "sessionCount": int(row.get("session_count") or 0),
                     "avgSessionSeconds": int(row.get("avg_session_seconds") or 0),
@@ -10812,8 +11776,11 @@ def api_stats_yearly_recap():
 
         listening_recap = None
         try:
-            abs_client = container.abs_client()
-            raw_stats = abs_client.get_listening_stats() if abs_client else None
+            abs_client = _stats_abs_client()
+            if abs_client:
+                raw_stats = abs_client.get_listening_stats()
+            else:
+                raw_stats = _local_listening_stats(tz)
         except Exception:
             raw_stats = None
         if raw_stats:
@@ -11858,34 +12825,6 @@ def _build_test_url(base_url: str, path: str) -> str:
     return f"{base_url.rstrip('/')}/{path.lstrip('/')}"
 
 
-def _is_builtin_kosync_test_url(url: str) -> bool:
-    if not url:
-        return False
-
-    try:
-        parsed = urlparse(url)
-    except Exception:
-        return False
-
-    host = (parsed.hostname or "").strip().lower()
-    if host not in {"127.0.0.1", "localhost", "0.0.0.0", "::1"}:
-        return False
-
-    valid_ports = {5757}
-    configured_port = (os.environ.get("KOSYNC_PORT") or "").strip()
-    if configured_port:
-        try:
-            valid_ports.add(int(configured_port))
-        except ValueError:
-            logger.warning(f"Invalid KOSYNC_PORT '{configured_port}' while testing KOSync settings", exc_info=True)
-
-    port = parsed.port
-    if port is None:
-        port = 443 if parsed.scheme == "https" else 80
-
-    return port in valid_ports
-
-
 def _run_test_connection(service: str, payload: dict):
     testers = {
         'abs': lambda data: _test_abs(
@@ -12289,12 +13228,28 @@ def api_bookfusion_upload(abs_id: str) -> object:
     # Shared result handling (both variants converge here)
     # ------------------------------------------------------------------
     if result.status == "created":
-        book_id = result.book_id
-        bookfusion_id_str = str(book_id) if book_id is not None else None
+        calibre_book_id = result.book_id
+        title = str(metadata.get("title") or "").strip()
+        author = str((metadata.get("authors") or [None])[0] or "").strip()
+        book_id = _resolve_created_bookfusion_id(calibre_book_id, title, author)
+        if book_id is None:
+            logger.warning(
+                "BookFusion upload succeeded but its User API id could not be resolved for %s "
+                "(Calibre id=%s); no link was saved",
+                sanitize_log_data(abs_id),
+                calibre_book_id,
+            )
+            return jsonify({
+                "success": False,
+                "error": (
+                    "BookFusion accepted the upload, but it is not yet available through "
+                    "the reader API. Wait a moment and upload again; no progress link was saved."
+                ),
+            }), 502
         link = database_service.set_user_bookfusion_link(
-            user_id, abs_id, bookfusion_id_str,
-            title=str(metadata.get("title") or "").strip() or None,
-            author=str((metadata.get("authors") or [None])[0] or "").strip() or None,
+            user_id, abs_id, str(book_id),
+            title=title or None,
+            author=author or None,
         )
         if not link:
             logger.warning("BookFusion upload succeeded but link creation failed for %s / id=%s", abs_id, book_id)
@@ -12329,6 +13284,77 @@ def api_bookfusion_upload(abs_id: str) -> object:
     return jsonify({"success": False, "error": result.message}), 502
 
 
+def _bookfusion_item_matches(item: dict, title: str, author: str = "") -> bool:
+    """Return whether a User-API search result matches local EPUB metadata."""
+    if not isinstance(item, dict):
+        return False
+    if (item.get("title") or "").strip().casefold() != title.strip().casefold():
+        return False
+    if not author:
+        return True
+    item_authors = item.get("authors") or item.get("author") or ""
+    if isinstance(item_authors, list):
+        first = item_authors[0] if item_authors else ""
+        first_author = str(first.get("name") or first.get("authorName") or "").strip() if isinstance(first, dict) else str(first or "").strip()
+    elif isinstance(item_authors, dict):
+        first_author = str(item_authors.get("name") or item_authors.get("authorName") or "").strip()
+    elif isinstance(item_authors, str):
+        first_author = item_authors.strip()
+    else:
+        first_author = ""
+    return first_author.casefold() == author.strip().casefold()
+
+
+def _bookfusion_reader_id_from_url(item: dict) -> int | None:
+    """Extract the Calibre/reader-facing id from a BookFusion User-API result."""
+    read_url = str(item.get("read_url") or "")
+    match = re.search(r"/books/(\d+)(?:[-/?#]|$)", read_url)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def _find_bookfusion_user_api_id(results, title: str, author: str, expected_reader_id: int | None = None) -> int | None:
+    """Find an exact metadata match, optionally tied to a Calibre reader id."""
+    for item in results or []:
+        if not _bookfusion_item_matches(item, title, author):
+            continue
+        if expected_reader_id is not None and _bookfusion_reader_id_from_url(item) != expected_reader_id:
+            continue
+        try:
+            return int(item.get("id"))
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def _resolve_created_bookfusion_id(calibre_book_id: int | None, title: str, author: str = "") -> int | None:
+    """Resolve a newly-uploaded Calibre id to BookFusion's User-API id.
+
+    The Calibre finalize endpoint returns the id embedded in ``read_url`` rather
+    than the User API's ``id``. Search is retried briefly because uploads are
+    indexed asynchronously; no link is saved until the exact title match (and
+    author, when supplied) also exposes that returned reader id.
+    """
+    if calibre_book_id is None or not title:
+        return None
+    reader_client = uc().bookfusion_client
+    if not reader_client.is_configured():
+        return None
+    for attempt in range(3):
+        try:
+            results = reader_client.search_books(page=1, per_page=10, q=title) or []
+        except Exception as exc:
+            logger.warning("BookFusion post-upload User API search failed: %s", exc, exc_info=True)
+            return None
+        resolved_id = _find_bookfusion_user_api_id(results, title, author, calibre_book_id)
+        if resolved_id is not None:
+            return resolved_id
+        if attempt < 2:
+            time.sleep(0.5 * (attempt + 1))
+    return None
+
+
 def _resolve_duplicate_bookfusion_id(upload_client, title: str, author: str = "") -> int | None:
     """Try to find a BookFusion book id for an already-uploaded duplicate.
 
@@ -12347,28 +13373,11 @@ def _resolve_duplicate_bookfusion_id(upload_client, title: str, author: str = ""
     except Exception as exc:
         logger.warning("BookFusion duplicate search failed: %s", exc, exc_info=True)
         return None
-    title_lower = title.strip().lower()
-    author_lower = author.strip().lower() if author else ""
     for item in results:
-        item_id = item.get("id")
-        if item_id is None:
+        if not _bookfusion_item_matches(item, title, author):
             continue
-        # Verify title matches (case-insensitive)
-        item_title = (item.get("title") or "").strip().lower()
-        if item_title != title_lower:
-            continue
-        # Verify first author matches if we have one
-        if author_lower:
-            item_authors = item.get("authors") or item.get("author") or ""
-            first_author = ""
-            if isinstance(item_authors, list):
-                first_author = (item_authors[0] or "").strip().lower() if item_authors else ""
-            elif isinstance(item_authors, str):
-                first_author = item_authors.strip().lower()
-            if first_author != author_lower:
-                continue
         try:
-            candidate_id = int(item_id)
+            candidate_id = int(item.get("id"))
         except (ValueError, TypeError):
             continue
         try:
@@ -12580,7 +13589,7 @@ def _test_kosync(
     except Exception as e:
         healthcheck_error = str(e)
 
-    if _is_builtin_kosync_test_url(url):
+    if is_builtin_kosync_url(url):
         if healthcheck_status == 200:
             return {
                 "ok": True,
@@ -13033,6 +14042,11 @@ def api_diagnostics_submissions():
 
 
 # --- Application Factory ---
+# Largest request body either server reads. The split-port sync server serves the
+# same KoSync blueprint, so the same cap fits every device upload it accepts.
+_MAX_REQUEST_BYTES = 8 * 1024 * 1024
+
+
 def create_app(test_container=None):
     # Under a test container, run deferred work inline so integration tests are
     # deterministic (no background thread races).
@@ -13054,7 +14068,7 @@ def create_app(test_container=None):
     if str(os.environ.get("SESSION_COOKIE_SECURE", "")).strip().lower() in ("true", "1", "yes", "on"):
         app.config["SESSION_COOKIE_SECURE"] = True
 
-    app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
+    app.config["MAX_CONTENT_LENGTH"] = _MAX_REQUEST_BYTES
 
     # Tests inject a test_container and exercise routes without a session; honor
     # Flask's conventional LOGIN_DISABLED so the auth guard is a no-op there.
@@ -13251,6 +14265,23 @@ def create_app(test_container=None):
     # Return both app and container for external reference
     return app, container
 
+
+def create_sync_only_app() -> Flask:
+    """The split-port KoSync server: the sync blueprint alone, with the body cap.
+
+    Two KoSync routes read a JSON body before any credential check, so without
+    the cap an unauthenticated request of any size is read and parsed in full.
+    """
+    sync_app = Flask(__name__)
+    sync_app.config["MAX_CONTENT_LENGTH"] = _MAX_REQUEST_BYTES
+    sync_app.register_blueprint(kosync_sync_bp)
+
+    @sync_app.route('/')
+    def sync_health():
+        return "Sync Server OK", 200
+
+    return sync_app
+
 # ---------------- MAIN ----------------
 if __name__ == '__main__':
 
@@ -13433,12 +14464,7 @@ if __name__ == '__main__':
     sync_port = os.environ.get('KOSYNC_PORT')
     if sync_port and int(sync_port) != 5757:
         def run_sync_only_server(port):
-            sync_app = Flask(__name__)
-            sync_app.register_blueprint(kosync_sync_bp)
-            @sync_app.route('/')
-            def sync_health():
-                return "Sync Server OK", 200
-            sync_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+            create_sync_only_app().run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
         threading.Thread(target=run_sync_only_server, args=(int(sync_port),), daemon=True).start()
         logger.info(f"🚀 Split-Port Mode Active: Sync-only server on port {sync_port}")

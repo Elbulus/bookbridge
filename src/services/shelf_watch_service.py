@@ -23,6 +23,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from src.db.models import PendingSuggestion
+from src.services.aligned_shelf import defer_shelf_add
 from src.utils.logging_utils import get_persistent_condition_logger
 from src.utils.time_utils import utcnow
 
@@ -378,6 +379,7 @@ class ShelfWatchService:
         now = utcnow()
 
         candidate_pool = None  # Lazy-built on first non-skipped book
+        pool_empty = False
 
         for book in books:
             stats['scanned'] += 1
@@ -411,20 +413,21 @@ class ShelfWatchService:
                         shelf_name, len(books) - (stats['scanned'] - 1),
                     )
                     stats['errors'] += 1
-                    return stats
+                    pool_empty = True
 
             try:
                 outcome = self._process_one_book(
                     book, filename, grimmory_id, candidate_pool, threshold,
                     shelf_name, kobo_shelf, user_id=user_id,
-                    active_client=active_client,
+                    active_client=active_client, same_entry_only=bool(pool_empty),
                 )
             except Exception as e:
                 logger.exception(f"Shelf-watch: unexpected error processing '{filename}': {e}")
                 stats['errors'] += 1
                 continue
 
-            stats[outcome] = stats.get(outcome, 0) + 1
+            if outcome:
+                stats[outcome] = stats.get(outcome, 0) + 1
 
         if stats['scanned']:
             logger.info(
@@ -441,7 +444,10 @@ class ShelfWatchService:
     def _process_one_book(self, grimmory_book: dict, filename: str, grimmory_id: str,
                          candidate_pool: list, threshold: float,
                          watch_shelf: str, kobo_shelf: str,
-                         user_id: int = None, active_client=None) -> str:
+                         user_id: int = None, active_client=None,
+                         same_entry_only: bool = False) -> Optional[str]:
+        """Return the outcome key, or None when deferred (same_entry_only and no
+        same-entry audio match)."""
         ebook_anchor = {
             'filename': filename,
             'title': (grimmory_book.get('title') or '').strip(),
@@ -449,6 +455,20 @@ class ShelfWatchService:
             'grimmory_id': grimmory_id,
             'path': grimmory_book.get('filePath') or grimmory_book.get('filepath') or grimmory_book.get('path') or '',
         }
+
+        same_entry = self._same_entry_audio_match(grimmory_book, grimmory_id, active_client)
+        if same_entry:
+            self._create_audio_mapping_and_move(
+                grimmory_book, filename, grimmory_id, same_entry, watch_shelf, kobo_shelf,
+                user_id=user_id, active_client=active_client,
+            )
+            self.database_service.upsert_shelf_watch_scan(
+                self._scan_key(grimmory_id), filename, top_score=100.0, status='auto_matched',
+            )
+            return 'auto_matched'
+
+        if same_entry_only:
+            return None
 
         scan_result = self._get_suggestions_service()._scan_single_ebook(ebook_anchor, candidate_pool)
         matches = (scan_result or {}).get('matches') or []
@@ -493,6 +513,41 @@ class ShelfWatchService:
         )
         return outcome_status
 
+    def _same_entry_audio_match(self, grimmory_book: dict, grimmory_id: str,
+                                active_client) -> Optional[dict]:
+        """Live-check whether a BookOrbit shelf book's own entry also carries audio.
+
+        The fuzzy candidate pool comes from a TTL-cached listing, so a book added
+        and shelved within the TTL is missing from it; the entry itself is the
+        authoritative match. Returns a match dict, or None to fall back to the scan.
+        """
+        if self._source_name != 'BookOrbit' or active_client is None:
+            return None
+        try:
+            info = active_client.get_audiobook_info(grimmory_id)
+        except Exception as e:
+            logger.warning(
+                "Shelf-watch: same-entry audio check failed for %s:%s: %s",
+                self._source_name, grimmory_id, e, exc_info=True,
+            )
+            return None
+        if not isinstance(info, dict) or not info.get('tracks'):
+            return None
+        logger.info(
+            "Shelf-watch: %s:%s has audio on its own entry; auto-matching same entry "
+            "(candidate pool not consulted)", self._source_name, grimmory_id,
+        )
+        return {
+            'audio_source': 'BookOrbit',
+            'audio_source_id': grimmory_id,
+            'audio_provider_book_id': grimmory_id,
+            'audio_title': grimmory_book.get('title') or '',
+            'audio_duration': info.get('duration_seconds'),
+            'audio_cover_url': f"/api/bookorbit/audiobook-cover/{grimmory_id}",
+            'score': 100.0,
+            'match_reason': 'same_entry',
+        }
+
     def _create_audio_mapping_and_move(self, grimmory_book: dict, filename: str,
                                        grimmory_id: str, top_match: dict,
                                        watch_shelf: str, kobo_shelf: str,
@@ -522,7 +577,8 @@ class ShelfWatchService:
             f"Shelf-watch: auto-matched '{filename}' -> {saved.audio_source}:{saved.audio_source_id} "
             f"(score={top_match.get('score')})"
         )
-        self._move_shelf(filename, watch_shelf, kobo_shelf, client=active_client)
+        self._move_shelf(filename, watch_shelf, kobo_shelf, client=active_client,
+                         book=saved, user_id=user_id)
 
     def _create_ebook_only_and_move(self, grimmory_book: dict, filename: str,
                                     grimmory_id: str,
@@ -550,7 +606,8 @@ class ShelfWatchService:
             except Exception:
                 pass
         logger.info(f"Shelf-watch: created ebook-only mapping for '{filename}' (abs_id={saved.abs_id})")
-        self._move_shelf(filename, watch_shelf, kobo_shelf, client=active_client)
+        self._move_shelf(filename, watch_shelf, kobo_shelf, client=active_client,
+                         book=saved, user_id=user_id)
 
     # ---- reading-watch ("Continue Reading" auto-match: BookOrbit, Grimmory) --
 
@@ -858,12 +915,16 @@ class ShelfWatchService:
         return str(author or '').strip()
 
     def _move_shelf(self, filename: str, from_shelf: str, to_shelf: str,
-                    client=None) -> None:
+                    client=None, book=None, user_id: int = None) -> None:
         if not from_shelf or not to_shelf or from_shelf == to_shelf:
             return
         lib_client = client or self.booklore_client
         try:
-            if not lib_client.move_between_shelves(filename, from_shelf, to_shelf):
+            if defer_shelf_add(self.database_service, book, user_id):
+                moved = lib_client.remove_from_shelf(filename, from_shelf)
+            else:
+                moved = lib_client.move_between_shelves(filename, from_shelf, to_shelf)
+            if not moved:
                 logger.warning(
                     f"Shelf-watch: move_between_shelves returned False for '{filename}' "
                     f"({from_shelf} -> {to_shelf})"

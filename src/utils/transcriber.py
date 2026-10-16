@@ -18,7 +18,7 @@ import shutil
 import subprocess
 import gc
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional
 import math
 import re
 from bisect import bisect_right
@@ -80,6 +80,95 @@ class AudioTranscriber:
                 f"⚠️ Could not invalidate transcript cache for {abs_id}: {e}", exc_info=True
             )
             return False
+
+    def has_word_timed_transcript(self, abs_id: str) -> bool:
+        """Whether a completed cache contains usable word timings for re-alignment."""
+        try:
+            progress = json.loads((self.cache_root / str(abs_id) / '_progress.json').read_text())
+            return bool(
+                progress.get('done') and progress.get('chunks_completed', 0) > 0
+                and self._valid_word_timed_segments(progress.get('transcript'))
+            )
+        except (OSError, ValueError, TypeError, AttributeError):
+            return False
+
+    def _valid_word_timed_segments(self, segments: object) -> bool:
+        """Require complete, ordered word timings bounded by each segment."""
+        if not isinstance(segments, list) or not segments:
+            return False
+        previous_word_start = 0.0
+        for segment in segments:
+            if not isinstance(segment, dict):
+                return False
+            start, end, text, words = (
+                segment.get('start'), segment.get('end'), segment.get('text'),
+                segment.get('words'),
+            )
+            if (not isinstance(start, (int, float)) or isinstance(start, bool)
+                    or not isinstance(end, (int, float)) or isinstance(end, bool)
+                    or not math.isfinite(start) or not math.isfinite(end)
+                    or start < 0 or end < start or not isinstance(text, str)
+                    or not isinstance(words, list) or not words):
+                return False
+
+            expected = [self.polisher.normalize(token) for token in text.split()]
+            expected = [token for token in expected if token]
+            actual = []
+            for word in words:
+                if not isinstance(word, dict) or not isinstance(word.get('word'), str):
+                    return False
+                word_start, word_end = word.get('start'), word.get('end')
+                if (not word['word'].strip()
+                        or not isinstance(word_start, (int, float)) or isinstance(word_start, bool)
+                        or not isinstance(word_end, (int, float)) or isinstance(word_end, bool)
+                        or not math.isfinite(word_start) or not math.isfinite(word_end)
+                        or word_start < previous_word_start or word_end < word_start
+                        or word_start < start or word_end > end):
+                    return False
+                previous_word_start = word_start
+                actual.extend(
+                    token for token in (
+                        self.polisher.normalize(raw) for raw in word['word'].split()
+                    ) if token
+                )
+            if actual != expected:
+                return False
+        return True
+
+    def get_cached_word_timed_transcript(
+        self, abs_id: str, expected_duration: float
+    ) -> Optional[List[Dict]]:
+        """Return a completed cached word transcript with adequate duration coverage."""
+        try:
+            progress = json.loads(
+                (self.cache_root / str(abs_id) / "_progress.json").read_text(encoding="utf-8")
+            )
+            segments = progress.get("transcript")
+            if (not progress.get("done") or progress.get("chunks_completed", 0) <= 0
+                    or not self._valid_word_timed_segments(segments)):
+                return None
+            duration = float(expected_duration)
+            if not math.isfinite(duration) or duration <= 0:
+                return None
+            final_word_end = max(
+                word["end"]
+                for segment in segments
+                for word in segment["words"]
+            )
+            actual_duration = (
+                progress.get("cumulative_duration")
+                if progress.get("vad_filter") is True else final_word_end
+            )
+            actual_duration = float(actual_duration)
+            if not math.isfinite(actual_duration):
+                return None
+            try:
+                self._check_audio_coverage(actual_duration, duration, stage="cached transcript")
+            except ValueError:
+                return None
+            return segments
+        except (OSError, ValueError, TypeError, AttributeError):
+            return None
 
     @property
     def split_duration(self) -> int:
@@ -511,17 +600,22 @@ class AudioTranscriber:
         return new_files if new_files else [file_path]
 
     @staticmethod
-    def _prune_audio_cache(book_cache_dir: Path) -> None:
-        """Remove heavy audio artifacts after a successful run but keep `_progress.json`
-        (the finished transcript) so a later re-align can reuse it instead of
-        re-downloading audio and re-running Whisper."""
+    def _prune_audio_cache(book_cache_dir: Path, remove_directories: bool = False) -> None:
+        """Remove heavy audio but retain `_progress.json` for later re-alignment.
+
+        Source-track directories remain reusable after success; permanent failure
+        can remove them too without discarding the transcript.
+        """
         if not book_cache_dir.exists():
             return
         for artifact in book_cache_dir.iterdir():
-            if artifact.name == "_progress.json" or artifact.is_dir():
+            if artifact.name == "_progress.json" or (artifact.is_dir() and not remove_directories):
                 continue
             try:
-                artifact.unlink()
+                if artifact.is_dir():
+                    shutil.rmtree(artifact)
+                else:
+                    artifact.unlink()
             except OSError as cleanup_err:
                 logger.debug(f"Transcript cache cleanup skipped {artifact.name}: {cleanup_err}")
 
@@ -569,7 +663,8 @@ class AudioTranscriber:
                         # this file forever. Re-check it here or the book never heals.
                         try:
                             self._check_audio_coverage(
-                                self._transcript_extent(cached_transcript), expected_duration
+                                (progress.get('cumulative_duration') if progress.get('vad_filter') is True
+                                 else self._transcript_extent(cached_transcript)), expected_duration
                             )
                         except ValueError as coverage_err:
                             progress_file.unlink(missing_ok=True)
@@ -597,6 +692,7 @@ class AudioTranscriber:
         chunks_completed = 0
         cumulative_duration = 0.0
         resuming = False
+        vad_used = False
 
         try:
             # Check for partial resumption
@@ -607,6 +703,7 @@ class AudioTranscriber:
                     chunks_completed = progress.get('chunks_completed', 0)
                     cumulative_duration = progress.get('cumulative_duration', 0.0)
                     full_transcript = progress.get('transcript', [])
+                    vad_used = progress.get('vad_filter') is True
 
                     # Find existing split files
                     cached_files = sorted(book_cache_dir.glob("part_*_split_*.wav"))
@@ -808,6 +905,7 @@ class AudioTranscriber:
                 try:
                     # Use the transcription provider
                     segments = provider.transcribe(local_path)
+                    vad_used = vad_used or getattr(provider, 'last_vad_filter', False) is True
                     raise_if_cancelled()
                     
                     for segment in segments:
@@ -847,6 +945,7 @@ class AudioTranscriber:
                             'chunks_completed': chunks_completed,
                             'cumulative_duration': cumulative_duration,
                             'transcript': full_transcript,
+                            'vad_filter': vad_used,
                             'done': (chunks_completed == total_chunks)
                         }, f)
                 except (FileNotFoundError, NotADirectoryError):
@@ -866,7 +965,10 @@ class AudioTranscriber:
             # Belt-and-braces: chunks can individually fail to decode, so the
             # transcript can still fall short of audio that measured fine above.
             try:
-                self._check_audio_coverage(self._transcript_extent(full_transcript), expected_duration)
+                # VAD can omit trailing music; decoded/processed duration still proves audio coverage.
+                self._check_audio_coverage(
+                    cumulative_duration if vad_used else self._transcript_extent(full_transcript), expected_duration
+                )
             except ValueError as coverage_err:
                 progress_file.unlink(missing_ok=True)
                 logger.error(f"❌ '{abs_id}' {coverage_err}", exc_info=True)

@@ -15,7 +15,7 @@ import pytest
 
 from src.db.database_service import DatabaseService
 from src.services import map_quality
-from src.services.alignment_service import AlignmentService
+from src.services.alignment_service import AlignmentService, ContentMatchRejected
 from src.services.map_quality import transcript_text_overlap
 from src.utils.polisher import Polisher
 
@@ -75,6 +75,33 @@ def test_overlap_identical_text_scores_near_one():
     assert transcript_text_overlap(text, text) == pytest.approx(1.0)
 
 
+def test_partial_omnibus_refusal_logs_counts_and_regional_evidence(service, caplog, monkeypatch):
+    _guard_env(monkeypatch)
+    ebook = _sequential_words(1000)
+    segments = [{'start': 0, 'end': 100, 'text': _sequential_words(100)}]
+    with pytest.raises(ContentMatchRejected) as refusal:
+        service.align_and_store('partial-omnibus', segments, ebook)
+    reason = str(refusal.value)
+    assert 'ebook 1,000 / transcript 100 tokens = 10.00x' in reason
+    assert 'ebook quartile overlap:' in reason
+    assert ' / 0.0% / 0.0% / 0.0%' in reason
+    assert 'no exact match' in reason
+    assert 'Completed transcript retained' in reason
+    assert 'do not appear to be the same work' not in reason
+    assert reason in caplog.text
+    assert service._get_alignment('partial-omnibus') is None
+
+
+def test_overlap_diagnostics_use_the_same_samples_as_the_verdict():
+    diagnostics = {}
+    overlap = transcript_text_overlap(_sequential_words(100), _sequential_words(1000),
+                                      diagnostics=diagnostics)
+    assert diagnostics['sampled'] == 200
+    assert diagnostics['matched'] / diagnostics['sampled'] == overlap
+    assert diagnostics['quartiles'][0] > 0
+    assert diagnostics['quartiles'][1:] == [0, 0, 0]
+
+
 def test_overlap_survives_an_inline_word_join_in_the_ebook_text():
     """``_WORD_TOKEN_RE`` does not include
     ``INLINE_TEXT_JOINER``, so left in place it would split a bionic-reading
@@ -125,11 +152,92 @@ def test_align_and_store_refuses_mismatched_content_without_ollama(service):
 
     with pytest.MonkeyPatch.context() as mp:
         _guard_env(mp)
-        result = service.align_and_store("mismatched_book", segments, ebook_text)
-
-    assert result is False
+        with pytest.raises(ContentMatchRejected):
+            service.align_and_store("mismatched_book", segments, ebook_text)
     assert service._get_alignment("mismatched_book") is None
     assert service.database_service.get_alignment_method("mismatched_book") is None
+
+
+def test_recovery_requires_content_proof_even_when_normal_guards_are_disabled(service, monkeypatch):
+    from unittest.mock import Mock
+
+    service._save_alignment("book", [{"char": 0, "ts": 0}, {"char": 100, "ts": 10}],
+                            "lexical", total_chars=100)
+    service._generate_alignment_map_with_method = Mock(side_effect=AssertionError("must not align"))
+
+    def weak_overlap(_transcript, _ebook, diagnostics=None):
+        diagnostics.update(sampled=20)
+        return 0.24
+
+    monkeypatch.setattr(map_quality, "transcript_text_overlap", weak_overlap)
+    with pytest.MonkeyPatch.context() as mp:
+        _guard_env(mp, ollama_guard="false", lexical_guard="false")
+        with pytest.raises(ContentMatchRejected, match="required 25.0%"):
+            service.align_and_store(
+                "book", [{"start": 0, "end": 10, "text": "some transcript"}],
+                "some ebook", require_recovery_content_match=True,
+            )
+
+    assert service._get_alignment("book") == [{"char": 0, "ts": 0}, {"char": 100, "ts": 10}]
+    service._generate_alignment_map_with_method.assert_not_called()
+
+
+@pytest.mark.parametrize("points", [
+    [{"char": 0, "ts": 0}, {"char": float("nan"), "ts": 1}],
+    [{"char": -1, "ts": 0}, {"char": 10, "ts": 1}],
+])
+def test_recovery_rejects_nonfinite_or_negative_map_positions(service, points):
+    text = _sequential_words(300)
+    service._generate_alignment_map_with_method = lambda *args, **kwargs: (points, "lexical", None)
+    with pytest.MonkeyPatch.context() as mp:
+        _guard_env(mp, ollama_guard="false", lexical_guard="false")
+        assert service.align_and_store(
+            "invalid-recovery-map", [{"start": 0, "end": 10, "text": text,
+                                      "words": [{"word": word, "start": 0, "end": 10}
+                                                for word in text.split()]}], text,
+            require_recovery_content_match=True,
+        ) is False
+    assert service._get_alignment("invalid-recovery-map") is None
+
+
+def test_recovery_refuses_timings_discarded_by_alignment(service):
+    from unittest.mock import Mock
+
+    text = _sequential_words(300)
+    service._generate_alignment_map_with_method = Mock(side_effect=AssertionError("must not estimate"))
+    segments = [{"start": 0, "end": 10, "text": text,
+                 "words": [{"word": "unrelated", "start": 0, "end": 10}]}]
+    with pytest.MonkeyPatch.context() as mp:
+        _guard_env(mp, ollama_guard="false", lexical_guard="false")
+        assert service.align_and_store(
+            "incomplete-recovery-timing", segments, text, require_recovery_content_match=True,
+        ) is False
+    service._generate_alignment_map_with_method.assert_not_called()
+    assert service._get_alignment("incomplete-recovery-timing") is None
+
+
+def test_recovery_content_proof_does_not_bypass_configured_guard(service, monkeypatch):
+    calls = []
+
+    def overlap(_transcript, _ebook, diagnostics=None):
+        calls.append(None)
+        if len(calls) == 1:
+            diagnostics.update(sampled=20)
+            return 0.30  # clears the mandatory recovery proof
+        diagnostics.update(sampled=20, ebook_tokens=100, transcript_tokens=100,
+                           quartiles=[0.0, 0.0, 0.0, 0.0])
+        return 0.10  # fails the configured normal guard
+
+    monkeypatch.setattr(map_quality, "transcript_text_overlap", overlap)
+    with pytest.MonkeyPatch.context() as mp:
+        _guard_env(mp, min_overlap="0.20")
+        with pytest.raises(ContentMatchRejected, match="need 20.0%"):
+            service._verify_content_match(
+                [{"text": "matching enough"}], "matching enough", abs_id="book",
+                raise_on_mismatch=True, require_lexical_overlap=True,
+            )
+
+    assert len(calls) == 2
 
 
 def test_align_and_store_stores_matching_content_without_ollama(service):
@@ -161,9 +269,8 @@ def test_content_match_guard_blocks_on_true_and_on_spellings(service, spelling):
 
     with pytest.MonkeyPatch.context() as mp:
         _guard_env(mp, lexical_guard=spelling)
-        result = service.align_and_store(abs_id, segments, ebook_text)
-
-    assert result is False
+        with pytest.raises(ContentMatchRejected):
+            service.align_and_store(abs_id, segments, ebook_text)
     assert service._get_alignment(abs_id) is None
 
 
@@ -257,9 +364,8 @@ def test_embed_failure_falls_through_to_lexical_guard(tmp_path, bad_result, labe
 
         with pytest.MonkeyPatch.context() as mp:
             _guard_env(mp)
-            result = service.align_and_store("embed_fail_book", segments, ebook_text)
-
-        assert result is False, f"guard must still refuse when {label}"
+            with pytest.raises(ContentMatchRejected):
+                service.align_and_store("embed_fail_book", segments, ebook_text)
         assert service._get_alignment("embed_fail_book") is None
     finally:
         db.db_manager.close()
@@ -305,10 +411,10 @@ def test_working_embedding_path_never_consults_the_lexical_guard(tmp_path):
         with pytest.MonkeyPatch.context() as mp:
             _guard_env(mp)
             mp.setattr(map_quality, "transcript_text_overlap", _spy)
-            result = service.align_and_store("embed_ok_book", segments, ebook_text)
+            with pytest.raises(ContentMatchRejected):
+                service.align_and_store("embed_ok_book", segments, ebook_text)
 
         # The embedding verdict (ocean vs mountain => cosine 0.0 < 0.45) refuses.
-        assert result is False
         assert calls == [], "lexical guard must not run when embeddings decided"
     finally:
         db.db_manager.close()

@@ -171,6 +171,7 @@ class TestKosyncDocument(unittest.TestCase):
                 source='filesystem',
                 mtime=0.0,
                 percentage=0.12,
+                hash_method='content',
             )
         )
         self.db_service.save_kosync_document(
@@ -182,6 +183,7 @@ class TestKosyncDocument(unittest.TestCase):
         )
 
         ebook_parser = MagicMock()
+        ebook_parser.hash_method = 'content'
         ebook_parser.get_kosync_id.return_value = target_hash
         container = MagicMock()
         container.ebook_parser.return_value = ebook_parser
@@ -277,6 +279,17 @@ class TestKosyncEndpoints(unittest.TestCase):
         # Clear specific tables
         from src import web_server
         from src.api import kosync_server
+        # A cached app can leave the KoSync database global bound to an
+        # older service; bind it to the fixture's service for this test.
+        patcher = patch.object(kosync_server, '_database_service',
+                               web_server.database_service)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # Mocked endpoint tests must not consume or refresh a real manifest cache.
+        for name in ('_start_manifest_prebuilder', '_load_persisted_manifest'):
+            patcher = patch.object(kosync_server, name, return_value=None)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         with web_server.database_service.get_session() as session:
              session.query(ReadingSession).delete()
              session.query(KosyncDocument).delete()
@@ -286,13 +299,17 @@ class TestKosyncEndpoints(unittest.TestCase):
              session.query(HardcoverDetails).delete()
              session.query(UserCredential).delete()
              session.query(Book).delete()
-        if web_server.database_service.count_users() == 0:
+        # Document tests can leave regular users in this shared database.
+        if not any(user.is_admin for user in web_server.database_service.list_users()):
             web_server.database_service.create_user("admin", "secret", role="admin")
+        web_server.database_service._default_uid = None
         kosync_server._kosync_device_session_registry = None
         with kosync_server._booklore_shelf_mapping_cache_lock:
             kosync_server._booklore_shelf_mapping_cache.clear()
         with kosync_server._hardcover_list_mapping_cache_lock:
             kosync_server._hardcover_list_mapping_cache.clear()
+        with kosync_server._booklore_shelf_filter_cache_lock:
+            kosync_server._booklore_shelf_filter_cache.clear()
         with kosync_server._kosync_open_sessions_lock:
             kosync_server._kosync_open_sessions.clear()
         with kosync_server._kosync_debounce_lock:
@@ -390,6 +407,40 @@ class TestKosyncEndpoints(unittest.TestCase):
         data_bn = response_bn.get_json()
         self.assertIsInstance(data_bn['timestamp'], int)
 
+    def test_put_warns_once_per_user_while_kosync_is_off_server_wide(self):
+        """The device's progress is still accepted and kept; the log says, once, that it stops here."""
+        import logging
+        from src import web_server
+        from src.api import kosync_server
+        from src.utils.logging_utils import get_persistent_condition_logger
+
+        get_persistent_condition_logger().reset()
+        self.addCleanup(get_persistent_condition_logger().reset)
+        doc = 'k' * 32
+        payload = {'document': doc, 'progress': '/body/test', 'device': 'TestKobo', 'device_id': 'KOBO123'}
+
+        def put(pct):
+            return self.client.put('/syncs/progress', headers=self.auth_headers, json={**payload, 'percentage': pct})
+
+        with patch.dict(os.environ, {'KOSYNC_ENABLED': 'false'}), \
+             self.assertLogs(kosync_server.logger, level='DEBUG') as logs:
+            responses = [put(pct) for pct in (0.2, 0.3, 0.4)]
+        self.assertEqual([r.status_code for r in responses], [200] * 3)
+        self.assertEqual(set(responses[-1].get_json()), {'document', 'timestamp'})
+        self.assertAlmostEqual(float(web_server.database_service.get_kosync_document(doc).percentage), 0.4)
+        gate_lines = [r for r in logs.records if 'switched off server-wide' in r.getMessage()]
+        self.assertEqual([r.levelno for r in gate_lines], [logging.WARNING, logging.DEBUG, logging.DEBUG])
+        self.assertIn("device 'TestKobo'", gate_lines[0].getMessage())
+
+        # Switched back on: one recovery line, then nothing more about the gate.
+        with patch.dict(os.environ, {'KOSYNC_ENABLED': 'true'}), \
+             self.assertLogs(kosync_server.logger, level='DEBUG') as logs:
+            self.assertEqual(put(0.5).status_code, 200)
+            self.assertEqual(put(0.6).status_code, 200)
+        self.assertFalse(any('switched off server-wide' in r.getMessage() for r in logs.records))
+        recovered = [r for r in logs.records if 'switched on server-wide again' in r.getMessage()]
+        self.assertEqual([r.levelno for r in recovered], [logging.INFO])
+
     def test_put_links_unmapped_hash_to_book_via_filename_sibling(self):
         """A device hash unknown to the book but sharing the ebook filename should
         link to the existing book on PUT instead of falling to auto-discovery."""
@@ -431,6 +482,95 @@ class TestKosyncEndpoints(unittest.TestCase):
         self.assertEqual(linked.linked_abs_id, "abs-sib")
         # It linked to the existing book rather than auto-creating an ebook-only mapping.
         self.assertIsNone(db.get_book("ebook-" + device_hash[:16]))
+
+    def _cwa_library_with_checksum(self, calibre_book_id, checksum):
+        """A Calibre library whose metadata.db has CWA's checksum history (#302)."""
+        import sqlite3
+        import tempfile
+        library = tempfile.mkdtemp(prefix="cwa_library_")
+        self.addCleanup(shutil.rmtree, library, True)
+        with sqlite3.connect(os.path.join(library, "metadata.db")) as conn:
+            conn.execute(
+                "CREATE TABLE book_format_checksums (id INTEGER PRIMARY KEY, book INTEGER, "
+                "format TEXT, checksum TEXT(32), version TEXT, created TIMESTAMP)"
+            )
+            conn.execute(
+                "INSERT INTO book_format_checksums (book, format, checksum, version, created) "
+                "VALUES (?, 'EPUB', ?, 'koreader', '2026-10-08T00:07:26')",
+                (calibre_book_id, checksum),
+            )
+        return library
+
+    def _save_cwa_book(self, abs_id, calibre_book_id, matched_hash, percentage):
+        from src import web_server
+        db = web_server.database_service
+        db.save_book(Book(
+            abs_id=abs_id,
+            abs_title="CWA Book",
+            ebook_source="CWA",
+            ebook_source_id=str(calibre_book_id),
+            ebook_filename=f"cwa_{calibre_book_id}.epub",
+            kosync_doc_id=matched_hash,
+            status="active",
+            sync_mode="ebook_only",
+        ))
+        db.save_kosync_document(KosyncDocument(
+            document_hash=matched_hash,
+            progress='/body/chapter[3]',
+            percentage=percentage,
+            device='Bridge',
+            device_id='BR',
+            timestamp=utcnow(),
+            linked_abs_id=abs_id,
+        ))
+        return db
+
+    def test_get_resolves_cwa_download_via_checksum_history(self):
+        """A copy downloaded from CWA after a metadata edit has a hash BookBridge never
+        computed. CWA recorded it when it served the file, so the first GET resolves."""
+        matched_hash = 'a3' * 16
+        device_hash = 'c4' * 16
+        db = self._save_cwa_book("abs-cwa-get", 95, matched_hash, 0.37)
+        library = self._cwa_library_with_checksum(95, device_hash)
+
+        with patch.dict(os.environ, {"CALIBRE_LIBRARY_PATH": library}):
+            response = self.client.get('/syncs/progress/' + device_hash, headers=self.auth_headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertAlmostEqual(response.get_json()['percentage'], 0.37)
+        self.assertEqual(db.get_kosync_document(device_hash).linked_abs_id, "abs-cwa-get")
+
+    def test_put_links_cwa_download_via_checksum_history(self):
+        matched_hash = 'a5' * 16
+        device_hash = 'c6' * 16
+        db = self._save_cwa_book("abs-cwa-put", 96, matched_hash, 0.10)
+        library = self._cwa_library_with_checksum(96, device_hash)
+
+        with patch.dict(os.environ, {"CALIBRE_LIBRARY_PATH": library}):
+            response = self.client.put(
+                '/syncs/progress',
+                headers=self.auth_headers,
+                json={
+                    'document': device_hash,
+                    'progress': '/body/chapter[9]',
+                    'percentage': 0.55,
+                    'device': 'Kindle',
+                    'device_id': 'KPW',
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(db.get_kosync_document(device_hash).linked_abs_id, "abs-cwa-put")
+        self.assertIsNone(db.get_book("ebook-" + device_hash[:16]))
+
+    def test_get_unknown_hash_still_404_when_cwa_has_no_record(self):
+        self._save_cwa_book("abs-cwa-miss", 97, 'a7' * 16, 0.20)
+        library = self._cwa_library_with_checksum(97, 'c8' * 16)
+
+        with patch.dict(os.environ, {"CALIBRE_LIBRARY_PATH": library}):
+            response = self.client.get('/syncs/progress/' + 'c9' * 16, headers=self.auth_headers)
+
+        self.assertEqual(response.status_code, 404)
 
     def test_get_progress_returns_404_for_missing(self):
         """Test that GET returns 404 (not 502) for missing document."""
@@ -1068,6 +1208,40 @@ class TestKosyncEndpoints(unittest.TestCase):
         ids = [b["abs_id"] for b in response.get_json()["books"]]
         self.assertEqual(ids, ["mine"])
 
+    def test_device_sync_manifest_fails_closed_when_ownership_lookup_fails(self):
+        from src.api import kosync_server
+        from src import web_server
+
+        manifest = {
+            "generated_at": 1,
+            "revision": "global",
+            "delete_mode": "mirror",
+            "books": [
+                {"abs_id": "owned", "filename": "owned.epub"},
+                {"abs_id": "private", "filename": "private.epub"},
+            ],
+        }
+        with kosync_server._manifest_cache_lock:
+            old_manifest = kosync_server._manifest_cache
+            kosync_server._manifest_cache = manifest
+        try:
+            with patch.object(web_server.database_service, "get_books_by_status",
+                              side_effect=RuntimeError("synthetic ownership lookup failure")), \
+                 patch.object(kosync_server, "_start_manifest_prebuilder"), \
+                 patch.object(kosync_server, "note_device_sync_activity"):
+                response = self.client.get(
+                    "/koreader/device-sync/manifest", headers=self.auth_headers,
+                )
+        finally:
+            with kosync_server._manifest_cache_lock:
+                kosync_server._manifest_cache = old_manifest
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.get_json(), {
+            "error": "Manifest ownership unavailable",
+        })
+        self.assertNotIn("private", response.get_data(as_text=True))
+
     def test_device_sync_manifest_uses_grimmory_shelves_for_user_collections(self):
         from src.api import kosync_server
         from src import web_server
@@ -1159,6 +1333,205 @@ class TestKosyncEndpoints(unittest.TestCase):
             scoped = kosync_server._scope_manifest_to_user(manifest, admin_id)
 
         self.assertEqual(scoped["books"][0]["shelves"], ["Unsorted"])
+
+    def _shelf_filter_fixture(self, shelf_filter):
+        from src import web_server
+
+        svc = web_server.database_service
+        admin_id = svc._default_user_id()
+        svc.save_book(Book(abs_id="on-kobo", abs_title="On Kobo", ebook_filename="k.epub",
+                           ebook_source="Grimmory", ebook_source_id="1",
+                           status="active", user_id=admin_id))
+        svc.save_book(Book(abs_id="elsewhere", abs_title="Elsewhere", ebook_filename="e.epub",
+                           ebook_source="Grimmory", ebook_source_id="2",
+                           status="active", user_id=admin_id))
+        svc.save_book(Book(abs_id="from-abs", abs_title="From ABS", ebook_filename="a.epub",
+                           status="active", user_id=admin_id))
+        svc.set_user_credential(admin_id, "BOOKLORE_ENABLED", "true")
+        svc.set_user_credential(admin_id, "BOOKLORE_USER", "reader")
+        svc.set_user_credential(admin_id, "BOOKLORE_PASSWORD", "secret")
+        svc.set_user_credential(admin_id, "BOOKLORE_SHELF_NAME", "Kobo")
+        svc.set_user_credential(admin_id, "DEVICE_SYNC_COLLECTION_SOURCE", "off")
+        svc.set_user_credential(admin_id, "DEVICE_SYNC_SHELF_FILTER", shelf_filter)
+
+        client = MagicMock()
+        client.is_configured.return_value = True
+        client.get_shelf_book_ids.return_value = {"Kobo": {"1", "3"}}
+        container = MagicMock()
+        container.user_client_registry.return_value.get_clients.return_value.booklore_client = client
+        manifest = {
+            "generated_at": 1,
+            "revision": "abc",
+            "delete_mode": "mirror",
+            "books": [
+                {"abs_id": abs_id, "title": abs_id, "filename": f"{abs_id}.epub",
+                 "content_hash": abs_id, "download_path": "/x", "size": 1}
+                for abs_id in ("on-kobo", "elsewhere", "from-abs", "matched-later")
+            ],
+        }
+        return admin_id, client, container, manifest
+
+    def _use_booklore_shelf_payloads(self, client, payloads):
+        from src.api.booklore_client import BookloreClient
+
+        reader = BookloreClient.__new__(BookloreClient)
+        reader._get_json_or_none = lambda endpoint, context: payloads[endpoint]
+        client.get_shelf_book_ids.side_effect = reader.get_shelf_book_ids
+
+    def _expire_shelf_filter_cache(self):
+        from src.api import kosync_server
+
+        with kosync_server._booklore_shelf_filter_cache_lock:
+            for entry in kosync_server._booklore_shelf_filter_cache.values():
+                entry["time"] -= kosync_server._BOOKLORE_SHELF_FILTER_TTL_SECONDS + 1
+
+    def test_device_sync_manifest_shelf_filter_keeps_only_books_on_that_shelf(self):
+        from src.api import kosync_server
+
+        admin_id, client, container, manifest = self._shelf_filter_fixture(" kobo ")
+        with patch.object(kosync_server, "_container", container):
+            scoped = kosync_server._scope_manifest_to_user(manifest, admin_id)
+            kosync_server._scope_manifest_to_user(manifest, admin_id)
+
+        self.assertEqual([item["abs_id"] for item in scoped["books"]], ["on-kobo"])
+        self.assertNotIn("shelves", scoped["books"][0])
+        self.assertNotEqual(scoped["revision"], "abc")
+        container.user_client_registry.return_value.get_clients.assert_called_once_with(admin_id)
+        client.get_shelf_book_ids.assert_called_once_with(["kobo"])
+
+    def test_device_sync_manifest_shelf_filter_cache_survives_a_new_match(self):
+        from src import web_server
+        from src.api import kosync_server
+
+        admin_id, client, container, manifest = self._shelf_filter_fixture("Kobo")
+        with patch.object(kosync_server, "_container", container):
+            kosync_server._scope_manifest_to_user(manifest, admin_id)
+            web_server.database_service.save_book(
+                Book(abs_id="matched-later", abs_title="Matched Later", ebook_filename="m.epub",
+                     ebook_source="Grimmory", ebook_source_id="3", status="active", user_id=admin_id))
+            self._expire_shelf_filter_cache()
+            client.get_shelf_book_ids.return_value = None
+            scoped = kosync_server._scope_manifest_to_user(manifest, admin_id)
+
+        self.assertEqual([item["abs_id"] for item in scoped["books"]], ["on-kobo", "matched-later"])
+        self.assertEqual(len(kosync_server._booklore_shelf_filter_cache), 1)
+
+    def test_device_sync_manifest_shelf_filter_keeps_one_cache_entry_per_reader(self):
+        from src import web_server
+        from src.api import kosync_server
+
+        admin_id, client, container, manifest = self._shelf_filter_fixture("Kobo")
+        with patch.object(kosync_server, "_container", container):
+            kosync_server._scope_manifest_to_user(manifest, admin_id)
+            web_server.database_service.set_user_credential(admin_id, "DEVICE_SYNC_SHELF_FILTER", "Favorites")
+            client.get_shelf_book_ids.return_value = {"Favorites": {"2"}}
+            scoped = kosync_server._scope_manifest_to_user(manifest, admin_id)
+
+        self.assertEqual([item["abs_id"] for item in scoped["books"]], ["elsewhere"])
+        self.assertEqual(client.get_shelf_book_ids.call_count, 2)
+        self.assertEqual(len(kosync_server._booklore_shelf_filter_cache), 1)
+
+    def test_device_sync_manifest_shelf_filter_withholds_manifest_for_unknown_shelf(self):
+        from src.api import kosync_server
+
+        _admin_id, client, container, manifest = self._shelf_filter_fixture("Kobbo")
+        client.get_shelf_book_ids.return_value = {}
+        with kosync_server._manifest_cache_lock:
+            saved_manifest = kosync_server._manifest_cache
+            kosync_server._manifest_cache = manifest
+        try:
+            with patch.object(kosync_server, "_container", container), \
+                 patch.object(kosync_server, "_start_manifest_prebuilder"):
+                response = self.client.get('/koreader/device-sync/manifest', headers=self.auth_headers)
+        finally:
+            with kosync_server._manifest_cache_lock:
+                kosync_server._manifest_cache = saved_manifest
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("Kobbo", response.get_json()["detail"])
+
+    def test_device_sync_manifest_shelf_filter_falls_back_to_stale_membership(self):
+        from src.api import kosync_server
+
+        admin_id, client, container, manifest = self._shelf_filter_fixture("Kobo")
+        with patch.object(kosync_server, "_container", container):
+            kosync_server._scope_manifest_to_user(manifest, admin_id)
+            self._expire_shelf_filter_cache()
+            client.get_shelf_book_ids.return_value = None
+            scoped = kosync_server._scope_manifest_to_user(manifest, admin_id)
+
+        self.assertEqual([item["abs_id"] for item in scoped["books"]], ["on-kobo"])
+
+    def test_device_sync_manifest_shelf_filter_withholds_manifest_when_a_shelf_is_unreadable(self):
+        from src.api import kosync_server
+
+        admin_id, client, container, manifest = self._shelf_filter_fixture("Kobo")
+        client.get_shelf_book_ids.return_value = None
+        with patch.object(kosync_server, "_container", container):
+            with self.assertRaises(kosync_server.ManifestShelfFilterUnavailable):
+                kosync_server._scope_manifest_to_user(manifest, admin_id)
+
+        self.assertEqual(kosync_server._booklore_shelf_filter_cache, {})
+
+    def test_device_sync_manifest_shelf_filter_uses_stale_membership_on_malformed_payload(self):
+        from src.api import kosync_server
+
+        admin_id, client, container, manifest = self._shelf_filter_fixture("Kobo")
+        payloads = {
+            "/api/v1/shelves": [{"id": 7, "name": "Kobo"}],
+            "/api/v1/shelves/7/books": [{"id": 1}],
+        }
+        self._use_booklore_shelf_payloads(client, payloads)
+        with patch.object(kosync_server, "_container", container):
+            kosync_server._scope_manifest_to_user(manifest, admin_id)
+            self._expire_shelf_filter_cache()
+            payloads["/api/v1/shelves/7/books"] = {"unexpected": "not a book list"}
+            scoped = kosync_server._scope_manifest_to_user(manifest, admin_id)
+
+        self.assertEqual([item["abs_id"] for item in scoped["books"]], ["on-kobo"])
+
+    def test_device_sync_manifest_returns_503_when_malformed_shelf_payload_has_no_cache(self):
+        from src.api import kosync_server
+
+        _admin_id, client, container, manifest = self._shelf_filter_fixture("Kobo")
+        self._use_booklore_shelf_payloads(client, {
+            "/api/v1/shelves": [{"id": 7, "name": "Kobo"}],
+            "/api/v1/shelves/7/books": {"unexpected": "not a book list"},
+        })
+        with kosync_server._manifest_cache_lock:
+            saved_manifest = kosync_server._manifest_cache
+            kosync_server._manifest_cache = manifest
+        try:
+            with patch.object(kosync_server, "_container", container), \
+                 patch.object(kosync_server, "_start_manifest_prebuilder"):
+                response = self.client.get("/koreader/device-sync/manifest", headers=self.auth_headers)
+        finally:
+            with kosync_server._manifest_cache_lock:
+                kosync_server._manifest_cache = saved_manifest
+
+        self.assertEqual(response.status_code, 503)
+
+    def test_device_sync_manifest_accepts_a_valid_empty_shelf(self):
+        from src.api import kosync_server
+
+        admin_id, client, container, manifest = self._shelf_filter_fixture("Kobo")
+        self._use_booklore_shelf_payloads(client, {
+            "/api/v1/shelves": [{"id": 7, "name": "Kobo"}],
+            "/api/v1/shelves/7/books": [],
+        })
+        with patch.object(kosync_server, "_container", container):
+            scoped = kosync_server._scope_manifest_to_user(manifest, admin_id)
+
+        self.assertEqual(scoped["books"], [])
+
+    def test_device_sync_manifest_shelf_filter_withholds_manifest_when_grimmory_is_down(self):
+        from src.api import kosync_server
+
+        admin_id, client, container, manifest = self._shelf_filter_fixture("Kobo")
+        client.get_shelf_book_ids.side_effect = ConnectionError("grimmory down")
+        with patch.object(kosync_server, "_container", container):
+            with self.assertRaises(kosync_server.ManifestShelfFilterUnavailable):
+                kosync_server._scope_manifest_to_user(manifest, admin_id)
 
     def test_device_sync_manifest_grimmory_falls_back_to_global_for_admin(self):
         """An admin whose Grimmory collection config lives only in the global
@@ -1951,6 +2324,7 @@ class TestKosyncEndpoints(unittest.TestCase):
         booklore_client.download_book.return_value = b'epub-bytes'
 
         ebook_parser = MagicMock()
+        ebook_parser.hash_method = 'content'
         ebook_parser.get_kosync_id_from_bytes.return_value = target_hash
 
         container = MagicMock()
@@ -1967,10 +2341,10 @@ class TestKosyncEndpoints(unittest.TestCase):
         booklore_client.get_all_books.assert_called()
         booklore_client._fetch_and_cache_detail.assert_called_with('bl-1')
         booklore_client.download_book.assert_called_once_with('bl-1')
-        db.save_kosync_document.assert_called_once()
-        saved_doc = db.save_kosync_document.call_args[0][0]
-        self.assertEqual(saved_doc.filename, 'target-book.epub')
-        self.assertEqual(saved_doc.booklore_id, 'bl-1')
+        db.upsert_kosync_hash_metadata.assert_called_once_with(
+            target_hash, 'target-book.epub', 'booklore',
+            mtime=None, booklore_id='bl-1', hash_method='content',
+        )
 
     def test_plugin_session_upload_auto_classifies_device_and_replaces_estimated_overlap(self):
         from src import web_server
@@ -2550,6 +2924,13 @@ class TestKosyncAuthStubs(unittest.TestCase):
     def setUp(self):
         import hashlib
         from src import web_server
+        from src.api import kosync_server
+        # A cached app can leave the KoSync database global bound to an
+        # older service; bind it to the fixture's service for this test.
+        patcher = patch.object(kosync_server, '_database_service',
+                               web_server.database_service)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         # A user must exist or require_login_guard redirects to first-run setup.
         if web_server.database_service.count_users() == 0:
             web_server.database_service.create_user("admin", "secret", role="admin")

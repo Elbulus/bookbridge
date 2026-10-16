@@ -13,7 +13,7 @@ from src.utils.kosync_headers import (
     hash_kosync_key,
     kosync_request_kwargs,
 )
-from src.utils.logging_utils import sanitize_log_data
+from src.utils.logging_utils import get_persistent_condition_logger, sanitize_log_data
 from src.utils.user_config import resolve_setting
 
 logger = logging.getLogger(__name__)
@@ -24,6 +24,19 @@ ABS_DISABLED_SENTINEL = "disabled"
 def is_abs_disabled_value(value) -> bool:
     return str(value or "").strip().lower() == ABS_DISABLED_SENTINEL
 
+# User permissions (ABS API docs, "User Permissions") that together let a user
+# access every library item: all libraries, all tags, and explicit content.
+_ABS_ALL_ITEMS_PERMISSIONS = ("accessAllLibraries", "accessAllTags", "accessExplicitContent")
+
+_ABS_ITEM_LISTING_TTL_SECONDS = 1800
+
+
+class ABSBulkProgress(dict):
+    """`mediaProgress` by library item id, plus whether this login can access every library item."""
+
+    can_access_all_items: bool = False
+
+
 class ABSClient:
     def __init__(self, credentials: dict = None):
         # Configuration is dynamic via properties (no caching). `credentials`
@@ -32,6 +45,7 @@ class ABSClient:
         self._creds = credentials
         self.session = requests.Session()
         self.timeout = 30
+        self._item_ids_cache: Optional[tuple] = None  # (server+token key, expires_at, item ids)
 
     def _cfg(self, key, default=None):
         return resolve_setting(self._creds, key, default)
@@ -762,44 +776,70 @@ class ABSClient:
             logger.error(f"❌ Failed to sync ABS session progress: {e}", exc_info=True)
             return {"success": False, "code": None, "reason": str(e)}
 
-    def get_all_progress_raw(self):
-        """Fetch all user progress in one API call."""
+    def get_all_progress_raw(self) -> Optional[ABSBulkProgress]:
+        """Fetch all user progress in one API call (`mediaProgress` from GET /api/me).
+
+        Returns None when the read failed, so callers can tell it from "no progress".
+        """
         self._update_session_headers()
-        # Try specific progress endpoint first
-        url = f"{self.base_url}/api/me/progress"
+        url = f"{self.base_url}/api/me"
         try:
             r = self.session.get(url, timeout=self.timeout)
-            if r.status_code == 200:
-                data = r.json()
-                items = data if isinstance(data, list) else data.get('libraryItemsInProgress', [])
-                mapped_items = {item.get('libraryItemId'): item for item in items if item.get('libraryItemId')}
-                # logger.debug(f"📊 ABS Bulk Progress (Direct): {len(mapped_items)} items")
-                return mapped_items
-            elif r.status_code == 404:
-                # Fallback to /api/me (normal for older ABS versions)
-                url_fallback = f"{self.base_url}/api/me"
-                r2 = self.session.get(url_fallback, timeout=self.timeout)
-                if r2.status_code == 200:
-                    data = r2.json()
-                    
-                    # Try 'mediaInProgress' (some versions) or 'mediaProgress' (others)
-                    items = data.get('mediaInProgress', [])
-                    if not items:
-                        items = data.get('mediaProgress', [])
-                        
-                    return {item.get('libraryItemId'): item for item in items if item.get('libraryItemId')}
-                else:
-                    logger.warning(f"⚠️ Fallback to /api/me failed: {r2.status_code}")
-            else:
+            if r.status_code != 200:
                 logger.warning(f"⚠️ Failed to fetch all progress: {r.status_code}")
-                
-            return {}
+                return None
+            # The User object includes the user's token: keep only what is used here
+            user = r.json()
+            progress = ABSBulkProgress(
+                (item.get('libraryItemId'), item) for item in user['mediaProgress'] if item.get('libraryItemId')
+            )
+            # librariesAccessible must also be empty: GET /api/libraries lists only those when set
+            permissions = user.get('permissions') or {}
+            progress.can_access_all_items = not user.get('librariesAccessible') and all(
+                permissions.get(key) is True
+                for key in _ABS_ALL_ITEMS_PERMISSIONS
+            )
+            return progress
         except Exception as e:
             logger.error(f"❌ Error fetching all ABS progress: {e}", exc_info=True)
-            return {}
+            return None
+
+    def get_all_item_ids(self) -> Optional[set[str]]:
+        """Ids of every item in the user's libraries, or None when a listing failed.
+
+        The listing is cached per server+token for 30 minutes: callers treat an
+        id in it as present and must verify a miss themselves (it may be new).
+        """
+        cache_key = (self.base_url, self.token)
+        cached = self._item_ids_cache
+        if cached and cached[0] == cache_key and cached[1] > time.monotonic():
+            return cached[2]
+        self._update_session_headers()
+        condition_key = f"abs-item-listing:{self.base_url}:{hash(self.token) & 0xffff}"
+        try:
+            r = self.session.get(f"{self.base_url}/api/libraries", timeout=self.timeout)
+            r.raise_for_status()
+            item_ids = set()
+            for lib in r.json()['libraries']:
+                # limit=0 returns all of the library's items
+                r_items = self.session.get(
+                    f"{self.base_url}/api/libraries/{lib['id']}/items",
+                    params={"limit": 0, "minified": 1},
+                    timeout=self.timeout,
+                )
+                r_items.raise_for_status()
+                data = r_items.json()
+                if len(data['results']) != data['total']:
+                    raise ValueError(f"listed {len(data['results'])} of {data['total']} items")
+                item_ids.update(item['id'] for item in data['results'])
         except Exception as e:
-            logger.error(f"❌ Error fetching all ABS progress: {e}", exc_info=True)
-            return {}
+            get_persistent_condition_logger().warn(
+                logger, condition_key, "⚠️ ABS: Failed to list library items: %s", e, exc_info=True
+            )
+            return None
+        get_persistent_condition_logger().resolve(logger, condition_key, "✅ ABS: Library item listing recovered")
+        self._item_ids_cache = (cache_key, time.monotonic() + _ABS_ITEM_LISTING_TTL_SECONDS, item_ids)
+        return item_ids
 
     def get_in_progress(self, min_progress=0.01):
         """Fetch in-progress items, optimized to avoid redundant detail fetches if possible."""
@@ -895,7 +935,7 @@ class ABSClient:
         if library_id:
             return library_id
 
-        r_lib = self.session.get(f"{self.base_url}/api/libraries")
+        r_lib = self.session.get(f"{self.base_url}/api/libraries", timeout=self.timeout)
         if r_lib.status_code != 200:
             logger.warning("⚠️ ABS: Failed to list libraries (status %s)", r_lib.status_code)
             return None
@@ -910,14 +950,20 @@ class ABSClient:
 
     def add_to_collection(self, item_id, collection_name=None):
         """Add an audiobook to a collection, creating the collection if it doesn't exist."""
-        if not collection_name:
-             collection_name = os.environ.get("ABS_COLLECTION_NAME", "abs-kosync")
+        if collection_name is None:
+            collection_name = os.environ.get("ABS_COLLECTION_NAME", "abs-kosync")
+        if not isinstance(collection_name, str) or not collection_name.strip():
+            return False
 
         self._update_session_headers()
         try:
             collections_url = f"{self.base_url}/api/collections"
-            r = self.session.get(collections_url)
+            r = self.session.get(collections_url, timeout=self.timeout)
             if r.status_code != 200:
+                logger.warning(
+                    "Failed to add item to ABS collection '%s': listing collections returned %s",
+                    collection_name, r.status_code
+                )
                 return False
 
             collections = r.json().get('collections', [])
@@ -936,7 +982,8 @@ class ABSClient:
 
                 r_create = self.session.post(collections_url,
                                              json={"libraryId": library_id, "name": collection_name,
-                                                   "books": [item_id]})
+                                                   "books": [item_id]},
+                                             timeout=self.timeout)
                 if r_create.status_code in [200, 201]:
                     logger.info("Added item to newly created ABS Collection: %s", collection_name)
                     return True
@@ -956,7 +1003,7 @@ class ABSClient:
                 return False
 
             add_url = f"{self.base_url}/api/collections/{collection_id}/book"
-            r_add = self.session.post(add_url, json={"id": item_id})
+            r_add = self.session.post(add_url, json={"id": item_id}, timeout=self.timeout)
             if r_add.status_code in [200, 201, 204]:
                 try:
                     details = self.get_item_details(item_id)
@@ -965,10 +1012,76 @@ class ABSClient:
                     title = None
                 logger.info(f"🏷️ Added '{sanitize_log_data(title or str(item_id))}' to ABS Collection: {collection_name}")
                 return True
+            logger.warning(
+                "Failed to add item to ABS collection '%s': add returned %s - %s",
+                collection_name, r_add.status_code, sanitize_log_data(r_add.text)
+            )
             return False
         except Exception as e:
             logger.error(f"❌ Error adding item to ABS collection: {e}", exc_info=True)
             return False
+
+    def add_missing_to_collection(self, item_ids: list[str], collection_name: str) -> tuple[int, list[str]]:
+        """Add the items that are not yet in ``collection_name``.
+
+        An ABS collection belongs to one library, so the collection is matched or
+        created in each item's own library. Returns the number of items added and
+        one line per item that could not be. Raises when the listing fails or ABS
+        stops answering, so nothing is added blind and a stalled server costs a
+        single timeout.
+        """
+        if not isinstance(collection_name, str) or not collection_name.strip():
+            return 0, []
+        if not self.is_configured():
+            return 0, []
+        self._update_session_headers()
+        collections_url = f"{self.base_url}/api/collections"
+        r = self.session.get(collections_url, timeout=self.timeout)
+        r.raise_for_status()
+        collection_ids = {}
+        present = set()
+        for collection in r.json().get('collections', []):
+            if collection.get('name') == collection_name:
+                collection_ids.setdefault(collection.get('libraryId'), collection.get('id'))
+                present.update(book.get('id') for book in collection.get('books') or [])
+
+        refused = []
+        missing = {}
+        for item_id in item_ids:
+            if item_id in present:
+                continue
+            r_item = self.session.get(f"{self.base_url}/api/items/{item_id}", timeout=self.timeout)
+            library_id = r_item.json().get('libraryId') if r_item.status_code == 200 else None
+            if library_id:
+                missing.setdefault(library_id, []).append(item_id)
+            else:
+                refused.append(f"{item_id}: no library (item lookup returned {r_item.status_code})")
+
+        added = 0
+        for library_id, library_items in missing.items():
+            if library_id not in collection_ids:
+                r_create = self.session.post(collections_url,
+                                             json={"libraryId": library_id, "name": collection_name,
+                                                   "books": library_items},
+                                             timeout=self.timeout)
+                if r_create.status_code in [200, 201]:
+                    added += len(library_items)
+                else:
+                    refused.extend(
+                        f"{item_id}: create returned {r_create.status_code} - {sanitize_log_data(r_create.text)}"
+                        for item_id in library_items
+                    )
+                continue
+            add_url = f"{collections_url}/{collection_ids[library_id]}/book"
+            for item_id in library_items:
+                r_add = self.session.post(add_url, json={"id": item_id}, timeout=self.timeout)
+                if r_add.status_code in [200, 201, 204]:
+                    added += 1
+                else:
+                    refused.append(
+                        f"{item_id}: add returned {r_add.status_code} - {sanitize_log_data(r_add.text)}"
+                    )
+        return added, refused
 
     def remove_from_collection(self, item_id, collection_name="abs-kosync"):
         """Remove an audiobook from a collection."""
@@ -1116,11 +1229,14 @@ class KoSyncClient:
                 data = r.json()
                 raw_pct = data.get('percentage')
                 if raw_pct is None:
-                    return None, None, data
+                    # The original sync server answers 200 + {} for an unknown document.
+                    return None, None, {**data, "_http_status": 200}
                 pct = float(raw_pct)
                 # Grab the raw progress string (XPath)
                 xpath = data.get('progress')
                 return pct, xpath, data
+            # The status lets callers tell "no position stored" (404) from an outage.
+            return None, None, {"_http_status": r.status_code}
         except requests.exceptions.ConnectionError as e:
             if self._is_local_server():
                 logger.debug(
@@ -1133,7 +1249,7 @@ class KoSyncClient:
             logger.error(f"❌ Error fetching KoSync progress for doc '{doc_id}': {e}", exc_info=True)
         return None, None, {}
 
-    def update_progress(self, doc_id, percentage, xpath=None):
+    def update_progress(self, doc_id, percentage, xpath=None, fill_if_absent=False):
         if not self.is_configured(): return False
 
         request_kwargs = self._request_kwargs()
@@ -1156,11 +1272,16 @@ class KoSyncClient:
         if self._is_local_server():
             payload["timestamp"] = int(time.time())
             payload["force"] = True
+            if fill_if_absent:
+                payload["fill_if_absent"] = True
         try:
             r = self.session.put(url, json=payload, timeout=10, **request_kwargs)
             if r.status_code in (200, 202, 201, 204):
                 logger.debug(f"   📡 KoSync Updated: {percentage:.1%} with progress '{progress_val}' for doc {doc_id}")
                 return True
+            elif fill_if_absent and r.status_code == 409:
+                logger.info(f"KoSync already holds a position for doc {doc_id}; starting-position fill not applied")
+                return False
             else:
                 logger.error(f"❌ Failed to update KoSync: {r.status_code} - {r.text}")
                 return False

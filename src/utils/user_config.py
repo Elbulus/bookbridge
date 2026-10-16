@@ -30,7 +30,7 @@ PER_USER_CREDENTIAL_KEYS = frozenset({
     # KOReader / KoSync (server URL global; account is per-user)
     "KOSYNC_USER", "KOSYNC_KEY", "KOSYNC_ENABLED", "KOSYNC_AUTH_METHOD",
     "DEVICE_SYNC_COLLECTION_SOURCE", "DEVICE_SYNC_COLLECTIONS",
-    "DEVICE_SYNC_EXCLUDED_SHELVES", "DEVICE_SYNC_HARDCOVER_LISTS",
+    "DEVICE_SYNC_EXCLUDED_SHELVES", "DEVICE_SYNC_SHELF_FILTER", "DEVICE_SYNC_HARDCOVER_LISTS",
     "DEVICE_SYNC_HARDCOVER_LIST_NAMES",
     # Storyteller
     "STORYTELLER_USER", "STORYTELLER_PASSWORD", "STORYTELLER_ENABLED",
@@ -95,6 +95,11 @@ PER_USER_FIELD_GROUPS = [
         ),
         ("KOSYNC_USER", "Sync username", "text"),
         ("KOSYNC_KEY", "Sync password", "secret"),
+        (
+            "DEVICE_SYNC_SHELF_FILTER",
+            "Bridge Sync: only download books on these Grimmory shelves (comma-separated, blank = all)",
+            "text",
+        ),
     ]),
     ("KOReader Collections", [
         (
@@ -212,6 +217,7 @@ SERVICE_ENABLE_KEYS = frozenset({
 })
 
 _FALSEY_SETTING_VALUES = frozenset({"false", "0", "no", "off"})
+_TRUTHY_SETTING_VALUES = frozenset({"true", "1", "yes", "on"})
 
 
 def global_service_disabled(key: str) -> bool:
@@ -223,6 +229,27 @@ def global_service_disabled(key: str) -> bool:
     if key not in SERVICE_ENABLE_KEYS:
         return False
     return str(os.environ.get(key, "")).strip().lower() in _FALSEY_SETTING_VALUES
+
+
+def services_off_server_wide(credentials) -> list[str]:
+    """Service gates switched on in ``credentials`` that the admin has switched off
+    install-wide, sorted.
+
+    The gate in :func:`resolve_setting` is silent by design: the user's own value is
+    stored untouched and simply answers 'false' for as long as the global is off.
+    The integrations pages show that as "Off server-wide"; this is the same answer
+    for code that reports a user's integrations back (the admin API), so a
+    provisioning script does not take a saved 'true' for a working one.
+    ``credentials`` may be a stored credential dict or the values of a single
+    write; only explicit truthy values count, a blank is not a switch.
+    """
+    if not credentials:
+        return []
+    return sorted(
+        key for key in SERVICE_ENABLE_KEYS
+        if str(credentials.get(key, "")).strip().lower() in _TRUTHY_SETTING_VALUES
+        and global_service_disabled(key)
+    )
 
 
 def resolve_setting(credentials, key, default=None, *, enforce_global_gate: bool = True):
