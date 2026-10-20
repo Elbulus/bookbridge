@@ -38,7 +38,7 @@ def _artifact_backed(book):
 def register_hashes(db, client, book, adopt, details=None, user_id=None):
     """Link actual plain/read-aloud OPDS file hashes, preserving primary and text EPUB."""
     if os.environ.get("KOSYNC_HASH_METHOD", "content").strip().lower() != "content":
-        logger.info("Storyteller hashes: filename method; skipping %s", book.storyteller_uuid)
+        logger.debug("Storyteller hashes: filename method; skipping %s", book.storyteller_uuid)
         return False
     if not client or not client.is_configured():
         return False
@@ -84,23 +84,29 @@ def register_hashes(db, client, book, adopt, details=None, user_id=None):
         existing = db.get_kosync_document(doc_hash)
         owner = getattr(existing, "linked_abs_id", None) if existing else None
         if owner and owner != book.abs_id:
-            logger.info("Storyteller hashes: %s hash %s already owned by %s; skipping",
-                        variant, doc_hash, owner)
+            # Repeats every pass while the conflict stands; say it once per fingerprint.
+            (logger.info if changed else logger.debug)(
+                "Storyteller hashes: %s hash %s already owned by %s; skipping",
+                variant, doc_hash, owner)
             continue
         adopt(book.abs_id, doc_hash)
-        logger.info("Storyteller hashes: linked %s hash %s to %s",
-                    variant, doc_hash, book.abs_id)
+        logger.debug("Storyteller hashes: ensured %s hash %s on %s",
+                     variant, doc_hash, book.abs_id)
 
-    with _STATE_LOCK:
-        state = _state(db, key)
-        state[uuid] = {
-            "ebook": plain_hash,
-            "readaloud": readaloud_hash if need_readaloud else previous.get("readaloud"),
-            "fingerprint": fingerprint,
-        }
-        db.set_json_setting(key, state)
-    logger.info("Storyteller hashes: %s fingerprint for %s",
-                "changed; rehashed" if changed else "unchanged; reused", uuid)
+    entry = {
+        "ebook": plain_hash,
+        "readaloud": readaloud_hash if need_readaloud else previous.get("readaloud"),
+        "fingerprint": fingerprint,
+    }
+    if entry != previous:
+        with _STATE_LOCK:
+            state = _state(db, key)
+            state[uuid] = entry
+            db.set_json_setting(key, state)
+    if changed:
+        logger.info("Storyteller hashes: fingerprint changed; rehashed %s", uuid)
+    else:
+        logger.debug("Storyteller hashes: fingerprint unchanged; reused %s", uuid)
     return True
 
 
@@ -150,5 +156,5 @@ def scan_linked(db, client, books, adopt, user_id, library=None):
         current = _state(db, key)
         current["_cursor"] = (start + inspected) % len(entries)
         db.set_json_setting(key, current)
-    logger.info("Storyteller hashes: user %s scanned=%d changed=%d",
-                user_id, inspected, to_hash)
+    (logger.info if to_hash else logger.debug)(
+        "Storyteller hashes: user %s scanned=%d changed=%d", user_id, inspected, to_hash)

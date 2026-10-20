@@ -256,6 +256,33 @@ def test_auto_link_title_collision_is_left_for_manual_add():
     create.assert_not_called()
 
 
+def test_auto_link_remembers_declined_books_so_newer_ones_still_link():
+    from src import web_server as ws
+
+    store = {}
+    db = Mock()
+    db.get_book_by_kosync_id.return_value = None
+    db.get_kosync_document.return_value = None
+    db.get_json_setting.side_effect = lambda key, default=None: store.get(key, default)
+    db.set_json_setting.side_effect = lambda key, value: store.__setitem__(key, value)
+    client = Mock()
+    client.get_kosync_content_hash.return_value = "a" * 32
+    aligned = {"status": "ALIGNED", "missing": False, "fingerprint": "fp-1"}
+    mapped = [SimpleNamespace(abs_id=f"bo-{n}", abs_title=f"Taken {n}", storyteller_uuid=None)
+              for n in range(7)]
+    library = [{"uuid": f"dup-{n}", "title": f"Taken {n}", "readaloud": aligned} for n in range(7)]
+    library.append({"uuid": "fresh", "title": "Fresh Book", "readaloud": aligned})
+    saved = SimpleNamespace(abs_id="ebook-new", storyteller_uuid="fresh")
+    with patch.object(ws, "database_service", db), \
+         patch.object(ws, "user_setting", return_value="on"), \
+         patch.object(ws, "_create_ebook_only_mapping_from_queue_item", return_value=saved) as create, \
+         patch.object(ws, "_claim_book_for_user_id"):
+        assert ws._storyteller_auto_link_candidates(3, client, library, list(mapped), set()) == 0
+        assert ws._storyteller_auto_link_candidates(3, client, library, list(mapped), set()) == 1
+    create.assert_called_once()
+    assert create.call_args.args[0]["storyteller_uuid"] == "fresh"
+
+
 def test_auto_link_foreign_uuid_uses_existing_join_policy():
     from src import web_server as ws
 
