@@ -353,12 +353,18 @@ class TestMatchPathsRegression(unittest.TestCase):
         owned.document_hash = "hash-theirs"
         owned.linked_abs_id = "some-other-book"
         self.mock_container.mock_database_service.get_kosync_document.return_value = owned
+        self.mock_container.mock_database_service.adopt_kosync_document_if_unowned.return_value = False
 
-        web_server._adopt_kosync_progress_for_book("ab-1", "hash-theirs")
+        with self.assertLogs("src.web_server", level="INFO") as logs:
+            web_server._adopt_kosync_progress_for_book("ab-1", "hash-theirs")
 
         self.mock_container.mock_database_service.adopt_kosync_document_if_unowned.assert_called_once_with(
             "hash-theirs", "ab-1"
         )
+        self.assertTrue(any(
+            "🔒 KoSync document 'hash-theirs' already belongs to 'some-other-book'" in line
+            for line in logs.output
+        ))
 
     @patch("src.web_server.get_kosync_id_for_ebook", return_value="hash-match-1")
     def test_match_route_reuses_alignment_instead_of_requeueing_transcription(self, _mock_kosync):

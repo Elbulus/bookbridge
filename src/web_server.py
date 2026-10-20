@@ -3009,14 +3009,31 @@ def _preserve_or_reset_mapping_status(
 
 
 def _adopt_kosync_progress_for_book(abs_id: str, kosync_doc_id: str) -> None:
-    """Atomically adopt a KoSync hash without taking another book's document."""
+    """Link a hash KOReader already knows to a freshly mapped book (#431), never re-pointing.
+
+    One atomic statement leaves a hash another book owns, by link or as its primary,
+    with that book. The consolidating paths (match, absorb, ebook-only tri-link)
+    delete the loser first, so they reach this with nothing to conflict against.
+    """
     if not abs_id or not isinstance(kosync_doc_id, str) or not kosync_doc_id.strip():
         return
     try:
-        if database_service.adopt_kosync_document_if_unowned(kosync_doc_id.strip(), abs_id):
+        doc_id = kosync_doc_id.strip()
+        if database_service.adopt_kosync_document_if_unowned(doc_id, abs_id):
             logger.info(
                 "🔗 Adopted existing KoSync document '%s' for '%s'",
                 sanitize_log_data(kosync_doc_id), sanitize_log_data(abs_id),
+            )
+            return
+        existing = database_service.get_kosync_document(doc_id)
+        owner = getattr(existing, "linked_abs_id", None) if existing else None
+        if not owner:
+            primary = database_service.get_book_by_kosync_id(doc_id)
+            owner = getattr(primary, "abs_id", None) if primary else None
+        if owner and owner != abs_id:
+            logger.info(
+                "🔒 KoSync document '%s' already belongs to '%s' — not re-pointing it to '%s'",
+                sanitize_log_data(doc_id), sanitize_log_data(owner), sanitize_log_data(abs_id),
             )
     except Exception as e:
         logger.warning(f"⚠️ Failed to adopt KoSync document for '{abs_id}': {e}", exc_info=True)
