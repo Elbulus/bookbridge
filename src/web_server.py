@@ -910,6 +910,8 @@ def _spawn_user_background(fn, *args, label="background"):
         user_id = user.id if user is not None else None
     except Exception:
         user_id = None
+    if user_id is None:
+        user_id = get_current_user_id()
     creds = get_current_user_credentials()
 
     def runner():
@@ -2183,6 +2185,7 @@ def sync_daemon():
         schedule.every(1).minutes.do(manager.flush_reading_sessions_for_all_users)
         schedule.every(int(SYNC_PERIOD_MINS)).minutes.do(_reconcile_aligned_shelf)
         schedule.every(1).hours.do(_run_diagnostics_send)
+        schedule.every(1).hours.do(_run_storyteller_library_hourly)
         schedule.every(int(SYNC_PERIOD_MINS)).minutes.do(_reconcile_abs_collection)
 
         logger.info(f"🔄 Sync daemon started (period: {SYNC_PERIOD_MINS} minutes)")
@@ -3047,6 +3050,80 @@ def _adopt_kosync_progress_for_book(abs_id: str, kosync_doc_id: str) -> None:
         logger.warning(f"⚠️ Failed to adopt KoSync document for '{abs_id}': {e}", exc_info=True)
 
 
+def _storyteller_register_file_hashes(storyteller_uuid, abs_id):
+    """Register Storyteller OPDS hashes off the match request thread."""
+    from src.services.storyteller_library_watch import register_hashes
+
+    try:
+        book = database_service.get_book(abs_id)
+        if not book or book.storyteller_uuid != storyteller_uuid:
+            logger.info("Storyteller hashes: stale mapping %s; skipping", abs_id)
+            return
+        register_hashes(
+            database_service, uc().storyteller_client, book,
+            _adopt_kosync_progress_for_book, user_id=get_current_user_id(),
+        )
+    except Exception as exc:
+        logger.warning("Storyteller hashes: registration failed for %s: %s",
+                       storyteller_uuid, exc, exc_info=True)
+
+
+def _storyteller_user_library_pass(user_id):
+    """Reconcile one reader's Storyteller books on the shared hourly schedule."""
+    from src.services.storyteller_library_watch import scan_linked
+
+    try:
+        claimed = (
+            set(database_service.get_linked_abs_ids(user_id) or [])
+            if user_id is not None else None
+        )
+        books = [
+            book for book in database_service.get_all_books()
+            if book.storyteller_uuid and (claimed is None or book.abs_id in claimed)
+        ]
+        scan_linked(
+            database_service, uc().storyteller_client, books,
+            _adopt_kosync_progress_for_book, user_id,
+        )
+    except Exception as exc:
+        logger.warning("Storyteller hashes: pass failed for user %s: %s",
+                       user_id, exc, exc_info=True)
+
+
+def _run_storyteller_library_hourly():
+    """Dispatch per-user scans via the existing scoped background helper."""
+    from src.utils.user_config import (
+        _ALLOW_GLOBAL_FALLBACK_KEY, PER_USER_CREDENTIAL_KEYS, global_fallback_allowed,
+    )
+
+    try:
+        users = [user for user in database_service.list_users() if getattr(user, "active", 1)]
+    except Exception as exc:
+        logger.warning("Storyteller hashes: could not list users: %s", exc, exc_info=True)
+        return
+    for user in users:
+        uid_token = creds_token = None
+        try:
+            uid_token = set_current_user_id(user.id)
+            credentials = database_service.get_user_credentials(user.id) or {}
+            credentials = {key: val for key, val in credentials.items()
+                           if key in PER_USER_CREDENTIAL_KEYS}
+            credentials[_ALLOW_GLOBAL_FALLBACK_KEY] = global_fallback_allowed(database_service, user)
+            creds_token = set_current_user_credentials(credentials)
+            _spawn_user_background(
+                _storyteller_user_library_pass, user.id,
+                label=f"storyteller-library-{user.id}",
+            )
+        except Exception as exc:
+            logger.warning("Storyteller hashes: cannot schedule user %s: %s",
+                           user.id, exc, exc_info=True)
+        finally:
+            if creds_token is not None:
+                reset_current_user_credentials(creds_token)
+            if uid_token is not None:
+                reset_current_user_id(uid_token)
+
+
 def _upsert_storyteller_mapping(
     *,
     mode_hint,
@@ -3346,6 +3423,11 @@ def _upsert_storyteller_mapping(
         database_service.dismiss_suggestion(saved_book.kosync_doc_id)
     _adopt_kosync_progress_for_book(saved_book.abs_id, saved_book.kosync_doc_id)
 
+    if selected_storyteller_uuid:
+        _spawn_user_background(
+            _storyteller_register_file_hashes, selected_storyteller_uuid, saved_book.abs_id,
+            label="storyteller-link-hashes",
+        )
     return saved_book, None, None
 
 
