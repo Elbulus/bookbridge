@@ -10,6 +10,7 @@ from src.utils.user_context import get_current_user_id
 logger = logging.getLogger(__name__)
 _STATE_LOCK = threading.Lock()
 PASS_LIMIT = 4
+SCAN_BOOK_LIMIT = 24
 
 
 def state_key(user_id):
@@ -103,11 +104,12 @@ def register_hashes(db, client, book, adopt, details=None, user_id=None):
     return True
 
 
-def scan_linked(db, client, books, adopt, user_id):
+def scan_linked(db, client, books, adopt, user_id, library=None):
     """Run a bounded, round-robin per-user backfill over already-linked books."""
     if not client or not client.is_configured():
         return
-    library = client.list_library_books()
+    if library is None:
+        library = client.list_library_books()
     if library is None:
         logger.info("Storyteller hashes: could not list library for user %s", user_id)
         return
@@ -123,14 +125,22 @@ def scan_linked(db, client, books, adopt, user_id):
     start = int(state.get("_cursor", 0) or 0) % len(entries)
     inspected = 0
     to_hash = 0
-    for index in range(len(entries)):
+    for index in range(min(len(entries), SCAN_BOOK_LIMIT)):
         item = entries[(start + index) % len(entries)]
         uuid = item.get("uuid") or item.get("id")
         previous = state.get(uuid, {})
         previous = previous if isinstance(previous, dict) else {}
         readaloud = item.get("readaloud") or {}
         fingerprint = str(readaloud.get("fingerprint") or "") if isinstance(readaloud, dict) else ""
-        if previous.get("fingerprint") != fingerprint or not _is_hash(previous.get("ebook")):
+        needs_readaloud = (
+            _artifact_backed(mappings[uuid])
+            and isinstance(readaloud, dict)
+            and str(readaloud.get("status") or "").upper() == "ALIGNED"
+            and not readaloud.get("missing")
+            and not _is_hash(previous.get("readaloud"))
+        )
+        if (previous.get("fingerprint") != fingerprint
+                or not _is_hash(previous.get("ebook")) or needs_readaloud):
             if to_hash >= PASS_LIMIT:
                 break
             to_hash += 1
