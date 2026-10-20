@@ -882,3 +882,28 @@ def test_library_decode_warnings_suppress_repeats_and_recover(caplog):
         response.json.return_value = []
         assert client.list_library_books() == []
     assert "Storyteller library list decode recovered" in caplog.text
+
+
+
+def test_large_storyteller_state_is_not_exported_to_environment(real_db, monkeypatch):
+    from src.utils.config_loader import ConfigLoader
+    key = "STORYTELLER_519_HASHES:7"
+    monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("STORYTELLER_API_URL", raising=False)
+    state = {f"{i:08x}-1234-1234-1234-123456789abc": {
+        "ebook": "a" * 32, "readaloud": "b" * 32, "fingerprint": "c" * 32} for i in range(1000)}
+    real_db.set_json_setting(key, state)
+    real_db.set_setting("STORYTELLER_API_URL", "http://storyteller.test")
+    ConfigLoader.load_settings(real_db)
+    assert key not in os.environ
+    assert os.environ["STORYTELLER_API_URL"] == "http://storyteller.test"
+    assert real_db.get_json_setting(key) == state
+
+
+def test_bad_environment_row_does_not_stop_later_settings(monkeypatch):
+    from src.utils.config_loader import ConfigLoader
+    monkeypatch.delenv("STORYTELLER_API_URL", raising=False)
+    db = Mock()
+    db.get_all_settings.return_value = {"BAD=KEY": "bad", "STORYTELLER_API_URL": "http://storyteller.test"}
+    ConfigLoader.load_settings(db)
+    assert os.environ["STORYTELLER_API_URL"] == "http://storyteller.test"
