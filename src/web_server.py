@@ -3009,39 +3009,11 @@ def _preserve_or_reset_mapping_status(
 
 
 def _adopt_kosync_progress_for_book(abs_id: str, kosync_doc_id: str) -> None:
-    """Link an already-known KoSync document hash to a freshly mapped book.
-
-    KOReader stores progress under a document hash before the book is mapped. The
-    resolution path reaches that progress by joining KosyncDocument.linked_abs_id, so
-    an unlinked row stays invisible to sync and the book reads as unstarted even
-    though the position is durable and the hashes match exactly (#431). Add Book
-    already computes the same hash, so adopt it here rather than leaving the reader
-    to link it by hand.
-
-    Adoption is fail-closed: a hash already owned by a *different* book is left
-    alone, matching the sibling-hash step below and `_register_hash_for_book`.
-    `ensure_linked_kosync_document` re-points on conflict by design — hash
-    reconciliation needs that to keep sibling hashes of one book durable (#285) —
-    so the ownership check belongs here, at the one caller that must not steal.
-    Re-pointing would hide the loser's stored progress behind the same join this
-    function exists to repair, moving #431 rather than fixing it. The mapping paths
-    that legitimately consolidate a duplicate (`match`, `absorb_duplicate_mapping`,
-    the ebook-only tri-link) all migrate and delete the loser first, which clears
-    its link, so they reach this with nothing to conflict against.
-    """
+    """Atomically adopt a KoSync hash without taking another book's document."""
     if not abs_id or not isinstance(kosync_doc_id, str) or not kosync_doc_id.strip():
         return
     try:
-        doc_id = kosync_doc_id.strip()
-        existing = database_service.get_kosync_document(doc_id)
-        owner = getattr(existing, "linked_abs_id", None) if existing else None
-        if owner and owner != abs_id:
-            logger.info(
-                "🔒 KoSync document '%s' already belongs to '%s' — not re-pointing it to '%s'",
-                sanitize_log_data(doc_id), sanitize_log_data(owner), sanitize_log_data(abs_id),
-            )
-            return
-        if database_service.ensure_linked_kosync_document(doc_id, abs_id):
+        if database_service.adopt_kosync_document_if_unowned(kosync_doc_id.strip(), abs_id):
             logger.info(
                 "🔗 Adopted existing KoSync document '%s' for '%s'",
                 sanitize_log_data(kosync_doc_id), sanitize_log_data(abs_id),
@@ -3064,7 +3036,7 @@ def _storyteller_register_file_hashes(storyteller_uuid, abs_id):
                   if user_id is not None else uc().storyteller_client)
         register_hashes(
             database_service, client, book,
-            _adopt_kosync_progress_for_book, user_id=user_id,
+            user_id=user_id,
         )
     except Exception as exc:
         logger.warning("Storyteller hashes: registration failed for %s: %s",
@@ -3249,7 +3221,7 @@ def _storyteller_user_library_pass(user_id):
         ]
         scan_linked(
             database_service, client, books,
-            _adopt_kosync_progress_for_book, user_id, library=library,
+            user_id, library=library,
         )
     except Exception as exc:
         logger.warning("Storyteller hashes: pass failed for user %s: %s",

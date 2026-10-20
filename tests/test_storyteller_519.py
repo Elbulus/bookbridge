@@ -2,8 +2,14 @@
 
 import hashlib
 import os
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+
+from sqlalchemy import event
+
+from src.db.database_service import DatabaseService
+from src.db.models import Book, KosyncDocument
 
 import pytest
 
@@ -17,9 +23,10 @@ class FakeResponse:
         self.status_code = status
         self.content = content
         self.headers = headers or {}
+        self.closed = False
 
     def close(self):
-        pass
+        self.closed = True
 
     def iter_content(self, chunk_size=1024):
         for idx in range(0, len(self.content), chunk_size):
@@ -31,16 +38,25 @@ def hash_client(content, ignore_range=False):
     client.base_url = "http://storyteller.test"
     client._get_fresh_token = Mock(return_value="token")
 
+    responses = []
+
+    def response(*args):
+        value = FakeResponse(*args)
+        responses.append(value)
+        return value
+
+    client.responses = responses
+
     def get(url, *, headers, params, timeout, stream):
         assert params["format"] in {"ebook", "readaloud"}
         assert stream
         if ignore_range:
-            return FakeResponse(200, content)
+            return response(200, content)
         start = int(headers["Range"].split("=")[1].split("-")[0])
         if start >= len(content):
-            return FakeResponse(416)
+            return response(416)
         end = min(len(content), start + 1024)
-        return FakeResponse(206, content[start:end],
+        return response(206, content[start:end],
                             {"Content-Range": f"bytes {start}-{end - 1}/{len(content)}"})
 
     client.session.get = Mock(side_effect=get)
@@ -55,15 +71,17 @@ def test_range_hash_matches_full_epub_hash(size):
     with patch.dict(os.environ, {"KOSYNC_HASH_METHOD": "content"}):
         assert client.get_kosync_content_hash("a-uuid", "ebook") == expected
     assert client.session.get.call_count <= 12
+    assert client.responses and all(response.closed for response in client.responses)
 
 
 def test_200_fallback_hashes_streamed_full_body():
-    contents = bytes(i % 256 for i in range(350000))
+    contents = hashlib.shake_256(b"storyteller-519-stream").digest(350000)
     client = hash_client(contents, ignore_range=True)
     with patch.dict(os.environ, {"KOSYNC_HASH_METHOD": "content"}):
         assert client.get_kosync_content_hash("a-uuid", "readaloud") == (
             EbookParser._compute_koreader_hash_from_bytes(None, contents))
     client.session.get.assert_called_once()
+    assert client.responses[0].closed
 
 
 def test_filename_method_does_not_call_storyteller():
@@ -92,41 +110,58 @@ def setup_registration(artifact=True, owner=None):
         lambda uuid, fmt: {"ebook": "a" * 32, "readaloud": "b" * 32}[fmt]
     )
     details = {"readaloud": {"status": "ALIGNED", "missing": False, "fingerprint": "v1"}}
-    return db, client, book, details, Mock(), state
+    return db, client, book, details, db.adopt_kosync_document_if_unowned, state
 
 
 def test_registers_plain_and_readaloud_for_artifact_only():
     for artifact, expected in ((True, 2), (False, 1)):
         db, client, book, details, adopt, _ = setup_registration(artifact=artifact)
         with patch.dict(os.environ, {"KOSYNC_HASH_METHOD": "content"}):
-            assert register_hashes(db, client, book, adopt, details, user_id=1)
+            assert register_hashes(db, client, book, details, user_id=1)
         assert adopt.call_count == expected
-        adopt.assert_any_call(book.abs_id, "a" * 32)
+        adopt.assert_any_call("a" * 32, book.abs_id, expected_storyteller_uuid="abcd-1234")
         if not artifact:
             client.get_kosync_content_hash.assert_called_once_with("abcd-1234", "ebook")
 
 
-def test_conflicting_hash_is_never_repointed():
-    db, client, book, details, adopt, _ = setup_registration(owner="other-book")
-    with patch.dict(os.environ, {"KOSYNC_HASH_METHOD": "content"}):
-        assert register_hashes(db, client, book, adopt, details, user_id=3)
-    adopt.assert_called_once_with("ebook-1", "a" * 32)
+@pytest.fixture
+def real_db(tmp_path):
+    db = DatabaseService(str(tmp_path / "storyteller519.db"))
+    try:
+        yield db
+    finally:
+        db.db_manager.close()
+
+
+def test_conflicting_hash_is_never_repointed(real_db, monkeypatch):
+    monkeypatch.setenv("KOSYNC_HASH_METHOD", "content")
+    _, client, _, details, _, _ = setup_registration()
+    book = real_db.save_book(Book(abs_id="ebook-1", storyteller_uuid="abcd-1234",
+                                 ebook_filename="storyteller_abcd-1234.epub"))
+    real_db.save_book(Book(abs_id="other-book"))
+    with real_db.get_session() as session:
+        session.add(KosyncDocument(document_hash="b" * 32, linked_abs_id="other-book",
+                                   percentage=0.4, progress="keep-me"))
+    assert register_hashes(real_db, client, book, details, user_id=3)
+    assert real_db.get_kosync_document("a" * 32).linked_abs_id == book.abs_id
+    other = real_db.get_kosync_document("b" * 32)
+    assert (other.linked_abs_id, other.percentage, other.progress) == ("other-book", Decimal("0.4"), "keep-me")
 
 
 def test_unchanged_fingerprint_skips_rehash_and_change_retains_old_hash():
     db, client, book, details, adopt, state = setup_registration()
     with patch.dict(os.environ, {"KOSYNC_HASH_METHOD": "content"}):
-        register_hashes(db, client, book, adopt, details, user_id=1)
+        register_hashes(db, client, book, details, user_id=1)
         client.get_kosync_content_hash.reset_mock()
-        register_hashes(db, client, book, adopt, details, user_id=1)
+        register_hashes(db, client, book, details, user_id=1)
         client.get_kosync_content_hash.assert_not_called()
         details["readaloud"]["fingerprint"] = "v2"
         client.get_kosync_content_hash.side_effect = (
             lambda uuid, fmt: {"ebook": "c" * 32, "readaloud": "d" * 32}[fmt]
         )
-        register_hashes(db, client, book, adopt, details, user_id=1)
-    assert ("ebook-1", "b" * 32) in [c.args for c in adopt.call_args_list]
-    assert ("ebook-1", "d" * 32) in [c.args for c in adopt.call_args_list]
+        register_hashes(db, client, book, details, user_id=1)
+    assert ("b" * 32, "ebook-1") in [c.args for c in adopt.call_args_list]
+    assert ("d" * 32, "ebook-1") in [c.args for c in adopt.call_args_list]
     assert state["STORYTELLER_519_HASHES:1"]["abcd-1234"]["fingerprint"] == "v2"
 
 
@@ -138,7 +173,7 @@ def test_reconciler_only_handles_passed_user_books():
         {"uuid": "other-uuid", **details},
     ]
     with patch.dict(os.environ, {"KOSYNC_HASH_METHOD": "content"}):
-        scan_linked(db, client, [book], adopt, 17)
+        scan_linked(db, client, [book], 17)
     client.get_kosync_content_hash.assert_any_call("abcd-1234", "ebook")
     assert all(call.args[0] == "abcd-1234" for call in client.get_kosync_content_hash.call_args_list)
     assert "STORYTELLER_519_HASHES:17" in _
@@ -317,7 +352,7 @@ def test_periodic_pass_filters_foreign_books_before_hash_registration():
          patch("src.services.storyteller_library_watch.scan_linked") as scan:
         ws._storyteller_user_library_pass(7)
     assert scan.call_args.args[2] == [mine]
-    assert scan.call_args.args[4] == 7
+    assert scan.call_args.args[3] == 7
 
 
 def test_reconciliation_bounds_changed_hashes_per_pass():
@@ -343,7 +378,7 @@ def test_reconciliation_bounds_changed_hashes_per_pass():
         for book in books
     ]
     with patch.dict(os.environ, {"KOSYNC_HASH_METHOD": "content"}):
-        scan_linked(db, client, books, Mock(), user_id=12)
+        scan_linked(db, client, books, user_id=12)
     assert client.get_kosync_content_hash.call_count == 8  # 4 books x both editions
     assert state["STORYTELLER_519_HASHES:12"]["_cursor"] == 4
 
@@ -400,3 +435,122 @@ def test_link_time_storyteller_hash_lookup_never_uses_global_for_user():
     finally:
         reset_current_user_id(token)
     global_client.get_kosync_content_hash.assert_not_called()
+
+
+@pytest.mark.parametrize("case,expected", [
+    ("new", True), ("unlinked", True), ("own", False),
+    ("foreign_doc", False), ("foreign_primary", False),
+    ("foreign_primary_unlinked", False), ("missing", False), ("stale_uuid", False),
+])
+def test_atomic_adoption_checks_book_and_both_owners(real_db, case, expected):
+    if case != "missing":
+        real_db.save_book(Book(abs_id="target", storyteller_uuid="current"))
+    real_db.save_book(Book(abs_id="other", kosync_doc_id="hash" if "foreign_primary" in case else None))
+    if case in {"unlinked", "own", "foreign_doc", "foreign_primary_unlinked"}:
+        owner = {"own": "target", "foreign_doc": "other"}.get(case)
+        with real_db.get_session() as session:
+            session.add(KosyncDocument(document_hash="hash", linked_abs_id=owner,
+                                       progress="keep", percentage=0.6))
+    statements = []
+    def capture(conn, cursor, statement, parameters, context, many):
+        statements.append(statement)
+    event.listen(real_db.db_manager.engine, "before_cursor_execute", capture)
+    try:
+        result = real_db.adopt_kosync_document_if_unowned(
+            "hash", "target", expected_storyteller_uuid="stale" if case == "stale_uuid" else "current")
+    finally:
+        event.remove(real_db.db_manager.engine, "before_cursor_execute", capture)
+    assert result is expected
+    assert len(statements) == 1
+    assert statements[0].lstrip().upper().startswith("INSERT")
+    doc = real_db.get_kosync_document("hash")
+    if expected or case == "own":
+        assert doc.linked_abs_id == "target"
+    elif case == "foreign_doc":
+        assert doc.linked_abs_id == "other"
+    else:
+        assert doc is None or doc.linked_abs_id is None
+    if case in {"unlinked", "own", "foreign_doc", "foreign_primary_unlinked"}:
+        assert (doc.progress, doc.percentage) == ("keep", Decimal("0.6"))
+
+
+def test_atomic_adoption_refuses_an_owner_claimed_just_before_insert(real_db):
+    real_db.save_book(Book(abs_id="target"))
+    real_db.save_book(Book(abs_id="other"))
+    interleaved = False
+    def claim_first(conn, cursor, statement, parameters, context, many):
+        nonlocal interleaved
+        if not interleaved and statement.lstrip().upper().startswith("INSERT"):
+            interleaved = True
+            assert real_db.adopt_kosync_document_if_unowned("hash", "other")
+    event.listen(real_db.db_manager.engine, "before_cursor_execute", claim_first)
+    try:
+        assert not real_db.adopt_kosync_document_if_unowned("hash", "target")
+    finally:
+        event.remove(real_db.db_manager.engine, "before_cursor_execute", claim_first)
+    assert interleaved
+    assert real_db.get_kosync_document("hash").linked_abs_id == "other"
+
+
+@pytest.mark.parametrize("change", ["delete", "remap"])
+def test_registration_rechecks_book_after_network_requests(real_db, monkeypatch, change):
+    monkeypatch.setenv("KOSYNC_HASH_METHOD", "content")
+    _, client, _, details, _, _ = setup_registration()
+    book = real_db.save_book(Book(abs_id="target", storyteller_uuid="abcd-1234",
+                                 ebook_filename="storyteller_abcd-1234.epub"))
+    def mutate_during_hash(uuid, fmt):
+        if fmt == "ebook":
+            if change == "delete":
+                real_db.delete_book(book.abs_id)
+            else:
+                current = real_db.get_book(book.abs_id)
+                current.storyteller_uuid = "different"
+                real_db.update_book_if_exists(current)
+        return "a" * 32 if fmt == "ebook" else "b" * 32
+    client.get_kosync_content_hash.side_effect = mutate_during_hash
+    register_hashes(real_db, client, book, details, user_id=3)
+    assert real_db.get_kosync_document("a" * 32) is None
+    assert real_db.get_kosync_document("b" * 32) is None
+
+
+def test_web_adoption_preserves_primary_only_foreign_owner(real_db, monkeypatch):
+    from src import web_server as ws
+    real_db.save_book(Book(abs_id="target"))
+    real_db.save_book(Book(abs_id="other", kosync_doc_id="hash"))
+    monkeypatch.setattr(ws, "database_service", real_db)
+    ws._adopt_kosync_progress_for_book("target", "hash")
+    assert real_db.get_kosync_document("hash") is None
+
+
+def test_unchanged_registration_and_cursor_do_not_write(real_db, monkeypatch):
+    monkeypatch.setenv("KOSYNC_HASH_METHOD", "content")
+    _, client, _, details, _, _ = setup_registration()
+    book = real_db.save_book(Book(abs_id="target", storyteller_uuid="abcd-1234",
+                                 ebook_filename="storyteller_abcd-1234.epub"))
+    library = [{"uuid": book.storyteller_uuid, **details}]
+    scan_linked(real_db, client, [book], 3, library=library)
+    client.get_kosync_content_hash.reset_mock()
+    statements = []
+    def capture(conn, cursor, statement, parameters, context, many):
+        statements.append(statement)
+    event.listen(real_db.db_manager.engine, "before_cursor_execute", capture)
+    try:
+        scan_linked(real_db, client, [book], 3, library=library)
+    finally:
+        event.remove(real_db.db_manager.engine, "before_cursor_execute", capture)
+    assert not any(s.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE")) for s in statements)
+    # Saving an equal JSON value still performs extra settings SELECTs and a transaction.
+    assert sum("FROM settings" in s for s in statements) == 3
+    client.get_kosync_content_hash.assert_not_called()
+
+
+def test_rehash_retains_old_rows_in_real_database(real_db, monkeypatch):
+    monkeypatch.setenv("KOSYNC_HASH_METHOD", "content")
+    _, client, _, details, _, _ = setup_registration()
+    book = real_db.save_book(Book(abs_id="target", storyteller_uuid="abcd-1234",
+                                 ebook_filename="storyteller_abcd-1234.epub"))
+    register_hashes(real_db, client, book, details, user_id=3)
+    details["readaloud"]["fingerprint"] = "v2"
+    client.get_kosync_content_hash.side_effect = lambda uuid, fmt: "c" * 32 if fmt == "ebook" else "d" * 32
+    register_hashes(real_db, client, book, details, user_id=3)
+    assert all(real_db.get_kosync_document(h * 32).linked_abs_id == book.abs_id for h in "abcd")
