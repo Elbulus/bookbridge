@@ -3043,50 +3043,38 @@ def _storyteller_register_file_hashes(storyteller_uuid, abs_id):
                        storyteller_uuid, exc, exc_info=True)
 
 
-def _storyteller_auto_skip_state(user_id) -> dict:
-    """Books auto-link already declined for this reader, keyed by uuid -> read-aloud fingerprint."""
-    from src.services.storyteller_library_watch import state_key
-
-    try:
-        state = database_service.get_json_setting(state_key(user_id), default={})
-    except Exception:
-        return {}
-    skipped = state.get("_auto_skip") if isinstance(state, dict) else None
-    return dict(skipped) if isinstance(skipped, dict) else {}
-
-
-def _save_storyteller_auto_skip(user_id, skipped: dict) -> None:
-    """Persist the declined-book map next to the reader's Storyteller hash state."""
+def _storyteller_auto_link_candidates(user_id, client, library, books, claimed, deadline=None):
+    """Auto-link aligned books with bounded joins and round-robin attempts."""
+    from unicodedata import normalize
     from src.services.storyteller_library_watch import _STATE_LOCK, state_key
 
-    key = state_key(user_id)
-    with _STATE_LOCK:
-        state = database_service.get_json_setting(key, default={})
-        state = state if isinstance(state, dict) else {}
-        state["_auto_skip"] = skipped
-        database_service.set_json_setting(key, state)
-
-
-def _storyteller_auto_link_candidates(user_id, client, library, books, claimed):
-    """Auto-link only aligned Storyteller books without touching existing KoSync primaries."""
-    from unicodedata import normalize
-
     enabled = str(user_setting("STORYTELLER_AUTO_LINK", "false") or "").strip().lower()
-    if enabled not in {"true", "on", "1", "yes"}:
+    if enabled not in {"true", "on", "1", "yes"} or not library:
         return 0
+    if deadline is None:
+        deadline = time.monotonic() + 600
 
     def title_key(text):
         return re.sub(r"[\W_]+", "", normalize("NFKC", str(text or "")).casefold())
 
-    # A declined book would otherwise spend one of the pass's attempts every hour
-    # and, once six sit early in the library, starve every newer book.
-    skipped = _storyteller_auto_skip_state(user_id)
+    key = state_key(user_id)
+    try:
+        state = database_service.get_json_setting(key, default={})
+    except Exception:
+        state = {}
+    state = state if isinstance(state, dict) else {}
+    skipped = state.get("_auto_skip", {})
+    skipped = dict(skipped) if isinstance(skipped, dict) else {}
     skipped_before = dict(skipped)
-    linked = 0
-    attempted = 0
-    for item in library:
-        if linked >= 3 or attempted >= 6:
+    start = int(state.get("_auto_cursor", 0) or 0) % len(library)
+    inspected = linked = attempted = joined = 0
+    conditions = get_persistent_condition_logger()
+    now = time.time()
+    for index in range(len(library)):
+        if linked >= 3 or attempted >= 6 or time.monotonic() >= deadline:
             break
+        item = library[(start + index) % len(library)]
+        inspected += 1
         if not isinstance(item, dict):
             continue
         uuid_value = str(item.get("uuid") or item.get("id") or "").strip()
@@ -3097,10 +3085,14 @@ def _storyteller_auto_link_candidates(user_id, client, library, books, claimed):
             logger.debug("Storyteller auto-link: %s not aligned; skipping", uuid_value)
             continue
         fingerprint = str(readaloud.get("fingerprint") or "")
+        failure_key = f"storyteller-auto-link:{user_id}:{uuid_value}"
+        failed = False
         try:
             already = next((book for book in books if book.storyteller_uuid == uuid_value), None)
             if already:
                 if claimed is not None and already.abs_id not in claimed:
+                    if joined >= 25:
+                        continue
                     access = _existing_mapping_access(
                         already, storyteller_uuid=uuid_value,
                         ebook_filename=already.ebook_filename,
@@ -3109,13 +3101,18 @@ def _storyteller_auto_link_candidates(user_id, client, library, books, claimed):
                     if access in {"join", "modify"}:
                         _claim_book_for_user_id(user_id, already.abs_id)
                         claimed.add(already.abs_id)
+                        joined += 1
+                        skipped.pop(uuid_value, None)
                         logger.info("Storyteller auto-link: joined existing %s for user %s",
                                     uuid_value, user_id)
                 else:
                     logger.debug("Storyteller auto-link: %s already mapped; skipping", uuid_value)
                 continue
 
-            if uuid_value in skipped and skipped[uuid_value] == fingerprint:
+            decline = skipped.get(uuid_value)
+            if (isinstance(decline, dict) and decline.get("fingerprint") == fingerprint
+                    and isinstance(decline.get("ts"), (int, float))
+                    and 0 <= now - decline["ts"] < 7 * 24 * 60 * 60):
                 logger.debug("Storyteller auto-link: %s declined earlier; skipping", uuid_value)
                 continue
             if "ebook" in item and not item["ebook"]:
@@ -3138,8 +3135,19 @@ def _storyteller_auto_link_candidates(user_id, client, library, books, claimed):
                     kosync_doc_id=existing.kosync_doc_id,
                 )
                 if access == "deny":
-                    skipped[uuid_value] = fingerprint
+                    skipped[uuid_value] = {"fingerprint": fingerprint, "ts": now}
                     logger.info("Storyteller auto-link: %s belongs to another reader; skipping", uuid_value)
+                    continue
+                if access == "join":
+                    if joined >= 25:
+                        continue
+                    _claim_book_for_user_id(user_id, existing.abs_id)
+                    if claimed is not None:
+                        claimed.add(existing.abs_id)
+                    joined += 1
+                    skipped.pop(uuid_value, None)
+                    logger.info("Storyteller auto-link: joined existing %s for user %s",
+                                uuid_value, user_id)
                     continue
                 saved, error, _status = _upsert_storyteller_mapping(
                     mode_hint="existing", existing_book=existing,
@@ -3160,15 +3168,14 @@ def _storyteller_auto_link_candidates(user_id, client, library, books, claimed):
                 for book in books:
                     if title_key(book.abs_title) != title_key(title):
                         continue
-                    # Older Book mappings have no author field. Fail closed on
-                    # their shared title rather than risk replacing an audio mapping.
+                    # Older mappings have no author field; fail closed on their shared title.
                     mapped_author = (getattr(book, "audio_author", None)
                                      or getattr(book, "author", None) or "")
                     if not mapped_author or not author_names or title_key(mapped_author) == title_key(author_names):
                         duplicate = True
                         break
                 if duplicate:
-                    skipped[uuid_value] = fingerprint
+                    skipped[uuid_value] = {"fingerprint": fingerprint, "ts": now}
                     logger.info("Storyteller auto-link: '%s' title/author collides; use Add Book", title)
                     continue
                 saved = _create_ebook_only_mapping_from_queue_item({
@@ -3183,18 +3190,33 @@ def _storyteller_auto_link_candidates(user_id, client, library, books, claimed):
             if claimed is not None:
                 claimed.add(saved.abs_id)
             books.append(saved)
+            skipped.pop(uuid_value, None)
             linked += 1
             logger.info("Storyteller auto-link: linked %s to %s for user %s",
                         uuid_value, saved.abs_id, user_id)
         except Exception as exc:
-            logger.warning("Storyteller auto-link: failed for %s: %s",
-                           uuid_value, exc, exc_info=True)
-    if skipped != skipped_before:
+            failed = True
+            conditions.warn(logger, failure_key, "Storyteller auto-link: failed for %s: %s",
+                            uuid_value, exc, exc_info=True)
+        finally:
+            if not failed:
+                conditions.resolve(logger, failure_key, "Storyteller auto-link: recovered for %s", uuid_value)
+    cursor = (start + inspected) % len(library)
+    if skipped != skipped_before or cursor != state.get("_auto_cursor", 0):
+        failure_key = f"storyteller-auto-state:{user_id}"
         try:
-            _save_storyteller_auto_skip(user_id, skipped)
+            with _STATE_LOCK:
+                current = database_service.get_json_setting(key, default={})
+                current = current if isinstance(current, dict) else {}
+                current["_auto_skip"] = skipped
+                current["_auto_cursor"] = cursor
+                database_service.set_json_setting(key, current)
+            conditions.resolve(logger, failure_key, "Storyteller auto-link: declined books saved for user %s", user_id)
         except Exception as exc:
-            logger.warning("Storyteller auto-link: could not save declined books: %s", exc, exc_info=True)
+            conditions.warn(logger, failure_key, "Storyteller auto-link: could not save declined books: %s",
+                            exc, exc_info=True)
     return linked
+
 
 
 def _storyteller_user_library_pass(user_id):

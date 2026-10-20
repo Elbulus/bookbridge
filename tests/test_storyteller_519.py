@@ -554,3 +554,132 @@ def test_rehash_retains_old_rows_in_real_database(real_db, monkeypatch):
     client.get_kosync_content_hash.side_effect = lambda uuid, fmt: "c" * 32 if fmt == "ebook" else "d" * 32
     register_hashes(real_db, client, book, details, user_id=3)
     assert all(real_db.get_kosync_document(h * 32).linked_abs_id == book.abs_id for h in "abcd")
+
+
+@pytest.fixture
+def auto_link_env(monkeypatch):
+    import copy
+    from src import web_server as ws
+    store = {}
+    db = Mock()
+    db.get_json_setting.side_effect = lambda key, default=None: copy.deepcopy(store.get(key, default))
+    db.set_json_setting.side_effect = lambda key, value: store.__setitem__(key, copy.deepcopy(value))
+    db.get_book_by_kosync_id.return_value = None
+    db.get_kosync_document.return_value = None
+    monkeypatch.setattr(ws, "database_service", db)
+    monkeypatch.setattr(ws, "user_setting", lambda *args: "true")
+    client = Mock()
+    client.get_kosync_content_hash.return_value = "a" * 32
+    create = Mock(side_effect=lambda item: SimpleNamespace(
+        abs_id="ebook-" + item["storyteller_uuid"], storyteller_uuid=item["storyteller_uuid"],
+        abs_title=item.get("abs_title", "")))
+    claim = Mock()
+    monkeypatch.setattr(ws, "_create_ebook_only_mapping_from_queue_item", create)
+    monkeypatch.setattr(ws, "_claim_book_for_user_id", claim)
+    return ws, db, client, store, create, claim
+
+
+def aligned_item(uuid, title=None, fingerprint="fp"):
+    return {"uuid": uuid, "title": title or uuid,
+            "readaloud": {"status": "ALIGNED", "fingerprint": fingerprint}}
+
+
+def test_already_mapped_joins_have_a_separate_cap(auto_link_env, monkeypatch):
+    ws, db, client, store, create, claim = auto_link_env
+    books = [SimpleNamespace(abs_id=f"b{i}", abs_title=f"u{i}", storyteller_uuid=f"u{i}",
+                            ebook_filename="plain.epub", kosync_doc_id="a" * 32) for i in range(30)]
+    library = [aligned_item(b.storyteller_uuid) for b in books]
+    library.extend(aligned_item(f"fresh{i}") for i in range(3))
+    monkeypatch.setattr(ws, "_existing_mapping_access", lambda *args, **kwargs: "join")
+    claimed = set()
+    assert ws._storyteller_auto_link_candidates(7, client, library, books, claimed) == 3
+    joined = [c for c in claim.call_args_list if c.args[1].startswith("b")]
+    assert len(joined) == 25
+    assert create.call_count == 3
+
+
+@pytest.mark.parametrize("failure", ["hash", "attach", "create", "exception"])
+def test_auto_cursor_advances_past_every_failed_attempt(auto_link_env, monkeypatch, failure):
+    ws, db, client, store, create, claim = auto_link_env
+    library = [aligned_item(f"u{i}") for i in range(7)]
+    def content_hash(uuid, fmt):
+        index = int(uuid[1:])
+        if index < 6:
+            if failure == "hash":
+                return None
+            if failure == "exception":
+                raise RuntimeError("offline")
+        return f"{index + 1:032x}"
+    client.get_kosync_content_hash.side_effect = content_hash
+    if failure == "attach":
+        db.get_book_by_kosync_id.side_effect = lambda h: (
+            SimpleNamespace(abs_id="old", abs_title="Old", storyteller_uuid=None,
+                            ebook_filename="plain.epub", kosync_doc_id=h) if int(h, 16) <= 6 else None)
+        monkeypatch.setattr(ws, "_existing_mapping_access", lambda *args, **kwargs: "modify")
+        monkeypatch.setattr(ws, "_upsert_storyteller_mapping", Mock(return_value=(None, "download failed", 500)))
+    if failure == "create":
+        create.side_effect = lambda item: (SimpleNamespace(abs_id="fresh", storyteller_uuid="u6", abs_title="Fresh")
+                                          if item["storyteller_uuid"] == "u6" else None)
+    assert ws._storyteller_auto_link_candidates(7, client, library, [], set()) == 0
+    assert store["STORYTELLER_519_HASHES:7"]["_auto_cursor"] == 6
+    client.get_kosync_content_hash.reset_mock()
+    assert ws._storyteller_auto_link_candidates(7, client, library, [], set()) == 1
+    assert client.get_kosync_content_hash.call_args_list[0].args[0] == "u6"
+
+
+def test_auto_cursor_is_per_reader(auto_link_env):
+    ws, db, client, store, create, claim = auto_link_env
+    library = [aligned_item(f"u{i}") for i in range(8)]
+    client.get_kosync_content_hash.return_value = None
+    ws._storyteller_auto_link_candidates(7, client, library, [], set())
+    ws._storyteller_auto_link_candidates(8, client, library, [], set())
+    calls = [c.args[0] for c in client.get_kosync_content_hash.call_args_list]
+    assert calls == [f"u{i}" for i in range(6)] * 2
+    assert store["STORYTELLER_519_HASHES:7"]["_auto_cursor"] == 6
+    assert store["STORYTELLER_519_HASHES:8"]["_auto_cursor"] == 6
+
+
+def test_decline_stores_fingerprint_and_timestamp(auto_link_env, monkeypatch):
+    ws, db, client, store, create, claim = auto_link_env
+    monkeypatch.setattr(ws.time, "time", lambda: 2_000_000_000)
+    collision = SimpleNamespace(abs_id="other", abs_title="Same", storyteller_uuid=None)
+    ws._storyteller_auto_link_candidates(7, client, [aligned_item("u", "Same")], [collision], set())
+    assert store["STORYTELLER_519_HASHES:7"]["_auto_skip"]["u"] == {
+        "fingerprint": "fp", "ts": 2_000_000_000}
+
+
+@pytest.mark.parametrize("age,fingerprint,legacy,expected", [
+    (0, "fp", False, 0), (7 * 24 * 60 * 60 - 1, "fp", False, 0),
+    (7 * 24 * 60 * 60, "fp", False, 1), (0, "changed", False, 1),
+    (0, "fp", True, 1),
+])
+def test_declines_expire_or_retry_a_new_fingerprint(auto_link_env, monkeypatch, age, fingerprint, legacy, expected):
+    ws, db, client, store, create, claim = auto_link_env
+    now = 2_000_000_000
+    monkeypatch.setattr(ws.time, "time", lambda: now)
+    decline = "fp" if legacy else {"fingerprint": "fp", "ts": now - age}
+    store["STORYTELLER_519_HASHES:7"] = {"_auto_skip": {"u": decline}}
+    assert ws._storyteller_auto_link_candidates(7, client, [aligned_item("u", fingerprint=fingerprint)], [], set()) == expected
+    assert create.call_count == expected
+    assert client.get_kosync_content_hash.call_count == expected
+
+
+def test_hash_match_join_claims_without_downloading(auto_link_env, monkeypatch, caplog):
+    ws, db, client, store, create, claim = auto_link_env
+    book = SimpleNamespace(abs_id="foreign", abs_title="Original", storyteller_uuid=None,
+                           ebook_filename="original.epub", kosync_doc_id="a" * 32)
+    db.get_book_by_kosync_id.return_value = book
+    monkeypatch.setattr(ws, "_existing_mapping_access", lambda *args, **kwargs: "join")
+    upsert = Mock()
+    download = Mock()
+    monkeypatch.setattr(ws, "_upsert_storyteller_mapping", upsert)
+    monkeypatch.setattr(ws, "_download_storyteller_artifact", download)
+    claimed = set()
+    with caplog.at_level("INFO"):
+        assert ws._storyteller_auto_link_candidates(7, client, [aligned_item("u")], [book], claimed) == 0
+    assert claimed == {"foreign"}
+    claim.assert_called_once_with(7, "foreign")
+    upsert.assert_not_called()
+    download.assert_not_called()
+    assert "joined existing u for user 7" in caplog.text
+    assert "Storyteller auto-link: linked" not in caplog.text
