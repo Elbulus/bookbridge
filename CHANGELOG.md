@@ -8,7 +8,7 @@ All notable changes to BookBridge will be documented in this file.
 
 ### Fixed
 
-- **Grimmory highlights now select the correct text.** Highlights spanning italics, links or other inline formatting no longer point at the wrong part of a paragraph when synced between KOReader and Grimmory (#535). Previously synced highlights with incorrect positions need manual recreation.
+- **Grimmory highlights now select the correct text.** Highlights spanning italics, links or other inline formatting no longer point at the wrong part of a paragraph when synced between KOReader and Grimmory (#535). Highlights synced before this update may still be in the wrong place in Grimmory; editing one in KOReader sends it again at the right place. Don't delete them in Grimmory to fix them: that also deletes them from your device.
 - Connect Audiobookshelf instant sync when the server address starts with `api`,
   such as `https://api.example.com`. The listener mangled those addresses and
   never connected, while scheduled sync kept working.
