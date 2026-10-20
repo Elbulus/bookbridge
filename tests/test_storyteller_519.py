@@ -2,6 +2,7 @@
 
 import hashlib
 import os
+import threading
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -125,7 +126,8 @@ def test_registers_plain_and_readaloud_for_artifact_only():
 
 
 @pytest.fixture
-def real_db(tmp_path):
+def real_db(tmp_path, monkeypatch):
+    monkeypatch.setenv("DB_JOURNAL_MODE", "DELETE")
     db = DatabaseService(str(tmp_path / "storyteller519.db"))
     try:
         yield db
@@ -683,3 +685,200 @@ def test_hash_match_join_claims_without_downloading(auto_link_env, monkeypatch, 
     download.assert_not_called()
     assert "joined existing u for user 7" in caplog.text
     assert "Storyteller auto-link: linked" not in caplog.text
+
+
+@pytest.fixture(autouse=True)
+def isolate_storyteller_failure_logs(monkeypatch):
+    from src import web_server as ws
+    from src.api import storyteller_api
+    from src.utils.logging_utils import PersistentConditionLogger
+    conditions = PersistentConditionLogger()
+    monkeypatch.setattr(ws, "get_persistent_condition_logger", lambda: conditions)
+    monkeypatch.setattr(storyteller_api, "get_persistent_condition_logger", lambda: conditions)
+
+
+def test_hourly_passes_cannot_overlap_for_a_reader(auto_link_env, monkeypatch, caplog):
+    ws, db, client, store, create, claim = auto_link_env
+    entered, release = threading.Event(), threading.Event()
+    def library():
+        entered.set()
+        release.wait(2)
+        return []
+    client.list_library_books.side_effect = library
+    db.get_all_books.return_value = []
+    db.get_linked_abs_ids.return_value = []
+    monkeypatch.setattr(ws, "uc", lambda: SimpleNamespace(storyteller_client=client))
+    thread = threading.Thread(target=ws._storyteller_user_library_pass, args=(7,))
+    thread.start()
+    try:
+        assert entered.wait(5)
+        with caplog.at_level("INFO"):
+            ws._storyteller_user_library_pass(7)
+        assert client.list_library_books.call_count == 1
+        assert "user 7 already scanning; skipping" in caplog.text
+    finally:
+        release.set()
+        thread.join(5)
+    assert not thread.is_alive()
+    assert 7 not in ws._STORYTELLER_PASSES_IN_PROGRESS
+    client.list_library_books.side_effect = None
+    client.list_library_books.return_value = []
+    ws._storyteller_user_library_pass(7)
+    assert client.list_library_books.call_count == 2
+
+
+def test_hourly_guard_is_per_reader(auto_link_env, monkeypatch):
+    ws, db, client, store, create, claim = auto_link_env
+    def library():
+        if client.list_library_books.call_count == 1:
+            ws._storyteller_user_library_pass(8)
+        return []
+    client.list_library_books.side_effect = library
+    db.get_all_books.return_value = []
+    db.get_linked_abs_ids.return_value = []
+    monkeypatch.setattr(ws, "uc", lambda: SimpleNamespace(storyteller_client=client))
+    ws._storyteller_user_library_pass(7)
+    assert client.list_library_books.call_count == 2
+    assert not ws._STORYTELLER_PASSES_IN_PROGRESS
+
+
+def test_auto_link_stops_starting_books_after_budget(auto_link_env, monkeypatch, caplog):
+    ws, db, client, store, create, claim = auto_link_env
+    clock = [0]
+    monkeypatch.setattr(ws.time, "monotonic", lambda: clock[0])
+    def slow_hash(*args):
+        clock[0] = 601
+        return None
+    client.get_kosync_content_hash.side_effect = slow_hash
+    with caplog.at_level("INFO"):
+        ws._storyteller_auto_link_candidates(7, client, [aligned_item(f"u{i}") for i in range(8)], [], set())
+    client.get_kosync_content_hash.assert_called_once_with("u0", "ebook")
+    assert store["STORYTELLER_519_HASHES:7"]["_auto_cursor"] == 1
+    assert "reached pass time budget; stopping" in caplog.text
+
+
+def test_backfill_stops_starting_books_after_budget(real_db, monkeypatch, caplog):
+    import src.services.storyteller_library_watch as watch
+    monkeypatch.setenv("KOSYNC_HASH_METHOD", "content")
+    clock = [0]
+    monkeypatch.setattr(watch.time, "monotonic", lambda: clock[0])
+    books = [real_db.save_book(Book(abs_id=f"b{i}", storyteller_uuid=f"abcd-{i}",
+                                   ebook_filename=f"storyteller_abcd-{i}.epub")) for i in range(3)]
+    client = Mock()
+    def slow_hash(uuid, fmt):
+        clock[0] = 601
+        return "a" * 32 if fmt == "ebook" else "b" * 32
+    client.get_kosync_content_hash.side_effect = slow_hash
+    library = [aligned_item(b.storyteller_uuid) for b in books]
+    with caplog.at_level("INFO"):
+        scan_linked(real_db, client, books, 7, library=library, deadline=600)
+    assert [c.args for c in client.get_kosync_content_hash.call_args_list] == [
+        ("abcd-0", "ebook"), ("abcd-0", "readaloud")]
+    assert real_db.get_json_setting("STORYTELLER_519_HASHES:7")["_cursor"] == 1
+    assert "reached pass time budget; stopping" in caplog.text
+
+
+def test_hourly_pass_shares_one_budget_with_backfill(auto_link_env, monkeypatch):
+    ws, db, client, store, create, claim = auto_link_env
+    clock = [0]
+    monkeypatch.setattr(ws.time, "monotonic", lambda: clock[0])
+    book = SimpleNamespace(abs_id="mapped", abs_title="Mapped", storyteller_uuid="mapped",
+                           ebook_filename="plain.epub", original_ebook_filename="plain.epub")
+    def slow_create(item):
+        clock[0] = 601
+        return SimpleNamespace(abs_id="new", abs_title="New", storyteller_uuid="new")
+    create.side_effect = slow_create
+    client.list_library_books.return_value = [aligned_item("new"), aligned_item("mapped")]
+    db.get_all_books.return_value = [book]
+    db.get_linked_abs_ids.return_value = ["mapped"]
+    monkeypatch.setattr(ws, "uc", lambda: SimpleNamespace(storyteller_client=client))
+    ws._storyteller_user_library_pass(7)
+    client.get_kosync_content_hash.assert_called_once_with("new", "ebook")
+
+
+def test_hourly_failure_warnings_suppress_repeats_and_reset_on_recovery(auto_link_env, monkeypatch, caplog):
+    ws, db, client, store, create, claim = auto_link_env
+    client.list_library_books.side_effect = RuntimeError("offline")
+    monkeypatch.setattr(ws, "uc", lambda: SimpleNamespace(storyteller_client=client))
+    db.get_all_books.return_value = []
+    db.get_linked_abs_ids.return_value = []
+    with caplog.at_level("DEBUG"):
+        ws._storyteller_user_library_pass(7)
+        ws._storyteller_user_library_pass(7)
+        failures = [r for r in caplog.records if "Storyteller hashes: pass failed" in r.message]
+        assert [r.levelname for r in failures] == ["WARNING", "DEBUG"]
+        assert all(r.exc_info for r in failures)
+        assert not ws._STORYTELLER_PASSES_IN_PROGRESS
+        client.list_library_books.side_effect = None
+        client.list_library_books.return_value = []
+        ws._storyteller_user_library_pass(7)
+        client.list_library_books.side_effect = RuntimeError("offline again")
+        ws._storyteller_user_library_pass(7)
+    failures = [r for r in caplog.records if "Storyteller hashes: pass failed" in r.message]
+    assert [r.levelname for r in failures] == ["WARNING", "DEBUG", "WARNING"]
+    assert "pass recovered for user 7" in caplog.text
+
+
+@pytest.mark.parametrize("status,content_range", [(401, None), (404, None), (206, "bytes 99-100/200")])
+def test_hash_closes_rejected_responses(status, content_range, monkeypatch):
+    monkeypatch.setenv("KOSYNC_HASH_METHOD", "content")
+    client = hash_client(b"unused")
+    rejected = FakeResponse(status, b"bad", {"Content-Range": content_range} if content_range else None)
+    client.session.get.return_value = rejected
+    client.session.get.side_effect = None
+    assert client.get_kosync_content_hash("uuid", "ebook") is None
+    assert rejected.closed
+
+
+def test_hash_reauthenticates_mid_sequence_and_closes_401(monkeypatch):
+    monkeypatch.setenv("KOSYNC_HASH_METHOD", "content")
+    content = hashlib.shake_256(b"401-samples").digest(5000)
+    client = hash_client(content)
+    get = client.session.get.side_effect
+    rejected = FakeResponse(401)
+    used = False
+    def expire_once(url, **kwargs):
+        nonlocal used
+        if kwargs["headers"]["Range"].startswith("bytes=1024-") and not used:
+            used = True
+            return rejected
+        return get(url, **kwargs)
+    client.session.get.side_effect = expire_once
+    client._get_fresh_token.side_effect = ["first", "second"]
+    assert client.get_kosync_content_hash("uuid", "ebook") == EbookParser._compute_koreader_hash_from_bytes(None, content)
+    assert used and rejected.closed
+    assert all(r.closed for r in client.responses)
+    assert client._get_fresh_token.call_count == 2
+
+
+def test_hash_failure_warnings_suppress_repeats_and_recover(monkeypatch, caplog):
+    monkeypatch.setenv("KOSYNC_HASH_METHOD", "content")
+    client = hash_client(b"book")
+    success = client.session.get.side_effect
+    client.session.get.side_effect = RuntimeError("offline")
+    with caplog.at_level("DEBUG"):
+        assert client.get_kosync_content_hash("uuid", "ebook") is None
+        assert client.get_kosync_content_hash("uuid", "ebook") is None
+        failures = [r for r in caplog.records if "Storyteller hash failed" in r.message]
+        assert [r.levelname for r in failures] == ["WARNING", "DEBUG"]
+        assert all(r.exc_info for r in failures)
+        client.session.get.side_effect = success
+        assert client.get_kosync_content_hash("uuid", "ebook")
+    assert "Storyteller hash recovered" in caplog.text
+
+
+
+def test_library_decode_warnings_suppress_repeats_and_recover(caplog):
+    client = StorytellerAPIClient()
+    response = Mock(status_code=200)
+    response.json.side_effect = ValueError("bad JSON")
+    client._make_request = Mock(return_value=response)
+    with caplog.at_level("DEBUG"):
+        assert client.list_library_books() is None
+        assert client.list_library_books() is None
+        failures = [r for r in caplog.records if "Storyteller library list decode failed" in r.message]
+        assert [r.levelname for r in failures] == ["WARNING", "DEBUG"]
+        response.json.side_effect = None
+        response.json.return_value = []
+        assert client.list_library_books() == []
+    assert "Storyteller library list decode recovered" in caplog.text

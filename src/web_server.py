@@ -3038,9 +3038,13 @@ def _storyteller_register_file_hashes(storyteller_uuid, abs_id):
             database_service, client, book,
             user_id=user_id,
         )
+        get_persistent_condition_logger().resolve(
+            logger, f"storyteller-registration:{user_id}:{storyteller_uuid}",
+            "Storyteller hashes: registration recovered for %s", storyteller_uuid)
     except Exception as exc:
-        logger.warning("Storyteller hashes: registration failed for %s: %s",
-                       storyteller_uuid, exc, exc_info=True)
+        get_persistent_condition_logger().warn(
+            logger, f"storyteller-registration:{get_current_user_id()}:{storyteller_uuid}",
+            "Storyteller hashes: registration failed for %s: %s", storyteller_uuid, exc, exc_info=True)
 
 
 def _storyteller_auto_link_candidates(user_id, client, library, books, claimed, deadline=None):
@@ -3071,7 +3075,10 @@ def _storyteller_auto_link_candidates(user_id, client, library, books, claimed, 
     conditions = get_persistent_condition_logger()
     now = time.time()
     for index in range(len(library)):
-        if linked >= 3 or attempted >= 6 or time.monotonic() >= deadline:
+        if linked >= 3 or attempted >= 6:
+            break
+        if time.monotonic() >= deadline:
+            logger.info("Storyteller auto-link: user %s reached pass time budget; stopping", user_id)
             break
         item = library[(start + index) % len(library)]
         inspected += 1
@@ -3168,7 +3175,8 @@ def _storyteller_auto_link_candidates(user_id, client, library, books, claimed, 
                 for book in books:
                     if title_key(book.abs_title) != title_key(title):
                         continue
-                    # Older mappings have no author field; fail closed on their shared title.
+                    # Older Book mappings have no author field. Fail closed on
+                    # their shared title rather than risk replacing an audio mapping.
                     mapped_author = (getattr(book, "audio_author", None)
                                      or getattr(book, "author", None) or "")
                     if not mapped_author or not author_names or title_key(mapped_author) == title_key(author_names):
@@ -3218,11 +3226,22 @@ def _storyteller_auto_link_candidates(user_id, client, library, books, claimed, 
     return linked
 
 
+_STORYTELLER_PASS_LOCK = threading.Lock()
+_STORYTELLER_PASSES_IN_PROGRESS = set()
+
 
 def _storyteller_user_library_pass(user_id):
-    """Reconcile and optionally auto-link this reader's Storyteller library."""
+    """Reconcile this reader once at a time; stop starting books after ten minutes."""
     from src.services.storyteller_library_watch import scan_linked
 
+    with _STORYTELLER_PASS_LOCK:
+        if user_id in _STORYTELLER_PASSES_IN_PROGRESS:
+            logger.info("Storyteller hashes: user %s already scanning; skipping", user_id)
+            return
+        _STORYTELLER_PASSES_IN_PROGRESS.add(user_id)
+    conditions = get_persistent_condition_logger()
+    failure_key = f"storyteller-library-pass:{user_id}"
+    deadline = time.monotonic() + 600
     try:
         client = uc().storyteller_client
         if not client or not client.is_configured():
@@ -3236,18 +3255,19 @@ def _storyteller_user_library_pass(user_id):
             if user_id is not None else None
         )
         all_books = list(database_service.get_all_books())
-        _storyteller_auto_link_candidates(user_id, client, library, all_books, claimed)
+        _storyteller_auto_link_candidates(user_id, client, library, all_books, claimed, deadline=deadline)
         books = [
             book for book in all_books
             if book.storyteller_uuid and (claimed is None or book.abs_id in claimed)
         ]
-        scan_linked(
-            database_service, client, books,
-            user_id, library=library,
-        )
+        scan_linked(database_service, client, books, user_id, library=library, deadline=deadline)
+        conditions.resolve(logger, failure_key, "Storyteller hashes: pass recovered for user %s", user_id)
     except Exception as exc:
-        logger.warning("Storyteller hashes: pass failed for user %s: %s",
-                       user_id, exc, exc_info=True)
+        conditions.warn(logger, failure_key, "Storyteller hashes: pass failed for user %s: %s",
+                        user_id, exc, exc_info=True)
+    finally:
+        with _STORYTELLER_PASS_LOCK:
+            _STORYTELLER_PASSES_IN_PROGRESS.discard(user_id)
 
 
 def _run_storyteller_library_hourly():
@@ -3259,8 +3279,11 @@ def _run_storyteller_library_hourly():
     try:
         users = [user for user in database_service.list_users() if getattr(user, "active", 1)]
     except Exception as exc:
-        logger.warning("Storyteller hashes: could not list users: %s", exc, exc_info=True)
+        get_persistent_condition_logger().warn(
+            logger, "storyteller-library-users", "Storyteller hashes: could not list users: %s", exc, exc_info=True)
         return
+    get_persistent_condition_logger().resolve(
+        logger, "storyteller-library-users", "Storyteller hashes: user list recovered")
     for user in users:
         uid_token = creds_token = bundle_token = None
         try:
@@ -3281,9 +3304,13 @@ def _run_storyteller_library_hourly():
                 _storyteller_user_library_pass, user.id,
                 label=f"storyteller-library-{user.id}",
             )
+            get_persistent_condition_logger().resolve(
+                logger, f"storyteller-library-schedule:{user.id}",
+                "Storyteller hashes: scheduling recovered for user %s", user.id)
         except Exception as exc:
-            logger.warning("Storyteller hashes: cannot schedule user %s: %s",
-                           user.id, exc, exc_info=True)
+            get_persistent_condition_logger().warn(
+                logger, f"storyteller-library-schedule:{user.id}",
+                "Storyteller hashes: cannot schedule user %s: %s", user.id, exc, exc_info=True)
         finally:
             if creds_token is not None:
                 reset_current_user_credentials(creds_token)

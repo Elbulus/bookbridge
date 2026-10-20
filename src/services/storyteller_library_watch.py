@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import threading
+import time
 
 from src.api.storyteller_api import StorytellerAPIClient
 from src.db.database_service import DatabaseService
@@ -118,7 +119,7 @@ def register_hashes(
 
 def scan_linked(
     db: DatabaseService, client: StorytellerAPIClient, books: list[Book], user_id: int | None,
-    library: list[dict] | None = None,
+    library: list[dict] | None = None, deadline: float | None = None,
 ) -> None:
     """Run a bounded, round-robin per-user backfill over already-linked books."""
     if not client or not client.is_configured():
@@ -141,6 +142,9 @@ def scan_linked(
     inspected = 0
     to_hash = 0
     for index in range(min(len(entries), SCAN_BOOK_LIMIT)):
+        if deadline is not None and time.monotonic() >= deadline:
+            logger.info("Storyteller hashes: user %s reached pass time budget; stopping", user_id)
+            break
         item = entries[(start + index) % len(entries)]
         uuid = item.get("uuid") or item.get("id")
         previous = state.get(uuid, {})
