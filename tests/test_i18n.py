@@ -238,6 +238,23 @@ class RenderedTranslationTests(I18nTestBase):
         self.assertIn('Сменить пароль', body)
         self.assertIn('Вы вошли как <strong>admin</strong>', body)
 
+    def test_integrations_pages_render_russian(self):
+        _write_catalog(self.translations, 'ru', {
+            'Save integrations': 'Сохранить интеграции',
+            'Integrations - %(name)s': 'Интеграции: %(name)s',
+            'Regular users need explicit account credentials here. Blank account fields stay '
+            'unavailable instead of inheriting the admin/master library.':
+                'Обычным пользователям нужны собственные учётные данные.',
+        })
+        user = self.svc.create_user("reader", "secret")
+        self._login()
+        self.client.post('/account/language', data={'language': 'ru'}, follow_redirects=False)
+        body = self.client.get('/account/integrations').get_data(as_text=True)
+        self.assertIn('Сохранить интеграции', body)
+        body = self.client.get(f'/admin/users/{user.id}/integrations').get_data(as_text=True)
+        self.assertIn('Интеграции: reader', body)
+        self.assertIn('Обычным пользователям нужны собственные учётные данные.', body)
+
     def test_confirm_survives_an_apostrophe_in_the_translation(self):
         # A translated confirm() string is a JS string literal: an apostrophe in
         # the msgstr (French "l'ensemble") must not end it early. tojson escapes
