@@ -418,13 +418,15 @@ class TestAutoMatchSuggestions(unittest.TestCase):
         finally:
             self._restore_env("SUGGESTIONS_AUTO_MATCH_ENABLED", old)
 
+    @patch("src.web_server.database_service")
     @patch("src.web_server.get_kosync_id_for_ebook", return_value="local-hash")
     @patch("src.web_server.container")
-    def test_local_file_match_is_linked_by_its_file_hash(self, mock_container, mock_hash):
+    def test_local_file_match_is_linked_by_its_file_hash(self, mock_container, mock_hash, mock_db):
         """A Local File has no library id to download by, so its hash comes from the file."""
         old = os.environ.get("SUGGESTIONS_AUTO_MATCH_ENABLED")
         try:
             self._set_env("SUGGESTIONS_AUTO_MATCH_ENABLED", "true")
+            mock_db.get_book_by_kosync_id.return_value = None
 
             mock_mapping = MagicMock()
             mock_mapping.create_audio_mapping_from_match.return_value = True
@@ -490,6 +492,67 @@ class TestAutoMatchSuggestions(unittest.TestCase):
             mock_mapping.create_audio_mapping_from_match.assert_not_called()
             self.assertEqual(out["suggestions"], [suggestion])
             self.assertTrue(any("could not hash Local File" in line for line in cm.output))
+        finally:
+            self._restore_env("SUGGESTIONS_AUTO_MATCH_ENABLED", old)
+
+    @patch("src.web_server.database_service")
+    @patch("src.web_server.get_kosync_id_for_ebook", return_value="shared-hash")
+    @patch("src.web_server.container")
+    def test_local_file_held_by_another_audiobook_stays_in_review(self, mock_container, mock_hash, mock_db):
+        """Linking would absorb the other audiobook's mapping, so a person decides."""
+        old = os.environ.get("SUGGESTIONS_AUTO_MATCH_ENABLED")
+        try:
+            self._set_env("SUGGESTIONS_AUTO_MATCH_ENABLED", "true")
+            mock_db.get_book_by_kosync_id.return_value = MagicMock(
+                abs_id="abs-other", audio_source_id="abs-other", sync_mode="audiobook",
+            )
+
+            mock_mapping = MagicMock()
+            mock_container.book_mapping_service.return_value = mock_mapping
+
+            match = _make_match(100.0, ebook_filename="Swann's Way - Marcel Proust.epub",
+                                source="Local File", source_id=None)
+            suggestion = _make_suggestion(matches=[match])
+            results = {"suggestions": [suggestion], "stats": {}}
+
+            with self.assertLogs("src.web_server", level="INFO") as cm:
+                out = _auto_match_suggestions(results, user_id=1)
+
+            mock_db.get_book_by_kosync_id.assert_called_once_with("shared-hash")
+            mock_mapping.create_audio_mapping_from_match.assert_not_called()
+            self.assertEqual(out["suggestions"], [suggestion])
+            self.assertTrue(any("already linked to another audiobook" in line for line in cm.output))
+        finally:
+            self._restore_env("SUGGESTIONS_AUTO_MATCH_ENABLED", old)
+
+    @patch("src.web_server.database_service")
+    @patch("src.web_server.get_kosync_id_for_ebook", return_value="shared-hash")
+    @patch("src.web_server.container")
+    def test_local_file_held_by_an_ebook_only_or_the_same_audiobook_is_linked(
+        self, mock_container, mock_hash, mock_db,
+    ):
+        """An ebook-only mapping is what absorbing is for, and a re-match replaces nothing."""
+        holders = {
+            "ebook-only mapping": MagicMock(abs_id="ebook-1", audio_source_id=None, sync_mode="ebook_only"),
+            "same audiobook": MagicMock(abs_id="abs-1", audio_source_id="abs-1", sync_mode="audiobook"),
+        }
+        old = os.environ.get("SUGGESTIONS_AUTO_MATCH_ENABLED")
+        try:
+            self._set_env("SUGGESTIONS_AUTO_MATCH_ENABLED", "true")
+            for label, holder in holders.items():
+                with self.subTest(label):
+                    mock_db.get_book_by_kosync_id.return_value = holder
+                    mock_mapping = MagicMock()
+                    mock_mapping.create_audio_mapping_from_match.return_value = True
+                    mock_container.book_mapping_service.return_value = mock_mapping
+
+                    match = _make_match(100.0, ebook_filename="Swann's Way - Marcel Proust.epub",
+                                        source="Local File", source_id=None)
+                    results = {"suggestions": [_make_suggestion(matches=[match])], "stats": {}}
+
+                    _auto_match_suggestions(results, user_id=1)
+
+                    mock_mapping.create_audio_mapping_from_match.assert_called_once()
         finally:
             self._restore_env("SUGGESTIONS_AUTO_MATCH_ENABLED", old)
 

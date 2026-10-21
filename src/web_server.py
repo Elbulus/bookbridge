@@ -8586,6 +8586,23 @@ def _auto_match_suggestions(results: object, user_id: int | None) -> object:
                     )
                     remaining.append(suggestion)
                     continue
+                # Saving a mapping absorbs any other book on the same hash. With
+                # two audiobooks of one ebook, or two files sharing a filename
+                # hash, the second match would delete the first one's mapping.
+                audio_source_id = suggestion.get('audio_source_id') or suggestion.get('abs_id') or ''
+                holder = database_service.get_book_by_kosync_id(kosync_doc_id)
+                if (
+                    holder is not None
+                    and holder.sync_mode != 'ebook_only'
+                    and (holder.audio_source_id or holder.abs_id) != audio_source_id
+                ):
+                    logger.info(
+                        f"Auto-match skipped '{suggestion.get('abs_title')}': Local File "
+                        f"'{top.get('ebook_filename')}' is already linked to another audiobook "
+                        f"('{holder.abs_title}', {holder.abs_id}); left for review"
+                    )
+                    remaining.append(suggestion)
+                    continue
             saved = mapping_service.create_audio_mapping_from_match(
                 audio_source=suggestion.get('audio_source') or 'ABS',
                 audio_source_id=suggestion.get('audio_source_id') or suggestion.get('abs_id') or '',
