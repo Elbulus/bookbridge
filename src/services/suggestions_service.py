@@ -207,6 +207,7 @@ class SuggestionsService:
                     (self._normalize_title_for_match(title), self._author_names(author))
                     for title, author in hypotheses
                 ],
+                "volume": next(filter(None, (self._volume_number(title) for title, _ in hypotheses)), None),
                 "language": candidate_language,
                 "source": candidate_source,
                 "source_id": source_id,
@@ -438,6 +439,34 @@ class SuggestionsService:
         if m:
             s = f"{m.group(2)} {m.group(1)}".strip()
         return s
+
+    _VOLUME_RE = re.compile(r"\b(?:book|volume|vol\.?)\s+(\w+)\b", re.IGNORECASE)
+    _VOLUME_WORDS = {
+        word: n for n, word in enumerate(
+            "one two three four five six seven eight nine ten eleven twelve".split(), start=1)
+    }
+    _VOLUME_ROMAN = {
+        numeral: n for n, numeral in enumerate(
+            "i ii iii iv v vi vii viii ix x xi xii".split(), start=1)
+    }
+
+    @classmethod
+    def _volume_number(cls, text: str) -> Optional[int]:
+        """The number in a "Book 3", "Book One", "Volume II", or "Vol. 2" credit, if any."""
+        text = text or ""
+        for match in cls._VOLUME_RE.finditer(text):
+            token = match.group(1).lower()
+            if token.isdigit():
+                return int(token)
+            # A word or numeral counts only when it ends the credit, since "I" and
+            # "Two" are also ordinary words ("The Book I Never Wrote").
+            rest = text[match.end():].lstrip()
+            if rest and rest[0] not in ",:;)]-":
+                continue
+            number = cls._VOLUME_WORDS.get(token) or cls._VOLUME_ROMAN.get(token)
+            if number:
+                return number
+        return None
 
     @staticmethod
     def _title_score(audio_title: str, audio_full_title: str, candidate_title: str) -> tuple[float, bool]:
@@ -695,6 +724,7 @@ class SuggestionsService:
         matches = []
         audio_path = self._audio_path(ab)
         audio_names = self._author_names(audio_author)
+        audio_volume = self._volume_number(audio_title) or self._volume_number(subtitle)
         same_folder_count = sum(
             1 for candidate_info in per_book_pool
             if self._paths_share_parent(audio_path, candidate_info.get("path"))
@@ -711,6 +741,12 @@ class SuggestionsService:
                 match = self._match_from_pool(candidate_info, score)
                 match["match_reason"] = match_reason
                 matches.append(match)
+                continue
+
+            # Normalizing drops a ", Book N" tail, so two volumes of one series would
+            # otherwise score as the same title.
+            candidate_volume = candidate_info.get("volume")
+            if audio_volume and candidate_volume and audio_volume != candidate_volume:
                 continue
 
             best = None
