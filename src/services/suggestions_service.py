@@ -133,8 +133,21 @@ class SuggestionsService:
                 i += 1
         return authors or editors
 
-    @staticmethod
-    def _score_author_names(names: List[str], candidate_names: List[str]) -> float:
+    # Different people still share letters ("William Golding" and "William Gaddis"
+    # score 76), while spellings of one name ("Roberto Bolaño", "Roberto Bolano")
+    # stay above 90. Below this, the author counts as no match at all.
+    _AUTHOR_SAME_PERSON_SCORE = 80.0
+    _NAME_SUFFIXES = frozenset({"jr", "sr", "ii", "iii", "iv", "phd"})
+
+    @classmethod
+    def _surname_and_initial(cls, name: str) -> Optional[tuple]:
+        """("tolstoy", "l") for "Lev Nikolayevich Tolstoy"; None for a one-word name."""
+        folded = "".join(c for c in unicodedata.normalize("NFKD", name.lower()) if not unicodedata.combining(c))
+        words = [w for w in re.findall(r"[a-z]+", folded) if w not in cls._NAME_SUFFIXES]
+        return (words[-1], words[0][0]) if len(words) >= 2 else None
+
+    @classmethod
+    def _score_author_names(cls, names: List[str], candidate_names: List[str]) -> float:
         """Best fuzzy score between two pre-parsed author name lists."""
         from rapidfuzz import fuzz, utils
 
@@ -148,7 +161,14 @@ class SuggestionsService:
         for name in names:
             for candidate_name in candidate_names:
                 best = max(best, ratio(name, candidate_name))
-        return float(best)
+        if best >= cls._AUTHOR_SAME_PERSON_SCORE:
+            return float(best)
+        # A patronymic or initials ("Lev Nikolayevich Tolstoy", "M. A. Bulgakov")
+        # lower the ratio, but the surname and first initial still agree.
+        keys = {cls._surname_and_initial(name) for name in names} - {None}
+        if any(cls._surname_and_initial(name) in keys for name in candidate_names):
+            return cls._AUTHOR_SAME_PERSON_SCORE
+        return 0.0
 
     @classmethod
     def _author_score(cls, author: str, candidate_author: str) -> float:
