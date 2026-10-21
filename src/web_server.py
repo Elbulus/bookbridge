@@ -47,6 +47,7 @@ from src.utils.ebook_utils import (
     LINKABLE_EBOOK_EXTENSIONS,
     LRUCache,
     is_comic_ebook_filename,
+    is_in_hidden_folder,
     is_linkable_ebook_filename,
 )
 from src.utils.ebook_sources import is_grimmory_source, local_ebook_filename, normalize_ebook_source
@@ -3986,7 +3987,7 @@ def _build_local_ebook_title_index():
             for eb in EBOOK_DIR.rglob('*'):
                 if eb.suffix.lower() not in LINKABLE_EBOOK_EXTENSIONS or not eb.is_file():
                     continue
-                if is_generated_readalong_epub(eb.name):
+                if is_generated_readalong_epub(eb.name) or is_in_hidden_folder(eb, EBOOK_DIR):
                     continue
                 stem = eb.stem
                 title_part = stem.split(" - ", 1)[0]
@@ -4203,6 +4204,7 @@ def get_searchable_ebooks(search_term):
                 eb for eb in EBOOK_DIR.rglob('*')
                 if eb.suffix.lower() in LINKABLE_EBOOK_EXTENSIONS and eb.is_file()
                 and not is_generated_readalong_epub(eb.name)
+                and not is_in_hidden_folder(eb, EBOOK_DIR)
             ]
             for eb in all_ebooks:
                 fname_lower = eb.name.lower()
@@ -7189,6 +7191,8 @@ def forge_search_text():
         if local_books_dir.exists():
             for epub in local_books_dir.rglob("*.epub"):
                 if "(readaloud)" in epub.name.lower() or is_generated_readalong_epub(epub.name):
+                    continue
+                if is_in_hidden_folder(epub, local_books_dir):
                     continue
                 if query_lower in epub.name.lower():
                     key = f"local_{epub.name}"
