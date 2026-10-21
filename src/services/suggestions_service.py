@@ -427,6 +427,10 @@ class SuggestionsService:
     # title alone survives even when the author string differs in format.
     _SUGGEST_FUZZY_FLOOR = 45.0
     _SUGGEST_TITLE_STRONG = 85.0
+    # A full author match adds 30 points, enough to lift another book by the same
+    # author ("Time Regained" and "The Guermantes Way" share a title score of 45)
+    # over the combined floor. Below this title score, a candidate is dropped.
+    _SUGGEST_TITLE_FLOOR = 50.0
     _SUBTITLE_STRIPPED_SCORE_CAP = 89.0
 
     # A same-folder pair is auto-trusted (exact 100, pinned ahead of and skipping the
@@ -784,6 +788,8 @@ class SuggestionsService:
             # Low floor on purpose; a strong title also survives a weak/format-mismatched
             # author. Embedding retrieval + the judge gate enforce precision downstream.
             if score < self._SUGGEST_FUZZY_FLOOR and title_score < self._SUGGEST_TITLE_STRONG:
+                continue
+            if title_score < self._SUGGEST_TITLE_FLOOR:
                 continue
 
             direct_match = self._audiobook_matches_candidate(
