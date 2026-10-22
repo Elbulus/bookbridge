@@ -3965,6 +3965,7 @@ def get_suggestion_audiobooks():
                 "audio_source_id": source_id,
                 "audio_title": title,
                 "audio_subtitle": (item.subtitle or "").strip(),
+                "audio_series": (item.series_label or "").strip(),
                 "audio_author": author,
                 "audio_language": item.language or "",
                 "audio_duration": item.duration,
