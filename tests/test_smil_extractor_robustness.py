@@ -1,5 +1,7 @@
+import io
 import unittest
 import xml.etree.ElementTree as ET
+import zipfile
 from unittest.mock import MagicMock, patch
 import sys
 import os
@@ -104,6 +106,35 @@ class TestSmilExtractorRobustness(unittest.TestCase):
         self.assertEqual(len(segments), 1)
         self.assertEqual(segments[0]['text'], 'Hello World')
         self.assertNotEqual(segments[0]['text'], 'FAIL_ENCODED')
+
+    def test_nested_overlay_spans_keep_only_their_own_words(self):
+        """Verify an overlay span nested inside another isn't repeated at the outer span's time."""
+        smil = """
+        <smil xmlns="http://www.w3.org/ns/SMIL" version="3.0">
+            <body>
+                <par><text src="ch1.html#w1"/><audio src="a.mp3" clipBegin="10s" clipEnd="12s"/></par>
+                <par><text src="ch1.html#w2"/><audio src="a.mp3" clipBegin="12s" clipEnd="13s"/></par>
+                <par><text src="ch1.html#w3"/><audio src="a.mp3" clipBegin="13s" clipEnd="15s"/></par>
+            </body>
+        </smil>
+        """
+        html = (
+            '<html><body><p><span id="s1">'
+            '<span id="w3"><span id="w2"><span id="w1"><em>The storm door </em></span>'
+            '<em>had this </em></span><em>lock</em><a id="n1">*</a>.</span>'
+            '</span></p></body></html>'
+        )
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, 'w') as zf:
+            zf.writestr('OEBPS/ch1.smil', smil)
+            zf.writestr('OEBPS/ch1.html', html)
+        with zipfile.ZipFile(buffer) as zf:
+            segments = self.extractor._process_smil_absolute(zf, 'OEBPS/ch1.smil')
+
+        self.assertEqual(
+            [(s['start'], s['text']) for s in segments],
+            [(10.0, 'The storm door'), (12.0, 'had this'), (13.0, 'lock * .')],
+        )
 
     def test_xml_parsing_with_prefixes(self):
         """Verify stripped XML is valid and parseable by ElementTree."""
