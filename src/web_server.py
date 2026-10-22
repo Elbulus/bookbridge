@@ -9324,6 +9324,56 @@ def _auto_match_suggestions(results: object, user_id: int | None) -> object:
             remaining.append(suggestion)
             continue
         try:
+            # The mapping service hashes by downloading from a library; a Local File
+            # has no library id, so hash the file itself as manual matching does.
+            # Without a hash the service can't link it either.
+            kosync_doc_id = None
+            if top.get('source') == 'Local File':
+                kosync_doc_id = get_kosync_id_for_ebook(
+                    top.get('ebook_filename') or '', source_path=top.get('source_path'),
+                )
+                if not kosync_doc_id:
+                    logger.warning(
+                        f"⚠️ Auto-match could not hash Local File '{top.get('ebook_filename')}' "
+                        f"for '{suggestion.get('abs_title')}'; left for review"
+                    )
+                    remaining.append(suggestion)
+                    continue
+                # Saving a mapping absorbs any other book on the same hash. With
+                # two audiobooks of one ebook, or two files sharing a filename
+                # hash, the second match deletes the first one's mapping.
+                audio_source_id = suggestion.get('audio_source_id') or suggestion.get('abs_id') or ''
+                holder = database_service.get_book_by_kosync_id(kosync_doc_id)
+                if (
+                    holder is not None
+                    and holder.sync_mode != 'ebook_only'
+                    and (holder.audio_source_id or holder.abs_id) != audio_source_id
+                ):
+                    logger.info(
+                        f"Auto-match skipped '{suggestion.get('abs_title')}': Local File "
+                        f"'{top.get('ebook_filename')}' is already linked to another audiobook "
+                        f"('{holder.abs_title}', {holder.abs_id}); left for review"
+                    )
+                    remaining.append(suggestion)
+                    continue
+                # Absorbing moves the holder's readers and progress, so unattended
+                # auto-match only folds in the scanning reader's own mapping.
+                document = database_service.get_kosync_document(kosync_doc_id)
+                document_owner = getattr(document, 'linked_abs_id', None) if document else None
+                other_readers = (
+                    user_id is not None and holder is not None and holder.sync_mode == 'ebook_only'
+                    and any(uid != user_id for uid in database_service.get_book_user_ids(holder.abs_id))
+                )
+                if other_readers or document_owner not in (
+                    None, suggestion.get('abs_id'), getattr(holder, 'abs_id', None),
+                ):
+                    logger.info(
+                        f"Auto-match skipped '{suggestion.get('abs_title')}': Local File "
+                        f"'{top.get('ebook_filename')}' belongs to another reader's mapping; "
+                        f"left for review"
+                    )
+                    remaining.append(suggestion)
+                    continue
             saved = mapping_service.create_audio_mapping_from_match(
                 audio_source=suggestion.get('audio_source') or 'ABS',
                 audio_source_id=suggestion.get('audio_source_id') or suggestion.get('abs_id') or '',
@@ -9335,6 +9385,7 @@ def _auto_match_suggestions(results: object, user_id: int | None) -> object:
                 audio_provider_file_id=suggestion.get('audio_provider_file_id'),
                 ebook_source=top.get('source'),
                 ebook_source_id=str(top.get('source_id')) if top.get('source_id') is not None else None,
+                kosync_doc_id=kosync_doc_id,
                 user_id=user_id,
             )
         except Exception as e:
