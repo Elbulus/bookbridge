@@ -93,10 +93,14 @@ class SmilExtractor:
                     logger.info(f"📖 Audio source has {len(abs_chapters)} chapters")
                 
                 # Detect timestamp mode
-                timestamp_mode = self._detect_timestamp_mode(zf, smil_files)
+                file_offsets = self._audio_file_offsets(zf, smil_files, abs_chapters)
+                timestamp_mode = 'per_audio_file' if file_offsets else self._detect_timestamp_mode(zf, smil_files)
                 logger.info(f"⚙️ Detected timestamp mode: {timestamp_mode}")
                 
-                if timestamp_mode == 'absolute':
+                if timestamp_mode == 'per_audio_file':
+                    for smil_path in smil_files:
+                        transcript.extend(self._process_smil_with_offset(zf, smil_path, 0.0, file_offsets))
+                elif timestamp_mode == 'absolute':
                     # Process all SMIL files with absolute timestamps
                     for idx, smil_path in enumerate(smil_files):
                         segments = self._process_smil_absolute(zf, smil_path)
@@ -156,6 +160,44 @@ class SmilExtractor:
         except Exception as e:
             logger.error(f"❌ Error extracting SMIL transcript: {e}", exc_info=True)
             return []
+
+    def _audio_file_offsets(self, zf: zipfile.ZipFile, smil_files: List[str],
+                            abs_chapters: Optional[List[Dict]]) -> Dict[str, float]:
+        """
+        Map each audio file to its start in the audiobook, when there's one per chapter.
+        
+        Clip times count from the start of their own audio file. A read-along made by
+        splitting the audiobook at its chapters has one numbered file per chapter.
+        Files the aligner gave no clips still hold their chapter, so they're counted
+        from the archive too. Returns an empty dict for any other layout.
+        """
+        if not abs_chapters:
+            return {}
+        names, folders, suffixes = set(), set(), set()
+        for smil_path in smil_files:
+            try:
+                root = ET.fromstring(self._strip_namespaces(zf.read(smil_path).decode('utf-8')))
+            except (KeyError, UnicodeDecodeError, ET.ParseError, DefusedXmlException):
+                continue
+            smil_dir = str(Path(smil_path).parent)
+            if smil_dir == '.': smil_dir = ''
+            for audio_elem in root.iter('audio'):
+                name = self._audio_file_name(audio_elem)
+                if name:
+                    names.add(name)
+                    full_path = self._resolve_path(smil_dir, urllib.parse.unquote(audio_elem.get('src', '')))
+                    folders.add(str(Path(full_path).parent))
+                    suffixes.add(Path(name).suffix.lower())
+        for entry in zf.namelist():
+            if str(Path(entry).parent) in folders and Path(entry).suffix.lower() in suffixes:
+                names.add(Path(entry).name)
+        audio_files = sorted(names, key=self._natural_sort_key)
+        if len(audio_files) < 2 or len(audio_files) != len(abs_chapters):
+            return {}
+        return {name: float(chapter.get('start', 0)) for name, chapter in zip(audio_files, abs_chapters)}
+
+    def _audio_file_name(self, audio_elem) -> str:
+        return Path(urllib.parse.unquote(audio_elem.get('src', ''))).name
 
     def _detect_timestamp_mode(self, zf: zipfile.ZipFile, smil_files: List[str]) -> str:
         """
@@ -450,8 +492,8 @@ class SmilExtractor:
         return transcript
 
     def _process_smil_with_offset(self, zf: zipfile.ZipFile, smil_path: str, 
-                                   offset: float) -> List[Dict]:
-        """Process SMIL file adding an offset to all timestamps."""
+                                   offset: float, file_offsets: Optional[Dict[str, float]] = None) -> List[Dict]:
+        """Process SMIL file adding an offset to all timestamps, or each audio file's own offset."""
         segments = []
         try:
             smil_content = zf.read(smil_path).decode('utf-8')
@@ -471,14 +513,15 @@ class SmilExtractor:
                 
                 clip_begin = self._parse_timestamp(audio_elem.get('clipBegin', '0s'))
                 clip_end = self._parse_timestamp(audio_elem.get('clipEnd', '0s'))
+                par_offset = file_offsets.get(self._audio_file_name(audio_elem), offset) if file_offsets else offset
                 
                 text_src = urllib.parse.unquote(text_elem.get('src', ''))
                 text_content = self._get_text_content(zf, smil_dir, text_src)
                 
                 if text_content:
                     segments.append({
-                        'start': round(clip_begin + offset, 3),
-                        'end': round(clip_end + offset, 3),
+                        'start': round(clip_begin + par_offset, 3),
+                        'end': round(clip_end + par_offset, 3),
                         'text': text_content
                     })
         

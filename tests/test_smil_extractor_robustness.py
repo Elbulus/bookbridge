@@ -1,4 +1,6 @@
+import io
 import unittest
+import zipfile
 import xml.etree.ElementTree as ET
 from unittest.mock import MagicMock, patch
 import sys
@@ -104,6 +106,81 @@ class TestSmilExtractorRobustness(unittest.TestCase):
         self.assertEqual(len(segments), 1)
         self.assertEqual(segments[0]['text'], 'Hello World')
         self.assertNotEqual(segments[0]['text'], 'FAIL_ENCODED')
+
+    def test_clip_times_are_placed_by_their_audio_file_chapter(self):
+        """Verify each audio file's clip times start at that file's audiobook chapter."""
+        opf = """<?xml version="1.0"?>
+        <package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+            <manifest>
+                <item id="c1" href="ch1.html" media-type="application/xhtml+xml" media-overlay="m1"/>
+                <item id="c2" href="ch2.html" media-type="application/xhtml+xml" media-overlay="m2"/>
+                <item id="m1" href="ch1.smil" media-type="application/smil+xml"/>
+                <item id="m2" href="ch2.smil" media-type="application/smil+xml"/>
+            </manifest>
+            <spine><itemref idref="c1"/><itemref idref="c2"/></spine>
+        </package>"""
+
+        def smil(chapter, clips):
+            pars = ''.join(
+                f'<par><text src="ch{chapter}.html#p{n}"/>'
+                f'<audio src="Audio/{audio}" clipBegin="{begin}s" clipEnd="{end}s"/></par>'
+                for n, audio, begin, end in clips
+            )
+            return f'<smil xmlns="http://www.w3.org/ns/SMIL" version="3.0"><body>{pars}</body></smil>'
+
+        def html(numbers):
+            return '<html><body>' + ''.join(f'<p id="p{n}">Sentence {n}.</p>' for n in numbers) + '</body></html>'
+
+        # The second text chapter starts in the first audio file and ends in the second.
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, 'w') as zf:
+            zf.writestr('META-INF/container.xml',
+                        '<container><rootfiles><rootfile full-path="OEBPS/content.opf"/></rootfiles></container>')
+            zf.writestr('OEBPS/content.opf', opf)
+            zf.writestr('OEBPS/ch1.smil', smil(1, [(1, '00000-00001.m4a', 0, 100), (2, '00000-00001.m4a', 100, 200)]))
+            zf.writestr('OEBPS/ch2.smil', smil(2, [(3, '00000-00001.m4a', 200, 300),
+                                                   (4, '00000-00002.m4a', 0, 50),
+                                                   (5, '00000-00002.m4a', 50, 120)]))
+            zf.writestr('OEBPS/ch1.html', html([1, 2]))
+            zf.writestr('OEBPS/ch2.html', html([3, 4, 5]))
+        chapters = [{'start': 0.0, 'end': 305.0}, {'start': 305.0, 'end': 430.0}]
+
+        transcript = self.extractor.extract_transcript(buffer, chapters)
+
+        self.assertEqual(
+            [(s['start'], s['text']) for s in transcript],
+            [(0.0, 'Sentence 1.'), (100.0, 'Sentence 2.'), (200.0, 'Sentence 3.'),
+             (305.0, 'Sentence 4.'), (355.0, 'Sentence 5.')],
+        )
+
+    def test_audio_file_offsets_need_one_file_per_chapter(self):
+        """Verify per-file offsets are used only when the audio files and chapters line up."""
+        def epub_with(audio_files, archived_audio=()):
+            pars = ''.join(
+                f'<par><text src="ch1.html#p{n}"/><audio src="{name}" clipBegin="0s" clipEnd="1s"/></par>'
+                for n, name in enumerate(audio_files)
+            )
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(buffer, 'w') as zf:
+                zf.writestr('ch1.smil', f'<smil xmlns="http://www.w3.org/ns/SMIL"><body>{pars}</body></smil>')
+                for name in archived_audio:
+                    zf.writestr(name, b'')
+            return zipfile.ZipFile(buffer)
+
+        two_chapters = [{'start': 0.0, 'end': 10.0}, {'start': 10.0, 'end': 20.0}]
+        three_chapters = two_chapters + [{'start': 20.0, 'end': 30.0}]
+
+        self.assertEqual(self.extractor._audio_file_offsets(epub_with(['a.mp3', 'b.mp3']), ['ch1.smil'], two_chapters),
+                         {'a.mp3': 0.0, 'b.mp3': 10.0})
+        self.assertEqual(self.extractor._audio_file_offsets(epub_with(['a.mp3', 'b.mp3']), ['ch1.smil'], three_chapters), {})
+        self.assertEqual(self.extractor._audio_file_offsets(epub_with(['a.mp3', 'a.mp3']), ['ch1.smil'], two_chapters), {})
+        self.assertEqual(self.extractor._audio_file_offsets(epub_with(['a.mp3', 'b.mp3']), ['ch1.smil'], None), {})
+        # An audio file the aligner left without clips still takes up its chapter.
+        self.assertEqual(
+            self.extractor._audio_file_offsets(
+                epub_with(['Audio/a.mp3', 'Audio/c.mp3'], ['Audio/a.mp3', 'Audio/b.mp3', 'Audio/c.mp3']),
+                ['ch1.smil'], three_chapters),
+            {'a.mp3': 0.0, 'b.mp3': 10.0, 'c.mp3': 20.0})
 
     def test_xml_parsing_with_prefixes(self):
         """Verify stripped XML is valid and parseable by ElementTree."""
