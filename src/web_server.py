@@ -8588,7 +8588,7 @@ def _auto_match_suggestions(results: object, user_id: int | None) -> object:
                     continue
                 # Saving a mapping absorbs any other book on the same hash. With
                 # two audiobooks of one ebook, or two files sharing a filename
-                # hash, the second match would delete the first one's mapping.
+                # hash, the second match deletes the first one's mapping.
                 audio_source_id = suggestion.get('audio_source_id') or suggestion.get('abs_id') or ''
                 holder = database_service.get_book_by_kosync_id(kosync_doc_id)
                 if (
@@ -8600,6 +8600,24 @@ def _auto_match_suggestions(results: object, user_id: int | None) -> object:
                         f"Auto-match skipped '{suggestion.get('abs_title')}': Local File "
                         f"'{top.get('ebook_filename')}' is already linked to another audiobook "
                         f"('{holder.abs_title}', {holder.abs_id}); left for review"
+                    )
+                    remaining.append(suggestion)
+                    continue
+                # Absorbing moves the holder's readers and progress, so unattended
+                # auto-match only folds in the scanning reader's own mapping.
+                document = database_service.get_kosync_document(kosync_doc_id)
+                document_owner = getattr(document, 'linked_abs_id', None) if document else None
+                other_readers = (
+                    user_id is not None and holder is not None and holder.sync_mode == 'ebook_only'
+                    and any(uid != user_id for uid in database_service.get_book_user_ids(holder.abs_id))
+                )
+                if other_readers or document_owner not in (
+                    None, suggestion.get('abs_id'), getattr(holder, 'abs_id', None),
+                ):
+                    logger.info(
+                        f"Auto-match skipped '{suggestion.get('abs_title')}': Local File "
+                        f"'{top.get('ebook_filename')}' belongs to another reader's mapping; "
+                        f"left for review"
                     )
                     remaining.append(suggestion)
                     continue
