@@ -1,13 +1,15 @@
-"""Title, author, and series metadata for library ebook files, read from Calibre's
-metadata.opf or the EPUB's own OPF. Shared by suggestion scoring and any other Local File
-consumer."""
+"""Title, author, and series metadata for library ebook files, read from the Calibre
+library's metadata.db, its metadata.opf, or the EPUB's own OPF. Shared by suggestion
+scoring and any other Local File consumer."""
 import logging
+import sqlite3
 import threading
 import unicodedata
 import zipfile
 from collections import OrderedDict
+from contextlib import closing
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from xml.etree import ElementTree
 
 from src.utils.series_metadata import (
@@ -27,6 +29,8 @@ _Record = Tuple[str, str, Optional[str], Optional[float]]
 _EMPTY: _Record = ("", "", None, None)
 _cache: "OrderedDict[tuple, _Record]" = OrderedDict()
 _cache_lock = threading.Lock()
+_LIBRARY_DB = "metadata.db"
+_library_cache: Dict[str, Tuple[tuple, Dict[str, _Record]]] = {}
 
 
 def opf_title_authors(opf_xml: bytes) -> Tuple[str, str]:
@@ -73,6 +77,72 @@ def _opf_record(opf_xml: bytes) -> _Record:
     return (*opf_title_authors(opf_xml), *opf_series(opf_xml))
 
 
+def _library_state(db_file: Path) -> Optional[tuple]:
+    """Size and mtime of metadata.db and its WAL file; a committed edit changes one of them."""
+    try:
+        db_stat = db_file.stat()
+    except OSError:
+        return None
+    wal_file = db_file.with_name(db_file.name + "-wal")
+    wal_stat = wal_file.stat() if wal_file.exists() else None
+    return (
+        db_stat.st_mtime_ns, db_stat.st_size,
+        (wal_stat.st_mtime_ns, wal_stat.st_size) if wal_stat else None,
+    )
+
+
+def _load_library(db_file: Path) -> Dict[str, _Record]:
+    """Map each book folder ("Author/Title (id)") in a Calibre library to its record."""
+    # Read-only, since the library is often mounted read-only and Calibre-Web owns writes.
+    with closing(sqlite3.connect(f"{db_file.as_uri()}?mode=ro", uri=True, timeout=1)) as conn:
+        books = conn.execute("SELECT id, path, title, series_index FROM books").fetchall()
+        authors: Dict[int, List[str]] = {}
+        for book_id, name in conn.execute(
+            "SELECT l.book, a.name FROM books_authors_link l JOIN authors a ON a.id = l.author ORDER BY l.id"
+        ):
+            # Calibre stores a comma inside an author's name as "|".
+            authors.setdefault(book_id, []).append((name or "").replace("|", ","))
+        series = dict(conn.execute(
+            "SELECT l.book, s.name FROM books_series_link l JOIN series s ON s.id = l.series"
+        ).fetchall())
+    records = {}
+    for book_id, folder, title, index in books:
+        name = series.get(book_id)
+        records[folder] = (
+            unicodedata.normalize("NFC", title or ""),
+            unicodedata.normalize("NFC", " & ".join(authors.get(book_id, []))),
+            name,
+            float(index) if name and index is not None else None,
+        )
+    return records
+
+
+def _library_record(path: Path) -> Optional[_Record]:
+    """The book's record in metadata.db, which Calibre keeps two folders above the book's."""
+    if len(path.parents) < 3:
+        return None
+    root = path.parents[2]
+    db_file = root / _LIBRARY_DB
+    state = _library_state(db_file)
+    if state is None:
+        return None
+    with _cache_lock:
+        cached = _library_cache.get(str(db_file))
+    if cached and cached[0] == state:
+        records = cached[1]
+    else:
+        try:
+            records = _load_library(db_file)
+        except Exception:
+            logger.debug("Local ebook metadata: could not read %s", db_file, exc_info=True)
+            # Cached as empty so an unreadable database isn't reopened for every book.
+            records = {}
+        with _cache_lock:
+            _library_cache[str(db_file)] = (state, records)
+    record = records.get(path.parent.relative_to(root).as_posix())
+    return record if record and record[0] else None
+
+
 def _sole_book_in_folder(path: Path) -> bool:
     """True when every ebook beside *path* shares its stem (one Calibre book, many formats)."""
     stems = {p.stem for p in path.parent.iterdir() if p.suffix.lower() in _EBOOK_SUFFIXES}
@@ -102,8 +172,10 @@ def _read_uncached(path: Path) -> _Record:
 def read_local_ebook_metadata(path: Any) -> Tuple[str, str]:
     """Return ``(title, authors)`` for a library file; empty strings when unreadable.
 
-    Never raises. Results are cached per (resolved path, mtime, size) so repeated scans
-    only re-read files that changed.
+    Calibre-Web edits metadata.db right away but rewrites metadata.opf only in its
+    scheduled backup, so the library database is read first. Never raises. Results are
+    cached per (resolved path, mtime, size) so repeated scans only re-read files that
+    changed.
     """
     return _cached_record(path)[:2]
 
@@ -111,7 +183,7 @@ def read_local_ebook_metadata(path: Any) -> Tuple[str, str]:
 def read_local_ebook_series(path: Any) -> SeriesTuple:
     """Return ``(series_name, series_sequence)`` for a library file; Nones when unreadable.
 
-    Read from the same OPF, and cached the same way, as :func:`read_local_ebook_metadata`.
+    Read from the same source, and cached the same way, as :func:`read_local_ebook_metadata`.
     """
     return _cached_record(path)[2:]
 
@@ -119,6 +191,9 @@ def read_local_ebook_series(path: Any) -> SeriesTuple:
 def _cached_record(path: Any) -> _Record:
     try:
         resolved = Path(path).resolve()
+        record = _library_record(resolved)
+        if record:
+            return record
         stat = resolved.stat()
         opf_file = resolved.parent / "metadata.opf"
         opf_stat = opf_file.stat() if opf_file.exists() else None
@@ -145,3 +220,4 @@ def clear_metadata_cache() -> None:
     """Drop every cached metadata result (tests, or after bulk library changes)."""
     with _cache_lock:
         _cache.clear()
+        _library_cache.clear()
