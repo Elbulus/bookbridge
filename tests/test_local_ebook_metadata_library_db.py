@@ -1,6 +1,7 @@
 """Calibre-Web edits metadata.db right away but rewrites metadata.opf only in its
 scheduled backup, so the library database is read before the sidecar file."""
 
+import os
 import sqlite3
 import zipfile
 
@@ -81,6 +82,11 @@ def test_an_edit_in_the_database_is_read_on_the_next_scan(library):
     read_local_ebook_metadata(epub)
     library.db.execute("UPDATE books SET title = 'Lord of the Flies Centenary Edition'")
     library.db.commit()
+    # Some Windows filesystems preserve mtime for rapid same-size SQLite updates.
+    # Model a later scan with an observably changed metadata.db timestamp.
+    db_file = library.root / "metadata.db"
+    state = db_file.stat()
+    os.utime(db_file, ns=(state.st_atime_ns, state.st_mtime_ns + 2_000_000_000))
     assert read_local_ebook_metadata(epub)[0] == "Lord of the Flies Centenary Edition"
 
 
