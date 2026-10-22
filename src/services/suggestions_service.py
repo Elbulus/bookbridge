@@ -4,7 +4,8 @@ import unicodedata
 from typing import Callable, List, Set, Any, Dict, Optional
 
 from src.services.llm_matching import craft_search_terms
-from src.utils.local_ebook_metadata import read_local_ebook_metadata
+from src.utils.local_ebook_metadata import read_local_ebook_metadata, read_local_ebook_series
+from src.utils.series_metadata import extract_series_from_abs_metadata
 
 # Provider preference for collapsing the same physical audiobook when more than one
 # provider indexes the same shared library tree (#383): lower index wins ties. A
@@ -201,6 +202,7 @@ class SuggestionsService:
             candidate_language = str(getattr(candidate, 'language', None) or '').strip()
             candidate_source = (getattr(candidate, 'source', None) or '').strip()
             hypotheses = [(candidate_title, candidate_author)]
+            series = None
             # The library scan builds Local File candidates from the filename alone.
             if candidate_source == "Local File" and not candidate_author:
                 local_path = getattr(candidate, 'path', None)
@@ -209,6 +211,8 @@ class SuggestionsService:
                 )
                 hypotheses = self._title_author_hypotheses(candidate_title, meta_title, meta_authors)
                 candidate_title, candidate_author = hypotheses[0]
+                if local_path:
+                    series = self._series_key(*read_local_ebook_series(local_path))
             source_id = getattr(candidate, 'source_id', None) or getattr(candidate, 'booklore_id', None)
             raw_path = getattr(candidate, 'path', None)
             path = str(raw_path) if raw_path else None
@@ -228,6 +232,7 @@ class SuggestionsService:
                     for title, author in hypotheses
                 ],
                 "volume": next(filter(None, (self._volume_number(title) for title, _ in hypotheses)), None),
+                "series": series,
                 "language": candidate_language,
                 "source": candidate_source,
                 "source_id": source_id,
@@ -432,6 +437,10 @@ class SuggestionsService:
     # over the combined floor. Below this title score, a candidate is dropped.
     _SUGGEST_TITLE_FLOOR = 50.0
     _SUBTITLE_STRIPPED_SCORE_CAP = 89.0
+    # The same series, volume, and author identify a book whose title shares nothing
+    # with the audiobook's ("My Struggle, Book 3" and "Boyhood Island"). It stays below
+    # the auto-match threshold so a person still confirms it.
+    _SERIES_MATCH_SCORE = 90.0
 
     # A same-folder pair is auto-trusted (exact 100, pinned ahead of and skipping the
     # Ollama judge) only when the titles ALSO loosely agree. Without this, a lone
@@ -491,6 +500,18 @@ class SuggestionsService:
             if number:
                 return number
         return None
+
+    @classmethod
+    def _series_key(cls, name: Optional[str], sequence: Optional[float]) -> Optional[tuple]:
+        """Series name folded for comparison, with its volume; None without a name."""
+        folded = cls._normalize_title_for_match(name or "").casefold()
+        return (folded, sequence) if folded else None
+
+    def _audio_series(self, ab: dict) -> Optional[tuple]:
+        # Scan records carry the ABS "seriesName" label, which ends in "#N".
+        label = str(ab.get("audio_series") or "").strip()
+        metadata = {"seriesName": label} if label else ((ab.get("media") or {}).get("metadata") or {})
+        return self._series_key(*extract_series_from_abs_metadata(metadata))
 
     @staticmethod
     def _title_score(audio_title: str, audio_full_title: str, candidate_title: str) -> tuple[float, bool]:
@@ -749,6 +770,7 @@ class SuggestionsService:
         audio_path = self._audio_path(ab)
         audio_names = self._author_names(audio_author)
         audio_volume = self._volume_number(audio_title) or self._volume_number(subtitle)
+        audio_series = self._audio_series(ab)
         same_folder_count = sum(
             1 for candidate_info in per_book_pool
             if self._paths_share_parent(audio_path, candidate_info.get("path"))
@@ -767,6 +789,20 @@ class SuggestionsService:
                 matches.append(match)
                 continue
 
+            # Volumes of one series can share a bare title ("My Struggle"), so a
+            # different series number rules out a candidate titled with the series
+            # name. A distinctive title wins over the number, which sources assign
+            # differently (Calibre numbers a prequel 0, ABS by publication order).
+            candidate_series = candidate_info.get("series")
+            same_volume = False
+            if audio_series and candidate_series and audio_series[0] == candidate_series[0]:
+                if None not in (audio_series[1], candidate_series[1]):
+                    if audio_series[1] == candidate_series[1]:
+                        same_volume = True
+                    elif any(title.casefold() == candidate_series[0]
+                             for title, _ in candidate_info["hypotheses"]):
+                        continue
+
             # Normalizing drops a ", Book N" tail, so two volumes of one series would
             # otherwise score as the same title.
             candidate_volume = candidate_info.get("volume")
@@ -784,12 +820,17 @@ class SuggestionsService:
                 if best is None or score > best[0]:
                     best = (score, title_score, subtitle_stripped)
             score, title_score, subtitle_stripped = best
+            series_match = same_volume and any(
+                self._score_author_names(audio_names, names) for _, _, names in scored
+            )
 
+            if series_match:
+                score = max(score, self._SERIES_MATCH_SCORE)
             # Low floor on purpose; a strong title also survives a weak/format-mismatched
             # author. Embedding retrieval + the judge gate enforce precision downstream.
-            if score < self._SUGGEST_FUZZY_FLOOR and title_score < self._SUGGEST_TITLE_STRONG:
+            elif score < self._SUGGEST_FUZZY_FLOOR and title_score < self._SUGGEST_TITLE_STRONG:
                 continue
-            if title_score < self._SUGGEST_TITLE_FLOOR:
+            elif title_score < self._SUGGEST_TITLE_FLOOR:
                 continue
 
             direct_match = self._audiobook_matches_candidate(
@@ -801,7 +842,9 @@ class SuggestionsService:
 
             match = self._match_from_pool(candidate_info, max(score, 0.0))
             match["_direct_match"] = direct_match
-            if subtitle_stripped:
+            if series_match:
+                match["match_reason"] = "same_series"
+            elif subtitle_stripped:
                 match["match_reason"] = "subtitle_only"
             matches.append(match)
 
@@ -1184,6 +1227,9 @@ class SuggestionsService:
         from src.api.ollama_client import cosine_similarity
 
         for m, ct in zip(rerank, cand_texts):
+            if m.get("match_reason") == "same_series":
+                # Series metadata identifies these; their titles are unrelated text by design.
+                continue
             cand_vec = embedded.get(ct)
             cos = cosine_similarity(audio_vec, cand_vec) if cand_vec else 0.0
             m["score"] = round(0.6 * m.get("score", 0) + 40.0 * cos, 1)

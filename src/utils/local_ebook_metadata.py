@@ -1,22 +1,31 @@
-"""Title/author metadata for library ebook files, read from Calibre's metadata.opf or the
-EPUB's own OPF. Shared by suggestion scoring and any other Local File consumer."""
+"""Title, author, and series metadata for library ebook files, read from Calibre's
+metadata.opf or the EPUB's own OPF. Shared by suggestion scoring and any other Local File
+consumer."""
 import logging
 import threading
 import unicodedata
 import zipfile
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Tuple
+from typing import Any, Optional, Tuple
 from xml.etree import ElementTree
 
-from src.utils.series_metadata import _local_tag, _locate_opf_path
+from src.utils.series_metadata import (
+    SeriesTuple,
+    _extract_calibre_series_from_opf,
+    _extract_epub3_collection_from_opf,
+    _local_tag,
+    _locate_opf_path,
+)
 
 logger = logging.getLogger(__name__)
 
 _OPF_NAMESPACE = "{http://www.idpf.org/2007/opf}"
 _EBOOK_SUFFIXES = frozenset({".epub", ".kepub", ".pdf", ".mobi", ".azw", ".azw3", ".cbz", ".cbr", ".fb2"})
 _CACHE_MAX = 4096
-_cache: "OrderedDict[tuple, Tuple[str, str]]" = OrderedDict()
+_Record = Tuple[str, str, Optional[str], Optional[float]]
+_EMPTY: _Record = ("", "", None, None)
+_cache: "OrderedDict[tuple, _Record]" = OrderedDict()
 _cache_lock = threading.Lock()
 
 
@@ -51,19 +60,32 @@ def opf_title_authors(opf_xml: bytes) -> Tuple[str, str]:
     return unicodedata.normalize("NFC", title), unicodedata.normalize("NFC", " & ".join(authors))
 
 
+def opf_series(opf_xml: bytes) -> SeriesTuple:
+    """Return ``(series_name, series_sequence)`` from OPF package XML."""
+    root = ElementTree.fromstring(opf_xml)
+    name, sequence = _extract_calibre_series_from_opf(root)
+    if name:
+        return name, sequence
+    return _extract_epub3_collection_from_opf(root)
+
+
+def _opf_record(opf_xml: bytes) -> _Record:
+    return (*opf_title_authors(opf_xml), *opf_series(opf_xml))
+
+
 def _sole_book_in_folder(path: Path) -> bool:
     """True when every ebook beside *path* shares its stem (one Calibre book, many formats)."""
     stems = {p.stem for p in path.parent.iterdir() if p.suffix.lower() in _EBOOK_SUFFIXES}
     return stems <= {path.stem}
 
 
-def _read_uncached(path: Path) -> Tuple[str, str]:
+def _read_uncached(path: Path) -> _Record:
     opf_file = path.parent / "metadata.opf"
     try:
         if opf_file.is_file() and _sole_book_in_folder(path):
-            title, authors = opf_title_authors(opf_file.read_bytes())
-            if title:
-                return title, authors
+            record = _opf_record(opf_file.read_bytes())
+            if record[0]:
+                return record
     except Exception:
         logger.debug("Local ebook metadata: could not read %s", opf_file, exc_info=True)
     if path.suffix.lower() == ".epub":
@@ -71,10 +93,10 @@ def _read_uncached(path: Path) -> Tuple[str, str]:
             with zipfile.ZipFile(path) as zf:
                 opf_path = _locate_opf_path(zf)
                 if opf_path:
-                    return opf_title_authors(zf.read(opf_path))
+                    return _opf_record(zf.read(opf_path))
         except Exception:
             logger.debug("Local ebook metadata: could not read %s", path, exc_info=True)
-    return "", ""
+    return _EMPTY
 
 
 def read_local_ebook_metadata(path: Any) -> Tuple[str, str]:
@@ -83,6 +105,18 @@ def read_local_ebook_metadata(path: Any) -> Tuple[str, str]:
     Never raises. Results are cached per (resolved path, mtime, size) so repeated scans
     only re-read files that changed.
     """
+    return _cached_record(path)[:2]
+
+
+def read_local_ebook_series(path: Any) -> SeriesTuple:
+    """Return ``(series_name, series_sequence)`` for a library file; Nones when unreadable.
+
+    Read from the same OPF, and cached the same way, as :func:`read_local_ebook_metadata`.
+    """
+    return _cached_record(path)[2:]
+
+
+def _cached_record(path: Any) -> _Record:
     try:
         resolved = Path(path).resolve()
         stat = resolved.stat()
@@ -104,7 +138,7 @@ def read_local_ebook_metadata(path: Any) -> Tuple[str, str]:
         return value
     except Exception:
         logger.debug("Local ebook metadata: could not inspect %s", path, exc_info=True)
-        return "", ""
+        return _EMPTY
 
 
 def clear_metadata_cache() -> None:
