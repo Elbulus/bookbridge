@@ -89,6 +89,12 @@ def test_the_same_volume_of_the_same_series_is_suggested(library):
     assert scores == {"Boyhood Island": SuggestionsService._SERIES_MATCH_SCORE}
 
 
+def test_distinctive_title_survives_conflicting_series_and_title_numbers(library):
+    candidate = library("The Daughters' War, Book 1", 0, series="Blacktongue", author="Christopher Buehlman")
+    scores = _scan("The Daughters' War, Book 2", "Blacktongue #2", candidate, author="Christopher Buehlman")
+    assert "The Daughters' War, Book 1" in scores
+
+
 def test_a_series_match_never_auto_matches(library):
     scores = _scan("My Struggle, Book 3", "My Struggle #3", library("Boyhood Island", 3))
     assert scores["Boyhood Island"] < 95

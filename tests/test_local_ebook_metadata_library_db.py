@@ -45,7 +45,7 @@ def library(tmp_path):
 
     def add(title, authors, opf_title, opf_author, series=None, index=1.0):
         book_id = db.execute("SELECT COUNT(*) + 1 FROM books").fetchone()[0]
-        folder = f"{authors[0]}/{title} ({book_id})"
+        folder = f"{authors[0].replace('|', ',').rstrip('. ')}/{title} ({book_id})"
         db.execute("INSERT INTO books (id, title, path, series_index) VALUES (?, ?, ?, ?)",
                    (book_id, title, folder, index))
         for name in authors:
@@ -58,7 +58,7 @@ def library(tmp_path):
         (tmp_path / folder).mkdir(parents=True)
         (tmp_path / folder / "metadata.opf").write_text(
             _OPF.format(title=opf_title, author=opf_author), encoding="utf-8")
-        epub = tmp_path / folder / f"{title} - {authors[0]}.epub"
+        epub = tmp_path / folder / f"{title} - {authors[0].replace('|', ',')}.epub"
         with zipfile.ZipFile(epub, "w"):
             pass
         return epub

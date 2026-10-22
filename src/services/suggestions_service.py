@@ -851,8 +851,10 @@ class SuggestionsService:
             # differently (Calibre numbers a prequel 0, ABS by publication order).
             candidate_series = candidate_info.get("series")
             same_volume = False
+            series_number_compared = False
             if audio_series and candidate_series and audio_series[0] == candidate_series[0]:
                 if None not in (audio_series[1], candidate_series[1]):
+                    series_number_compared = True
                     if audio_series[1] == candidate_series[1]:
                         same_volume = True
                     elif any(title.casefold() == candidate_series[0]
@@ -862,7 +864,7 @@ class SuggestionsService:
             # Normalizing drops a ", Book N" tail, so two volumes of one series would
             # otherwise score as the same title.
             candidate_volume = candidate_info.get("volume")
-            if audio_volume and candidate_volume and audio_volume != candidate_volume:
+            if not series_number_compared and audio_volume and candidate_volume and audio_volume != candidate_volume:
                 continue
 
             best = None
