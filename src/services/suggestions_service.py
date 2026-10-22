@@ -224,6 +224,13 @@ class SuggestionsService:
                 except Exception as e:
                     self.logger.debug(f"Calibre identifier lookup failed for {source_id}: {e}")
 
+            edition_titles = {}
+            for title, _ in hypotheses:
+                stripped = self._normalize_title_for_match(title)
+                unstripped = self._normalize_title_for_match(title, strip_editions=False)
+                if unstripped != stripped:
+                    edition_titles[stripped] = unstripped
+
             prepared.append({
                 "title": candidate_title,
                 "author": candidate_author,
@@ -233,6 +240,7 @@ class SuggestionsService:
                 ],
                 "volume": next(filter(None, (self._volume_number(title) for title, _ in hypotheses)), None),
                 "series": series,
+                "edition_titles": edition_titles,
                 "language": candidate_language,
                 "source": candidate_source,
                 "source_id": source_id,
@@ -437,6 +445,9 @@ class SuggestionsService:
     # over the combined floor. Below this title score, a candidate is dropped.
     _SUGGEST_TITLE_FLOOR = 50.0
     _SUBTITLE_STRIPPED_SCORE_CAP = 89.0
+    # Another edition can carry an introduction, notes, or essays the audiobook
+    # lacks, so a match that needed its edition credit dropped waits for a person.
+    _EDITION_STRIPPED_SCORE_CAP = 89.0
     # The same series, volume, and author identify a book whose title shares nothing
     # with the audiobook's ("My Struggle, Book 3" and "Boyhood Island"). It stays below
     # the auto-match threshold so a person still confirms it.
@@ -449,11 +460,47 @@ class SuggestionsService:
     # bypass all fuzzy/Ollama verification. Below the floor the pair stays reviewable.
     _SAME_FOLDER_TITLE_FLOOR = 45.0
 
-    @staticmethod
-    def _normalize_title_for_match(text: str) -> str:
+    _EDITION_QUALIFIERS = frozenset((
+        "first second third fourth fifth sixth seventh eighth ninth tenth anniversary "
+        "centenary centennial bicentennial deluxe new enhanced illustrated annotated special "
+        "collector's collectors definitive critical norton revised updated expanded "
+        "unabridged abridged"
+    ).split())
+    # Qualifiers that name an edition without the word "edition" ("Marathon, Revised
+    # and Updated"). They count only after punctuation, so "Universe Expanded" stays.
+    _EDITION_STANDALONE = frozenset({"revised", "updated", "expanded", "unabridged", "abridged"})
+    _EDITION_FILLER = frozenset({"edition", "editions", "the", "a", "and"})
+
+    @classmethod
+    def _strip_edition_credit(cls, s: str) -> str:
+        """Drop a trailing edition credit ("Centenary Edition", ", 3rd Edition - 2021")."""
+        words = list(re.finditer(r"[\w']+", s))
+        start = len(words)
+        while start > 0:
+            word = words[start - 1].group().lower()
+            if not (word in cls._EDITION_QUALIFIERS or word in cls._EDITION_FILLER
+                    or re.fullmatch(r"\d+(?:st|nd|rd|th)|\d{4}", word)):
+                break
+            start -= 1
+        # A title made only of these words ("Special Edition") is the title itself.
+        if start in (0, len(words)):
+            return s
+        tail = [w.group().lower() for w in words[start:]]
+        qualifiers = {w for w in tail if w not in cls._EDITION_FILLER and not w.isdigit()}
+        if not qualifiers:
+            return s
+        if not {"edition", "editions"} & set(tail):
+            separator = s[words[start - 1].end():words[start].start()]
+            if not qualifiers <= cls._EDITION_STANDALONE or not re.search(r"[,:;\-]", separator):
+                return s
+        return s[:words[start].start()].rstrip(" ,:;-([")
+
+    @classmethod
+    def _normalize_title_for_match(cls, text: str, strip_editions: bool = True) -> str:
         """Strip surface noise that wrecks fuzzy/embedding scoring: leading numbering
         ('01. ', '02 '), trailing parentheticals ('(2024)', '(Unabridged)', '(readaloud)'),
-        ', Book N' tails, and a reordered trailing article ('Title, The' -> 'The Title').
+        trailing edition credits ('Centenary Edition', ', 3rd Edition'), ', Book N' tails,
+        and a reordered trailing article ('Title, The' -> 'The Title').
         Smart quotes/dashes are normalized to ASCII."""
         s = unicodedata.normalize("NFC", (text or "").strip())
         if not s:
@@ -462,8 +509,10 @@ class SuggestionsService:
                      ("”", '"'), ("–", "-"), ("—", "-")):
             s = s.replace(a, b)
         s = re.sub(r"^\s*\d{1,3}\s*[\.\)\-:]?\s+", "", s)  # leading "01. " / "02 " / "1) "
-        for _ in range(3):  # trailing "(...)" / "[...]"
+        for _ in range(3):  # trailing "(...)" / "[...]" and edition credits
             new = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]\s*$", "", s).strip()
+            if strip_editions:
+                new = cls._strip_edition_credit(new)
             if new == s:
                 break
             s = new
@@ -766,6 +815,9 @@ class SuggestionsService:
             or ""
         ).strip()
         norm_audio_full_title = self._normalize_title_for_match(f"{audio_title}: {subtitle}") if subtitle else ""
+        unstripped_audio_title = self._normalize_title_for_match(audio_title, strip_editions=False)
+        unstripped_audio_full_title = self._normalize_title_for_match(
+            f"{audio_title}: {subtitle}", strip_editions=False) if subtitle else ""
         matches = []
         audio_path = self._audio_path(ab)
         audio_names = self._author_names(audio_author)
@@ -776,13 +828,17 @@ class SuggestionsService:
             if self._paths_share_parent(audio_path, candidate_info.get("path"))
         )
         for candidate_info in per_book_pool:
-            scored = [
-                (*self._title_score(norm_audio_title, norm_audio_full_title, norm_title), names)
-                for norm_title, names in candidate_info["hypotheses"]
-            ]
+            scored = []
+            for norm_title, names in candidate_info["hypotheses"]:
+                title_score, subtitle_stripped = self._title_score(norm_audio_title, norm_audio_full_title, norm_title)
+                # Whether only dropping the candidate's edition credit made the titles agree.
+                unstripped = candidate_info.get("edition_titles", {}).get(norm_title)
+                edition_stripped = bool(unstripped) and self._title_score(
+                    unstripped_audio_title, unstripped_audio_full_title, unstripped)[0] < title_score
+                scored.append((title_score, subtitle_stripped, names, edition_stripped))
 
             if self._paths_share_parent(audio_path, candidate_info.get("path")):
-                title_score = max(t for t, _, _ in scored)
+                title_score = max(t for t, _, _, _ in scored)
                 score, match_reason = self._same_folder_tier(same_folder_count, title_score)
                 match = self._match_from_pool(candidate_info, score)
                 match["match_reason"] = match_reason
@@ -810,18 +866,20 @@ class SuggestionsService:
                 continue
 
             best = None
-            for title_score, subtitle_stripped, names in scored:
+            for title_score, subtitle_stripped, names, edition_stripped in scored:
                 if audio_author:
                     score = (title_score * 0.7) + (self._score_author_names(audio_names, names) * 0.3)
                 else:
                     score = title_score
                 if subtitle_stripped:
                     score = min(score, self._SUBTITLE_STRIPPED_SCORE_CAP)
+                if edition_stripped:
+                    score = min(score, self._EDITION_STRIPPED_SCORE_CAP)
                 if best is None or score > best[0]:
-                    best = (score, title_score, subtitle_stripped)
-            score, title_score, subtitle_stripped = best
+                    best = (score, title_score, subtitle_stripped, edition_stripped)
+            score, title_score, subtitle_stripped, edition_stripped = best
             series_match = same_volume and any(
-                self._score_author_names(audio_names, names) for _, _, names in scored
+                self._score_author_names(audio_names, names) for _, _, names, _ in scored
             )
 
             if series_match:
@@ -846,6 +904,8 @@ class SuggestionsService:
                 match["match_reason"] = "same_series"
             elif subtitle_stripped:
                 match["match_reason"] = "subtitle_only"
+            elif edition_stripped:
+                match["match_reason"] = "edition"
             matches.append(match)
 
         if not matches:
@@ -1236,6 +1296,8 @@ class SuggestionsService:
             if m.get("match_reason") == "subtitle_only":
                 # Semantic similarity must not lift a subtitle-only match past the judge.
                 m["score"] = min(m["score"], self._SUBTITLE_STRIPPED_SCORE_CAP)
+            elif m.get("match_reason") == "edition":
+                m["score"] = min(m["score"], self._EDITION_STRIPPED_SCORE_CAP)
 
         reordered = rerank + rest
         reordered.sort(key=lambda m: m.get("score", 0), reverse=True)
