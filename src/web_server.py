@@ -59,6 +59,9 @@ from src.services.job_queue_view import build_job_queue_view
 from src.services import whats_new
 from src.api.api_clients import ABS_DISABLED_SENTINEL, is_abs_disabled_value
 from src.api.kosync_server import kosync_sync_bp, kosync_admin_bp, init_kosync_server, signal_manifest_rebuild
+# This import adds the position-preview routes to kosync_admin_bp before
+# setup_dependencies registers the blueprint.
+from src.api import reading_position_preview_routes  # noqa: E402,F401
 from src.api.admin_api import admin_api_bp, init_admin_api
 from src.api.hardcover_routes import hardcover_bp, init_hardcover_routes
 from src.api.storygraph_routes import storygraph_bp, init_storygraph_routes
