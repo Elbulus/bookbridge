@@ -9361,7 +9361,7 @@ def _auto_match_suggestions(results: object, user_id: int | None) -> object:
                 document = database_service.get_kosync_document(kosync_doc_id)
                 document_owner = getattr(document, 'linked_abs_id', None) if document else None
                 other_readers = (
-                    user_id is not None and holder is not None and holder.sync_mode == 'ebook_only'
+                    holder is not None and holder.sync_mode == 'ebook_only'
                     and any(uid != user_id for uid in database_service.get_book_user_ids(holder.abs_id))
                 )
                 if other_readers or document_owner not in (
