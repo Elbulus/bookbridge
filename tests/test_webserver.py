@@ -2891,12 +2891,15 @@ class CleanFlaskIntegrationTest(unittest.TestCase):
         mock_write_cached.assert_called_once()
 
     def test_listening_yearly_recap_skips_out_of_range_months(self):
+        from datetime import timezone
+
         from src.web_server import _build_listening_yearly_recap
 
         recap = _build_listening_yearly_recap(
             {"2026-00-15": 10, "2026-13-01": 20, "2026-04-07": 30},
             2026,
-            0,
+            [],
+            timezone.utc,
         )
 
         self.assertEqual(recap["totalSeconds"], 30)
