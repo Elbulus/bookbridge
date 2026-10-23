@@ -11937,10 +11937,10 @@ def _build_listening_yearly_recap(all_days, year, finished_books, tz):
     """Year-in-review for listening: monthly hours from the ABS daily map, and the
     books ABS marks finished that year."""
     months = [{"month": m, "seconds": 0, "pages": 0, "finished": 0} for m in range(1, 13)]
-    finished_books = [
-        book for book in (finished_books or [])
-        if datetime.fromtimestamp(book["finishedAt"], tz).year == year
-    ]
+    finish_years = {
+        book["absId"]: datetime.fromtimestamp(book["finishedAt"], tz).year for book in (finished_books or [])
+    }
+    finished_books = [book for book in (finished_books or []) if finish_years[book["absId"]] == year]
     for book in finished_books:
         months[book["month"] - 1]["finished"] += 1
     total_seconds = 0
@@ -11964,7 +11964,8 @@ def _build_listening_yearly_recap(all_days, year, finished_books, tz):
         "totalPages": 0,
         "booksFinished": len(finished_books),
         "finishedBooks": finished_books,
-        "availableYears": _years_from_days(all_days),
+        # A book marked finished in a year with no listening time still needs its year listed.
+        "availableYears": sorted(set(_years_from_days(all_days)) | set(finish_years.values())),
     }
 
 

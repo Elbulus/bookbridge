@@ -71,3 +71,14 @@ def test_combined_recap_counts_a_book_finished_in_both_formats_once():
     assert combined["booksFinished"] == 2
     assert sorted(book["absId"] for book in combined["finishedBooks"]) == ["a", "b"]
     assert sum(month["finished"] for month in combined["months"]) == 2
+
+
+def test_a_year_with_a_finish_but_no_listening_time_is_listed():
+    finished = [
+        {"bookKey": "abs:b", "absId": "b", "title": "B", "author": None,
+         "finishedAt": _ms(2024, 5, 2) // 1000, "finishedDate": "2024-05-02", "month": 5},
+    ]
+
+    recap = _build_listening_yearly_recap({"2026-08-20": 600}, 2026, finished, DENVER)
+
+    assert recap["availableYears"] == [2024, 2026]
