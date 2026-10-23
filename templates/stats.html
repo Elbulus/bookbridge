@@ -197,6 +197,12 @@
     .pct-bar { height: 5px; border-radius: 3px; background: rgba(255,255,255,.08); margin-top: 6px; overflow: hidden; }
     .pct-bar > span { display: block; height: 100%; background: var(--success); }
     .scroll-list { max-height: 360px; overflow-y: auto; }
+    /* The books list fills the height its row gives it and scrolls inside, so it
+       never ends partway down the panel or stretches the panel beside it. */
+    .books-panel { display: flex; flex-direction: column; }
+    .books-panel .scroll-list { flex: 1 1 0; min-height: 360px; max-height: none; }
+    /* The heatmap keeps its own height beside the taller recent sessions list. */
+    #heatmap-panel { align-self: start; }
     .finished-row { display: flex; justify-content: space-between; gap: 12px; padding: 9px 0; border-bottom: 1px solid rgba(255,255,255,.05); }
     .finished-row:last-child { border-bottom: none; }
 </style>
@@ -879,7 +885,7 @@
             const pct = (b.percentComplete != null) ? `<div class="pct-bar"><span style="width:${Math.min(b.percentComplete, 100)}%"></span></div>` : "";
             return `<div class="books-row" data-book-key="${escapeHtml(b.bookKey)}"><div style="min-width:0"><div class="recent-title" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml(b.title || "Unknown book")}</div><div class="books-meta">${meta.join(" · ") || "Activity"}</div>${pct}</div><div class="books-side"><div class="v">${escapeHtml(formatDurationCompact(b.totalSeconds || 0))}</div><div class="s">${escapeHtml(pace)}</div></div></div>`;
         }).join("");
-        return `<section class="panel"><div class="panel-head"><h3>Books</h3><span>${books.length} tracked · tap for detail</span></div><div class="scroll-list">${rows}</div></section>`;
+        return `<section class="panel books-panel"><div class="panel-head"><h3>Books</h3><span>${books.length} tracked · tap for detail</span></div><div class="scroll-list">${rows}</div></section>`;
     }
 
     function yearlyRecapInner(recap) {
