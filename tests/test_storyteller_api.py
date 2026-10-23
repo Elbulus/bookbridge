@@ -212,7 +212,7 @@ class TestStorytellerSlimReadaloudEpub(unittest.TestCase):
             again = Path(tmpdir) / "again.epub"
             self._make_epub(src)
 
-            with patch("src.api.storyteller_api._probe_audio_seconds",
+            with patch("src.api.storyteller_api.probe_duration_seconds",
                        side_effect=lambda path: lengths[Path(path).suffix]):
                 self.client._strip_audio_from_epub(src, dst)
             # Stripping a stripped copy keeps the recorded lengths and adds no second entry.
@@ -230,7 +230,7 @@ class TestStorytellerSlimReadaloudEpub(unittest.TestCase):
             dst = Path(tmpdir) / "slim.epub"
             self._make_epub(src)
 
-            with patch("src.api.storyteller_api._probe_audio_seconds",
+            with patch("src.api.storyteller_api.probe_duration_seconds",
                        side_effect=lambda path: 12.5 if Path(path).suffix == ".mp3" else None):
                 self.client._strip_audio_from_epub(src, dst)
 

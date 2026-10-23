@@ -5,7 +5,6 @@ import mimetypes
 import os
 import re
 import shutil
-import subprocess
 import tempfile
 import time
 import zipfile
@@ -24,6 +23,7 @@ from src.utils.file_transfers import (
 )
 from src.sync_clients.sync_client_interface import LocatorResult
 from src.utils.logging_utils import get_persistent_condition_logger, sanitize_log_data
+from src.utils.audio_duration import probe_duration_seconds
 from src.utils.smil_extractor import AUDIO_DURATIONS_ENTRY
 from src.utils.user_config import resolve_setting
 
@@ -53,20 +53,6 @@ def _validate_epub_zip(path: Path) -> None:
             f"downloaded EPUB {path} is not a valid zip: {e}",
             actual_size=path.stat().st_size,
         ) from e
-
-
-def _probe_audio_seconds(path) -> Optional[float]:
-    """An audio file's length in seconds via ``ffprobe``, or None when it can't be read."""
-    cmd = [
-        "ffprobe", "-v", "error", "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1", str(path),
-    ]
-    try:
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
-        return round(float(result.stdout.strip()), 3)
-    except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as e:
-        logger.warning("Could not probe audio length for '%s': %s", path, e)
-        return None
 
 
 class StorytellerAPIClient:
@@ -1087,10 +1073,10 @@ class StorytellerAPIClient:
                         probe_path = Path(scratch) / f"audio{ext}"
                         with zin.open(item) as audio, open(probe_path, "wb") as out:
                             shutil.copyfileobj(audio, out, 1 << 20)
-                        seconds = _probe_audio_seconds(probe_path)
+                        seconds = probe_duration_seconds(probe_path)
                         probe_path.unlink()
                         if seconds is not None:
-                            durations[item.filename] = seconds
+                            durations[item.filename] = round(seconds, 3)
                     placeholder = zipfile.ZipInfo(item.filename, date_time=item.date_time)
                     placeholder.compress_type = zipfile.ZIP_DEFLATED
                     zout.writestr(placeholder, b"")
