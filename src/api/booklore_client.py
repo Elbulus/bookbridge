@@ -2567,6 +2567,30 @@ class BookloreClient:
         display_filename = book.get('fileName') or f"book-id:{book_id}"
         return self._update_progress_for_book(book, display_filename, percentage, rich_locator)
 
+    @staticmethod
+    def _chapter_percent_for_kobo(rich_locator):
+        """How far through its chapter (``href``) the locator is, 0-100, or None.
+
+        Grimmory hands a Kobo its web-reader position as a span in the chapter,
+        picked by this percentage. Sent with the position it is used as is; left
+        out, Grimmory works it out from the CFI or, failing that, from the
+        book-wide percentage, which it measures on a different scale (the
+        chapters' raw HTML sizes) and does not clamp. Observed live: a position
+        34% into a chapter became "119%" and the Kobo was put on that chapter's
+        last span, five pages on. It is the same fraction 0003 reads back from
+        contentSourceProgressPercent, so the round trip lands where it was written.
+        """
+        value = getattr(rich_locator, 'chapter_progress', None) if rich_locator else None
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not 0.0 <= value <= 1.0:
+            return None
+        return round(value * 100.0, 2)
+
     def _update_progress_for_book(self, book, ebook_filename, percentage, rich_locator=None):
         """Shared write implementation after identity has already been resolved."""
 
@@ -2645,6 +2669,9 @@ class BookloreClient:
                 file_progress["positionData"] = cfi
             if href:
                 file_progress["positionHref"] = href
+                chapter_pct = self._chapter_percent_for_kobo(rich_locator) if book_type == 'EPUB' else None
+                if chapter_pct is not None:
+                    file_progress["contentSourceProgressPercent"] = chapter_pct
             payload_variants.append(("fileProgress", {"bookId": book_id, "fileProgress": file_progress}))
 
         if not payload_variants:
