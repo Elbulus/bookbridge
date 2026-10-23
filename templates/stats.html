@@ -994,7 +994,7 @@
 
         dashboardRoot.innerHTML = `
             <section class="dashboard-shell">
-                <header class="dashboard-header"><div><h2>${escapeHtml(config.title)}</h2><p>${escapeHtml(config.subtitle)}</p></div><div class="dashboard-note">Last 7 days plus yearly activity</div></header>
+                <header class="dashboard-header"><div><h2>${escapeHtml(config.title)}</h2><p>${escapeHtml(config.subtitle)}</p></div></header>
                 <div class="stats-grid">${config.cards.map(card => `<article class="stat-card"><div class="stat-card-label">${escapeHtml(card[0])}</div><div class="stat-card-value">${escapeHtml(card[1](dataset))}</div><div class="stat-card-hint">${escapeHtml(card[2])}</div></article>`).join("")}</div>
                 <div class="insights-grid">
                     <section class="panel"><div class="panel-head"><h3>Weekly activity</h3><span>Daily totals</span></div><div class="chart-wrap"><canvas id="activity-chart" aria-label="Weekly activity chart"></canvas></div></section>
