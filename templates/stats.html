@@ -708,6 +708,23 @@
         `;
     }
 
+    // The server groups activity into days in its own time zone, with the same
+    // America/New_York fallback, so today's date comes from that zone.
+    function serverToday() {
+        const now = new Date();
+        for (const timeZone of [BRIDGE_TIMEZONE || "America/New_York", "America/New_York"]) {
+            try {
+                const parts = new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "numeric", day: "numeric" }).formatToParts(now);
+                const part = type => Number(parts.find(item => item.type === type).value);
+                return new Date(part("year"), part("month") - 1, part("day"));
+            } catch (error) {
+                continue;
+            }
+        }
+        now.setHours(0, 0, 0, 0);
+        return now;
+    }
+
     function heatLevel(seconds, maxSeconds) {
         if (!seconds || seconds <= 0 || !maxSeconds) return 0;
         const ratio = seconds / maxSeconds;
@@ -722,8 +739,7 @@
     function heatmap(dataset, year = null) {
         const entries = Array.isArray(dataset.heatmap) ? dataset.heatmap : [];
         const readingInteractive = state.activeTab === "reading";
-        const today = new Date();
-        today.setHours(0, 0, 0, 0);
+        const today = serverToday();
         const monthYear = date => date.toLocaleString(undefined, { month: "short", year: "numeric" });
         let firstDay, lastDay, firstSunday, lastSaturday, title, range;
         if (year === null) {
@@ -901,7 +917,7 @@
         const years = Array.isArray(recap.availableYears) ? recap.availableYears : [];
         const minYear = years.length ? years[0] : recap.year;
         // The current year stays reachable even before it has any activity.
-        const maxYear = Math.max(years.length ? years[years.length - 1] : recap.year, new Date().getFullYear());
+        const maxYear = Math.max(years.length ? years[years.length - 1] : recap.year, serverToday().getFullYear());
         const finished = (recap.finishedBooks || []).slice(0, 40).map(b =>
             `<div class="finished-row"><div class="recent-title" style="font-size:14px;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml(b.title || "Unknown book")}</div><div class="s" style="color:var(--muted-soft);font-size:12px;flex-shrink:0">${escapeHtml(formatLongDate(new Date((b.finishedAt || 0) * 1000).toISOString().slice(0, 10)))}</div></div>`
         ).join("");
@@ -950,7 +966,7 @@
             // The heatmap follows the recap's year, and the current year rolls.
             const heatmapPanel = document.getElementById("heatmap-panel");
             if (heatmapPanel && state.activeTab === tab && Array.isArray(data.heatmap)) {
-                const thisYear = year === new Date().getFullYear();
+                const thisYear = year === serverToday().getFullYear();
                 heatmapPanel.outerHTML = thisYear
                     ? heatmap(state.payload?.[tab] || { heatmap: data.heatmap })
                     : heatmap({ heatmap: data.heatmap }, year);
