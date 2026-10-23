@@ -15,6 +15,13 @@ logger = logging.getLogger(__name__)
 # seconds, keyed by its path in the archive.
 AUDIO_DURATIONS_ENTRY = "META-INF/bookbridge-audio-durations.json"
 
+# A read-along's last clip in each audio file ends at, or shortly before, the end of
+# that file: within 0.1 s in most StoryAlign builds, and 32 s at most in the ones
+# measured. An audio file is placed with a length only when its clips end no more
+# than UNTIMED_TAIL_SECONDS before that length and no more than OVERRUN_SECONDS past it.
+UNTIMED_TAIL_SECONDS = 60.0
+OVERRUN_SECONDS = 2.0
+
 class SmilExtractor:
     """
     Extracts transcript data from EPUB3 media overlays.
@@ -174,10 +181,12 @@ class SmilExtractor:
         records every file's length, each file starts where the files before it end.
         Otherwise a read-along made by splitting the audiobook at its chapters has
         one numbered file per chapter. Files the aligner gave no clips still take up
-        their place, so they're counted from the archive too. Returns an empty dict
-        for any other layout.
+        their place, so they're counted from the archive too. Either placement is
+        used only when every file's clips fit the length it gives that file. Returns
+        an empty dict when neither does.
         """
         names, folders, suffixes = set(), set(), set()
+        clip_ends: Dict[str, float] = {}
         for smil_path in smil_files:
             try:
                 root = ET.fromstring(self._strip_namespaces(zf.read(smil_path).decode('utf-8')))
@@ -192,22 +201,64 @@ class SmilExtractor:
                     full_path = self._resolve_path(smil_dir, urllib.parse.unquote(audio_elem.get('src', '')))
                     folders.add(str(Path(full_path).parent))
                     suffixes.add(Path(name).suffix.lower())
+                    clip_end = self._parse_timestamp(audio_elem.get('clipEnd', '0s'))
+                    clip_ends[name] = max(clip_ends.get(name, 0.0), clip_end)
         for entry in zf.namelist():
             if str(Path(entry).parent) in folders and Path(entry).suffix.lower() in suffixes:
                 names.add(Path(entry).name)
         audio_files = sorted(names, key=self._natural_sort_key)
         if len(audio_files) < 2:
             return {}
-        lengths = self._recorded_audio_lengths(zf)
-        if all(name in lengths for name in audio_files):
+        audiobook_end = float(abs_chapters[-1].get('end', 0)) if abs_chapters else None
+
+        placements = []
+        recorded = self._recorded_audio_lengths(zf)
+        if all(name in recorded for name in audio_files):
             offsets, start = {}, 0.0
             for name in audio_files:
                 offsets[name] = start
-                start += lengths[name]
-            return offsets
-        if not abs_chapters or len(audio_files) != len(abs_chapters):
-            return {}
-        return {name: float(chapter.get('start', 0)) for name, chapter in zip(audio_files, abs_chapters)}
+                start += recorded[name]
+            placements.append(("recorded lengths", offsets, {name: recorded[name] for name in audio_files}))
+        if abs_chapters and len(audio_files) == len(abs_chapters):
+            offsets = {name: float(chapter.get('start', 0)) for name, chapter in zip(audio_files, abs_chapters)}
+            lengths = {name: float(chapter.get('end', 0)) - float(chapter.get('start', 0))
+                       for name, chapter in zip(audio_files, abs_chapters)}
+            placements.append(("one file per chapter", offsets, lengths))
+
+        for method, offsets, lengths in placements:
+            problems = self._placement_problems(audio_files, offsets, lengths, clip_ends, audiobook_end)
+            untimed = sum(lengths.values()) - sum(clip_ends.values())
+            if not problems:
+                logger.info(f"📖 Placed {len(audio_files)} audio files by {method} "
+                            f"({untimed:.0f}s of audio has no clips)")
+                return offsets
+            logger.info(f"⚠️ Not placing audio files by {method}: {'; '.join(problems[:3])}"
+                        + (f" (and {len(problems) - 3} more)" if len(problems) > 3 else ""))
+        return {}
+
+    @staticmethod
+    def _placement_problems(audio_files: List[str], offsets: Dict[str, float], lengths: Dict[str, float],
+                            clip_ends: Dict[str, float], audiobook_end: Optional[float]) -> List[str]:
+        """Why a placement contradicts the clip times; an empty list when it doesn't.
+
+        Files sit back to back, so a file whose clips run past its length overlaps the
+        next one, and a file whose clips end well before its length leaves audio that
+        nothing times, as a wrong pairing of files and chapters does.
+        """
+        problems = []
+        for name in audio_files:
+            if name not in clip_ends:
+                continue
+            spare = lengths[name] - clip_ends[name]
+            if spare < -OVERRUN_SECONDS:
+                problems.append(f"{name} has clips {-spare:.0f}s past its {lengths[name]:.0f}s")
+            elif spare > UNTIMED_TAIL_SECONDS:
+                problems.append(f"{name} ends {spare:.0f}s before its {lengths[name]:.0f}s")
+        last = audio_files[-1]
+        if audiobook_end and offsets[last] + lengths[last] > audiobook_end + OVERRUN_SECONDS:
+            problems.append(f"the files run {offsets[last] + lengths[last] - audiobook_end:.0f}s "
+                            f"past the {audiobook_end:.0f}s audiobook")
+        return problems
 
     def _recorded_audio_lengths(self, zf: zipfile.ZipFile) -> Dict[str, float]:
         """Audio file lengths an audio-stripped copy recorded, keyed by file name."""
