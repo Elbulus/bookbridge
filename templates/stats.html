@@ -894,7 +894,8 @@
         }).join("");
         const years = Array.isArray(recap.availableYears) ? recap.availableYears : [];
         const minYear = years.length ? years[0] : recap.year;
-        const maxYear = years.length ? years[years.length - 1] : recap.year;
+        // The current year stays reachable even before it has any activity.
+        const maxYear = Math.max(years.length ? years[years.length - 1] : recap.year, new Date().getFullYear());
         const finished = (recap.finishedBooks || []).slice(0, 40).map(b =>
             `<div class="finished-row"><div class="recent-title" style="font-size:14px;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml(b.title || "Unknown book")}</div><div class="s" style="color:var(--muted-soft);font-size:12px;flex-shrink:0">${escapeHtml(formatLongDate(new Date((b.finishedAt || 0) * 1000).toISOString().slice(0, 10)))}</div></div>`
         ).join("");
@@ -924,7 +925,10 @@
         const recap = dataset.yearlyRecap;
         if (!recap || !Array.isArray(recap.months)) return "";
         const hasAny = recap.months.some(m => Number(m.seconds || 0) > 0) || (recap.finishedBooks || []).length;
-        if (!hasAny) return "";
+        // An empty year still shows the panel when earlier years have activity, so
+        // the year buttons can reach them.
+        const hasHistory = (recap.availableYears || []).length > 0;
+        if (!hasAny && !hasHistory) return "";
         return `<section class="panel" id="recap-panel">${yearlyRecapInner(recap)}</section>`;
     }
 
