@@ -1,4 +1,5 @@
 import io
+import json
 import unittest
 import zipfile
 import xml.etree.ElementTree as ET
@@ -10,7 +11,7 @@ from pathlib import Path
 # Add src to path
 sys.path.append(str(Path(__file__).parent.parent))
 
-from src.utils.smil_extractor import SmilExtractor
+from src.utils.smil_extractor import AUDIO_DURATIONS_ENTRY, SmilExtractor
 
 class TestSmilExtractorRobustness(unittest.TestCase):
     def setUp(self):
@@ -181,6 +182,34 @@ class TestSmilExtractorRobustness(unittest.TestCase):
                 epub_with(['Audio/a.mp3', 'Audio/c.mp3'], ['Audio/a.mp3', 'Audio/b.mp3', 'Audio/c.mp3']),
                 ['ch1.smil'], three_chapters),
             {'a.mp3': 0.0, 'b.mp3': 10.0, 'c.mp3': 20.0})
+
+    def test_stored_audio_lengths_place_each_file_whatever_the_chapters(self):
+        """Verify recorded audio lengths set each file's start, even when the chapters don't line up."""
+        def epub_with(lengths):
+            names = ['00000-00001.m4a', '00000-00002.m4a', '00000-00003.m4a']
+            pars = ''.join(
+                f'<par><text src="ch1.html#p{n}"/><audio src="Audio/{name}" clipBegin="0s" clipEnd="1s"/></par>'
+                for n, name in enumerate(names)
+            )
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(buffer, 'w') as zf:
+                zf.writestr('OEBPS/ch1.smil', f'<smil xmlns="http://www.w3.org/ns/SMIL"><body>{pars}</body></smil>')
+                for name in names:
+                    zf.writestr(f'OEBPS/Audio/{name}', b'')
+                zf.writestr(AUDIO_DURATIONS_ENTRY, json.dumps(
+                    {f'OEBPS/Audio/{name}': length for name, length in zip(names, lengths) if length is not None}))
+            return zipfile.ZipFile(buffer)
+
+        two_chapters = [{'start': 0.0, 'end': 150.0}, {'start': 150.0, 'end': 240.0}]
+        three_chapters = [{'start': 0.0, 'end': 100.0}, {'start': 100.0, 'end': 190.0}, {'start': 190.0, 'end': 240.0}]
+        placed = {'00000-00001.m4a': 0.0, '00000-00002.m4a': 120.0, '00000-00003.m4a': 200.0}
+
+        self.assertEqual(self.extractor._audio_file_offsets(epub_with([120.0, 80.0, 40.0]), ['OEBPS/ch1.smil'], two_chapters), placed)
+        self.assertEqual(self.extractor._audio_file_offsets(epub_with([120.0, 80.0, 40.0]), ['OEBPS/ch1.smil'], None), placed)
+        # A file with no recorded length falls back to one file per chapter.
+        self.assertEqual(
+            self.extractor._audio_file_offsets(epub_with([120.0, 80.0, None]), ['OEBPS/ch1.smil'], three_chapters),
+            {'00000-00001.m4a': 0.0, '00000-00002.m4a': 100.0, '00000-00003.m4a': 190.0})
 
     def test_xml_parsing_with_prefixes(self):
         """Verify stripped XML is valid and parseable by ElementTree."""

@@ -11,6 +11,10 @@ from defusedxml.common import DefusedXmlException
 
 logger = logging.getLogger(__name__)
 
+# Archive entry where an audio-stripped copy keeps each audio file's length in
+# seconds, keyed by its path in the archive.
+AUDIO_DURATIONS_ENTRY = "META-INF/bookbridge-audio-durations.json"
+
 class SmilExtractor:
     """
     Extracts transcript data from EPUB3 media overlays.
@@ -164,15 +168,15 @@ class SmilExtractor:
     def _audio_file_offsets(self, zf: zipfile.ZipFile, smil_files: List[str],
                             abs_chapters: Optional[List[Dict]]) -> Dict[str, float]:
         """
-        Map each audio file to its start in the audiobook, when there's one per chapter.
+        Map each audio file to its start in the audiobook.
         
-        Clip times count from the start of their own audio file. A read-along made by
-        splitting the audiobook at its chapters has one numbered file per chapter.
-        Files the aligner gave no clips still hold their chapter, so they're counted
-        from the archive too. Returns an empty dict for any other layout.
+        Clip times count from the start of their own audio file. When the archive
+        records every file's length, each file starts where the files before it end.
+        Otherwise a read-along made by splitting the audiobook at its chapters has
+        one numbered file per chapter. Files the aligner gave no clips still take up
+        their place, so they're counted from the archive too. Returns an empty dict
+        for any other layout.
         """
-        if not abs_chapters:
-            return {}
         names, folders, suffixes = set(), set(), set()
         for smil_path in smil_files:
             try:
@@ -192,9 +196,34 @@ class SmilExtractor:
             if str(Path(entry).parent) in folders and Path(entry).suffix.lower() in suffixes:
                 names.add(Path(entry).name)
         audio_files = sorted(names, key=self._natural_sort_key)
-        if len(audio_files) < 2 or len(audio_files) != len(abs_chapters):
+        if len(audio_files) < 2:
+            return {}
+        lengths = self._recorded_audio_lengths(zf)
+        if all(name in lengths for name in audio_files):
+            offsets, start = {}, 0.0
+            for name in audio_files:
+                offsets[name] = start
+                start += lengths[name]
+            return offsets
+        if not abs_chapters or len(audio_files) != len(abs_chapters):
             return {}
         return {name: float(chapter.get('start', 0)) for name, chapter in zip(audio_files, abs_chapters)}
+
+    def _recorded_audio_lengths(self, zf: zipfile.ZipFile) -> Dict[str, float]:
+        """Audio file lengths an audio-stripped copy recorded, keyed by file name."""
+        try:
+            recorded = json.loads(zf.read(AUDIO_DURATIONS_ENTRY))
+        except (KeyError, ValueError):
+            return {}
+        if not isinstance(recorded, dict):
+            return {}
+        lengths = {}
+        for path, seconds in recorded.items():
+            try:
+                lengths[Path(path).name] = float(seconds)
+            except (TypeError, ValueError):
+                continue
+        return lengths
 
     def _audio_file_name(self, audio_elem) -> str:
         return Path(urllib.parse.unquote(audio_elem.get('src', ''))).name
