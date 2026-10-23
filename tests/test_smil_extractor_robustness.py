@@ -267,6 +267,20 @@ class TestSmilExtractorRobustness(unittest.TestCase):
         self.assertEqual(offsets(None, one_per_file, clip_ends=(119.9, 79.9, 42.6)), by_chapter)
         self.assertEqual(offsets(None, one_per_file, clip_ends=(119.9, 82.6, 39.9)), {})
 
+    def test_chapters_that_disagree_with_recorded_lengths_give_way(self):
+        """Verify chapter marks set away from the file boundaries don't override recorded lengths."""
+        def offsets(lengths, chapters, clip_ends=(119.9, 79.9, None)):
+            return self.extractor._audio_file_offsets(
+                self._numbered_audio_epub(lengths, list(clip_ends)), ['OEBPS/ch1.smil'], chapters)
+
+        # Every mark 8 s late: the first file gains an untimed tail, and the last file, the credits, has no clips.
+        shifted = [{'start': 0.0, 'end': 128.0}, {'start': 128.0, 'end': 208.0}, {'start': 208.0, 'end': 240.0}]
+        self.assertEqual(offsets([120.0, 80.0, 40.0], shifted),
+                         {'00000-00001.m4a': 0.0, '00000-00002.m4a': 120.0, '00000-00003.m4a': 200.0})
+        # Chapters that don't start at the beginning of the audiobook aren't one file each.
+        late_start = [{'start': 5.0, 'end': 125.0}, {'start': 125.0, 'end': 205.0}, {'start': 205.0, 'end': 245.0}]
+        self.assertEqual(offsets(None, late_start, clip_ends=(119.9, 79.9, 39.9)), {})
+
     def test_xml_parsing_with_prefixes(self):
         """Verify stripped XML is valid and parseable by ElementTree."""
         # This string would cause "unbound prefix" if xmlns:epub is stripped but epub:textref remains

@@ -221,7 +221,7 @@ class SmilExtractor:
         if abs_chapters and len(audio_files) == len(abs_chapters):
             starts = [float(chapter.get('start', 0)) for chapter in abs_chapters]
             ends = [float(chapter.get('end', 0)) for chapter in abs_chapters]
-            if all(abs(end - start) <= 1.0 for end, start in zip(ends, starts[1:])):
+            if abs(starts[0]) <= 1.0 and all(abs(end - start) <= 1.0 for end, start in zip(ends, starts[1:])):
                 placements.append(("one file per chapter", dict(zip(audio_files, starts)),
                                    {name: end - start for name, start, end in zip(audio_files, starts, ends)}))
         recorded = self._recorded_audio_lengths(zf)
@@ -232,16 +232,27 @@ class SmilExtractor:
                 start += recorded[name]
             placements.append(("recorded lengths", offsets, {name: recorded[name] for name in audio_files}))
 
+        fitting = []
         for method, offsets, lengths in placements:
             problems = self._placement_problems(audio_files, offsets, lengths, clip_ends, audiobook_end)
-            untimed = sum(lengths.values()) - sum(clip_ends.values())
             if not problems:
-                logger.info(f"📖 Placed {len(audio_files)} audio files by {method} "
-                            f"({untimed:.0f}s of audio has no clips)")
-                return offsets
+                fitting.append((method, offsets, sum(lengths.values()) - sum(clip_ends.values())))
+                continue
             logger.info(f"⚠️ Not placing audio files by {method}: {'; '.join(problems[:3])}"
                         + (f" (and {len(problems) - 3} more)" if len(problems) > 3 else ""))
-        return {}
+        if len(fitting) == 2:
+            # Chapter marks can sit away from where the files really start, while recorded
+            # lengths only drift by their padding, so chapters win only where they agree.
+            drift = max(abs(fitting[0][1][name] - fitting[1][1][name]) for name in audio_files)
+            if drift > OVERRUN_SECONDS + PADDING_PER_FILE_SECONDS * len(audio_files):
+                logger.info(f"⚠️ Not placing audio files by {fitting[0][0]}: "
+                            f"its starts are up to {drift:.0f}s from the recorded lengths'")
+                fitting = fitting[1:]
+        if not fitting:
+            return {}
+        method, offsets, untimed = fitting[0]
+        logger.info(f"📖 Placed {len(audio_files)} audio files by {method} ({untimed:.0f}s of audio has no clips)")
+        return offsets
 
     @staticmethod
     def _placement_problems(audio_files: List[str], offsets: Dict[str, float], lengths: Dict[str, float],
