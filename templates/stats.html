@@ -402,6 +402,18 @@
         return `${Math.floor(abs / 86400)}d ago`;
     }
 
+    // Viewer-local calendar date; toISOString() would roll late-evening sessions into the next UTC day.
+    function localIsoDate(epochSeconds) {
+        if (!epochSeconds) return "";
+        const date = new Date(epochSeconds * 1000);
+        return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+    }
+
+    function formatProgressRange(start, end) {
+        if (start == null || end == null) return "Listening";
+        return `${Math.round(start * 100)}% → ${Math.round(end * 100)}%`;
+    }
+
     function formatLongDate(value) {
         if (!value) return "Unknown date";
         return new Intl.DateTimeFormat(undefined, {
@@ -1126,6 +1138,11 @@
         if (sessions.length) {
             body += `<div class="panel-head" style="margin:4px 0 8px"><h3 style="font-size:14px">Recent reading sessions</h3><span>${sessions.length}</span></div>`;
             body += `<div class="scroll-list">${sessions.slice(0, 40).map(s => `<div class="finished-row"><div style="min-width:0"><div class="recent-title" style="font-size:13px">${escapeHtml(formatLongDate(new Date((s.startTime || 0) * 1000).toISOString().slice(0, 10)))}</div><div class="books-meta">${s.pagesRead || 0} pages</div></div><div class="books-side"><div class="v">${escapeHtml(formatDurationLong(s.durationSeconds || 0))}</div><div class="s">${escapeHtml(formatRelativeTime(s.endTime || s.startTime || 0))}</div></div></div>`).join("")}</div>`;
+        }
+        const listenSessions = (listening && Array.isArray(listening.sessions)) ? listening.sessions : [];
+        if (listenSessions.length) {
+            body += `<div class="panel-head" style="margin:${sessions.length ? "18px" : "4px"} 0 8px"><h3 style="font-size:14px">Recent listening sessions</h3><span>${listenSessions.length}</span></div>`;
+            body += `<div class="scroll-list">${listenSessions.slice(0, 40).map(s => `<div class="finished-row"><div style="min-width:0"><div class="recent-title" style="font-size:13px">${escapeHtml(formatLongDate(localIsoDate(s.startTime)))}</div><div class="books-meta">${escapeHtml(formatProgressRange(s.startProgress, s.endProgress))}</div></div><div class="books-side"><div class="v">${escapeHtml(formatDurationLong(s.durationSeconds || 0))}</div><div class="s">${escapeHtml(formatRelativeTime(s.endTime || s.startTime || 0))}</div></div></div>`).join("")}</div>`;
         }
         if (!body) body = `<div class="empty-state"><p>No session breakdown available for this book.</p></div>`;
         bookDetailBody.innerHTML = body;
