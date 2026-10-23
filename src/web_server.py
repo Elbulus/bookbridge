@@ -12449,9 +12449,13 @@ def api_stats_yearly_recap():
         return jsonify({"error": "Invalid year"}), 400
 
     try:
+        # Each recap carries that calendar year's heatmap, so the page can show it.
+        first_day, last_day = datetime(year, 1, 1).date(), datetime(year, 12, 31).date()
         reading_recap = database_service.get_koreader_yearly_recap(year, tz_name)
+        reading_heatmap = database_service.get_koreader_heatmap(first_day, last_day, tz_name)
 
         listening_recap = None
+        listening_heatmap = []
         try:
             abs_client = _stats_abs_client()
             if abs_client:
@@ -12464,12 +12468,15 @@ def api_stats_yearly_recap():
             listening_recap = _build_listening_yearly_recap(
                 raw_stats.get("days") or {}, year, len(raw_stats.get("items") or {})
             )
+            listening_heatmap = _heatmap_from_mapping(raw_stats.get("days") or {}, first_day, last_day)
 
         if scope == "reading":
-            return jsonify(reading_recap)
+            return jsonify({**reading_recap, "heatmap": reading_heatmap})
         if scope == "listening":
-            return jsonify(listening_recap or _build_listening_yearly_recap({}, year, 0))
-        return jsonify(_build_combined_yearly_recap(reading_recap, listening_recap))
+            listening = listening_recap or _build_listening_yearly_recap({}, year, 0)
+            return jsonify({**listening, "heatmap": listening_heatmap})
+        combined = _build_combined_yearly_recap(reading_recap, listening_recap)
+        return jsonify({**combined, "heatmap": _merge_heatmap_activity(listening_heatmap, reading_heatmap)})
     except Exception as e:
         logger.warning("Stats API: yearly recap failed for %s/%s: %s", scope, year, e, exc_info=True)
         return jsonify({"error": "Failed to load yearly recap"}), 500

@@ -711,20 +711,37 @@
         return 4;
     }
 
-    function heatmap(dataset) {
+    // Without a year, the 53 weeks ending this week, so the grid keeps rolling past
+    // New Year. With a year, that calendar year.
+    function heatmap(dataset, year = null) {
         const entries = Array.isArray(dataset.heatmap) ? dataset.heatmap : [];
         const readingInteractive = state.activeTab === "reading";
-        // The 53 weeks ending this week, so the grid keeps rolling past New Year.
         const today = new Date();
         today.setHours(0, 0, 0, 0);
-        const thisSunday = new Date(today);
-        thisSunday.setDate(today.getDate() - today.getDay());
-        const firstSunday = new Date(thisSunday);
-        firstSunday.setDate(thisSunday.getDate() - 52 * 7);
-        const lastSaturday = new Date(thisSunday);
-        lastSaturday.setDate(thisSunday.getDate() + 6);
         const monthYear = date => date.toLocaleString(undefined, { month: "short", year: "numeric" });
-        const range = `${monthYear(firstSunday)} to ${monthYear(today)}`;
+        let firstDay, lastDay, firstSunday, lastSaturday, title, range;
+        if (year === null) {
+            const thisSunday = new Date(today);
+            thisSunday.setDate(today.getDate() - today.getDay());
+            firstSunday = new Date(thisSunday);
+            firstSunday.setDate(thisSunday.getDate() - 52 * 7);
+            lastSaturday = new Date(thisSunday);
+            lastSaturday.setDate(thisSunday.getDate() + 6);
+            firstDay = firstSunday;
+            lastDay = today;
+            title = "Last 12 months";
+            range = `${monthYear(firstSunday)} to ${monthYear(today)}`;
+        } else {
+            firstDay = new Date(year, 0, 1);
+            const yearEnd = new Date(year, 11, 31);
+            lastDay = yearEnd < today ? yearEnd : today;
+            firstSunday = new Date(firstDay);
+            firstSunday.setDate(firstDay.getDate() - firstDay.getDay());
+            lastSaturday = new Date(yearEnd);
+            lastSaturday.setDate(yearEnd.getDate() + (6 - yearEnd.getDay()));
+            title = String(year);
+            range = `${monthYear(firstDay)} to ${monthYear(yearEnd)}`;
+        }
         const map = new Map(entries.map(entry => [entry.date, Number(entry.seconds || 0)]));
         const maxSeconds = entries.reduce((max, entry) => Math.max(max, Number(entry.seconds || 0)), 0);
         const weeks = [];
@@ -741,7 +758,7 @@
                 if (current.getTime() === today.getTime()) currentWeek = weeks.length;
                 // Local date: toISOString() would shift it a day east of UTC.
                 const iso = `${current.getFullYear()}-${String(current.getMonth() + 1).padStart(2, "0")}-${String(current.getDate()).padStart(2, "0")}`;
-                const inRange = current <= today;
+                const inRange = current >= firstDay && current <= lastDay;
                 const seconds = inRange ? (map.get(iso) || 0) : 0;
                 cells.push({ iso, inRange, seconds, level: inRange ? heatLevel(seconds, maxSeconds) : 0 });
             }
@@ -753,8 +770,8 @@
         }
 
         return `
-            <section class="panel">
-                <div class="panel-head"><h3>Last 12 months</h3><span>${readingInteractive ? `${range} · Click a day to see books` : range}</span></div>
+            <section class="panel" id="heatmap-panel">
+                <div class="panel-head"><h3>${escapeHtml(title)}</h3><span>${readingInteractive ? `${range} · Click a day to see books` : range}</span></div>
                 <div class="heatmap-shell">
                     <div class="heatmap-main">
                         <div class="heatmap-days"><span>Sun</span><span></span><span>Tue</span><span></span><span>Thu</span><span></span><span>Sat</span></div>
@@ -914,11 +931,21 @@
     async function loadYearlyRecap(year) {
         const panel = document.getElementById("recap-panel");
         if (!panel) return;
+        const tab = state.activeTab;
         try {
-            const response = await fetch(`/api/stats/yearly-recap?year=${year}&scope=${state.activeTab}`, { cache: "no-store" });
+            const response = await fetch(`/api/stats/yearly-recap?year=${year}&scope=${tab}`, { cache: "no-store" });
             const data = await response.json();
             if (!response.ok) throw new Error(data.error || "Failed");
             panel.innerHTML = yearlyRecapInner(data);
+            // The heatmap follows the recap's year, and the current year rolls.
+            const heatmapPanel = document.getElementById("heatmap-panel");
+            if (heatmapPanel && state.activeTab === tab && Array.isArray(data.heatmap)) {
+                const thisYear = year === new Date().getFullYear();
+                heatmapPanel.outerHTML = thisYear
+                    ? heatmap(state.payload?.[tab] || { heatmap: data.heatmap })
+                    : heatmap({ heatmap: data.heatmap }, year);
+                scrollHeatmapToCurrentWeek();
+            }
         } catch (error) {
             console.error(error);
         }
