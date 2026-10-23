@@ -11,6 +11,8 @@ from pathlib import Path
 # Add src to path
 sys.path.append(str(Path(__file__).parent.parent))
 
+from bs4 import BeautifulSoup
+
 from src.utils.smil_extractor import SmilExtractor
 
 class TestSmilExtractorRobustness(unittest.TestCase):
@@ -169,6 +171,13 @@ class TestSmilExtractorRobustness(unittest.TestCase):
                 [(s['start'], s['text']) for s in segments],
                 [(10.0, 'The storm'), (12.0, 'door')],
             )
+
+    def test_own_strings_accepts_a_single_string_type(self):
+        """Verify an element whose string types are one class, as bs4 4.12 gives <rt>, still yields its text."""
+        element = BeautifulSoup('<ruby>漢<rt id="r1">kan</rt></ruby>', 'html.parser').find(id='r1')
+        element.interesting_string_types = type(element.contents[0])
+
+        self.assertEqual(self.extractor._own_strings(element, set()), ['kan'])
 
     def test_xml_parsing_with_prefixes(self):
         """Verify stripped XML is valid and parseable by ElementTree."""

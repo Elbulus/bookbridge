@@ -656,6 +656,9 @@ class SmilExtractor:
     def _own_strings(self, element, nested_ids: set) -> List[str]:
         """Return the element's text pieces, leaving out elements with their own timing."""
         string_types = element.interesting_string_types or element.MAIN_CONTENT_STRING_TYPES
+        # bs4 4.12 gives some elements, such as <rt>, a single class instead of a set.
+        if isinstance(string_types, type):
+            string_types = (string_types,)
         pieces = []
         stack = list(reversed(element.contents))
         while stack:
