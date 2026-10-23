@@ -312,7 +312,7 @@
         },
         listening: {
             title: "Listening activity",
-            subtitle: "Live Audiobookshelf user stats with weekly activity, recent sessions, and yearly listening heatmap.",
+            subtitle: "Live Audiobookshelf user stats with weekly activity, recent sessions, and a listening heatmap of the last 12 months.",
             emptyTitle: "Listening stats are unavailable",
             emptyBody: "Audiobookshelf may be unconfigured, offline, or temporarily unreachable. The rest of BookBridge will continue working normally.",
             cards: [
@@ -712,19 +712,22 @@
     function heatmap(dataset) {
         const entries = Array.isArray(dataset.heatmap) ? dataset.heatmap : [];
         const readingInteractive = state.activeTab === "reading";
-        const year = new Date().getFullYear();
-        const start = new Date(year, 0, 1);
-        const end = new Date(year, 11, 31);
-        const firstSunday = new Date(start);
-        firstSunday.setDate(firstSunday.getDate() - firstSunday.getDay());
-        const lastSaturday = new Date(end);
-        lastSaturday.setDate(lastSaturday.getDate() + (6 - lastSaturday.getDay()));
+        // The 53 weeks ending this week, so the grid keeps rolling past New Year.
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        const thisSunday = new Date(today);
+        thisSunday.setDate(today.getDate() - today.getDay());
+        const firstSunday = new Date(thisSunday);
+        firstSunday.setDate(thisSunday.getDate() - 52 * 7);
+        const lastSaturday = new Date(thisSunday);
+        lastSaturday.setDate(thisSunday.getDate() + 6);
+        const monthYear = date => date.toLocaleString(undefined, { month: "short", year: "numeric" });
+        const range = `${monthYear(firstSunday)} to ${monthYear(today)}`;
         const map = new Map(entries.map(entry => [entry.date, Number(entry.seconds || 0)]));
         const maxSeconds = entries.reduce((max, entry) => Math.max(max, Number(entry.seconds || 0)), 0);
         const weeks = [];
         const labels = [];
         const cursor = new Date(firstSunday);
-        const todayKey = new Date().toDateString();
         let currentWeek = -1;
 
         while (cursor <= lastSaturday) {
@@ -733,11 +736,12 @@
             for (let day = 0; day < 7; day += 1) {
                 const current = new Date(weekStart);
                 current.setDate(weekStart.getDate() + day);
-                if (current.toDateString() === todayKey) currentWeek = weeks.length;
-                const iso = current.toISOString().slice(0, 10);
-                const inYear = current.getFullYear() === year;
-                const seconds = inYear ? (map.get(iso) || 0) : 0;
-                cells.push({ iso, inYear, seconds, level: inYear ? heatLevel(seconds, maxSeconds) : 0 });
+                if (current.getTime() === today.getTime()) currentWeek = weeks.length;
+                // Local date: toISOString() would shift it a day east of UTC.
+                const iso = `${current.getFullYear()}-${String(current.getMonth() + 1).padStart(2, "0")}-${String(current.getDate()).padStart(2, "0")}`;
+                const inRange = current <= today;
+                const seconds = inRange ? (map.get(iso) || 0) : 0;
+                cells.push({ iso, inRange, seconds, level: inRange ? heatLevel(seconds, maxSeconds) : 0 });
             }
             if (weekStart.getDate() <= 7) {
                 labels.push({ label: weekStart.toLocaleString(undefined, { month: "short" }), index: weeks.length });
@@ -748,7 +752,7 @@
 
         return `
             <section class="panel">
-                <div class="panel-head"><h3>Yearly heatmap</h3><span>${readingInteractive ? `${year} · Click a day to see books` : year}</span></div>
+                <div class="panel-head"><h3>Last 12 months</h3><span>${readingInteractive ? `${range} · Click a day to see books` : range}</span></div>
                 <div class="heatmap-shell">
                     <div class="heatmap-main">
                         <div class="heatmap-days"><span>Sun</span><span></span><span>Tue</span><span></span><span>Thu</span><span></span><span>Sat</span></div>
@@ -756,7 +760,7 @@
                             <div class="heatmap-canvas">
                                 <div class="heatmap-month-track">${labels.map(label => `<span class="heatmap-month-label" style="left:${label.index * 16}px">${escapeHtml(label.label)}</span>`).join("")}</div>
                                 <div class="heatmap-grid">
-                                    ${weeks.map((week, index) => `<div class="heatmap-week"${index === currentWeek ? " data-current-week" : ""}>${week.map(cell => `<button type="button" class="heatmap-cell ${cell.level ? `level-${cell.level}` : ""} ${readingInteractive && cell.inYear ? "is-clickable" : ""}" ${readingInteractive && cell.inYear ? `data-reading-date="${cell.iso}"` : ""} title="${cell.inYear ? `${cell.iso}: ${formatDurationLong(cell.seconds)}` : ""}" ${readingInteractive && cell.inYear ? `aria-label="Show reading books for ${cell.iso}"` : 'tabindex="-1" aria-hidden="true"'}></button>`).join("")}</div>`).join("")}
+                                    ${weeks.map((week, index) => `<div class="heatmap-week"${index === currentWeek ? " data-current-week" : ""}>${week.map(cell => `<button type="button" class="heatmap-cell ${cell.level ? `level-${cell.level}` : ""} ${readingInteractive && cell.inRange ? "is-clickable" : ""}" ${readingInteractive && cell.inRange ? `data-reading-date="${cell.iso}"` : ""} title="${cell.inRange ? `${cell.iso}: ${formatDurationLong(cell.seconds)}` : ""}" ${readingInteractive && cell.inRange ? `aria-label="Show reading books for ${cell.iso}"` : 'tabindex="-1" aria-hidden="true"'}></button>`).join("")}</div>`).join("")}
                                 </div>
                             </div>
                         </div>
@@ -767,8 +771,7 @@
         `;
     }
 
-    // Narrow screens can't fit the year, so end the visible range on this week
-    // rather than January; later weeks are empty until they happen.
+    // When the panel can't fit 53 weeks, open on this week, the last column.
     function scrollHeatmapToCurrentWeek() {
         const scroller = dashboardRoot.querySelector(".heatmap-scroll");
         const week = scroller?.querySelector("[data-current-week]");
