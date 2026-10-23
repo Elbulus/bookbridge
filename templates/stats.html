@@ -35,7 +35,7 @@
     .dashboard-shell, .recent-list, .heatmap-shell { display: grid; gap: 18px; }
     .dashboard-header, .panel { padding: 22px 24px; }
     .dashboard-header h2 { font-size: 30px; margin-bottom: 8px; }
-    .dashboard-note, .panel-head span, .summary-card-sub, .recent-time, .heatmap-days, .heatmap-legend, .heatmap-months { color: var(--muted-soft); font-size: 12px; }
+    .dashboard-note, .panel-head span, .summary-card-sub, .recent-time, .heatmap-days, .heatmap-legend, .heatmap-month-track { color: var(--muted-soft); font-size: 12px; }
     .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px,1fr)); gap: 16px; }
     .stat-card { padding: 20px 22px; background: linear-gradient(135deg, rgba(255,255,255,.08), transparent 55%), var(--panel); }
     .stat-card-label { color: var(--muted); font-size: 13px; text-transform: uppercase; letter-spacing: .08em; font-weight: 700; margin-bottom: 10px; }
@@ -61,13 +61,15 @@
     .recent-meta { color: var(--muted); font-size: 13px; line-height: 1.45; }
     .recent-side { text-align: right; flex-shrink: 0; }
     .recent-duration { font-size: 15px; font-weight: 700; margin-bottom: 4px; }
-    .heatmap-months, .heatmap-main { display: grid; gap: 10px; }
-    .heatmap-months { grid-template-columns: 38px 1fr; font-weight: 600; }
-    .heatmap-month-track { position: relative; min-height: 14px; overflow: hidden; }
+    .heatmap-main { display: grid; gap: 10px; grid-template-columns: 28px minmax(0,1fr); align-items: start; }
+    /* Month labels share the grid's scroll container so they move with the weeks when swiped. */
+    .heatmap-scroll { overflow-x: auto; padding-bottom: 4px; }
+    .heatmap-canvas { display: grid; gap: 18px; width: max-content; }
+    .heatmap-month-track { position: relative; min-height: 14px; overflow: hidden; font-weight: 600; }
     .heatmap-month-label { position: absolute; top: 0; transform: translateX(-4px); white-space: nowrap; }
-    .heatmap-main { grid-template-columns: 28px minmax(0,1fr); align-items: start; }
     .heatmap-days, .heatmap-week { display: grid; gap: 4px; }
-    .heatmap-grid { display: flex; gap: 4px; overflow-x: auto; padding-bottom: 4px; }
+    .heatmap-days { padding-top: 32px; } /* month track (14px) + canvas gap (18px) */
+    .heatmap-grid { display: flex; gap: 4px; }
     .heatmap-cell { width: 12px; height: 12px; border-radius: 4px; background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.05); }
     button.heatmap-cell { padding: 0; appearance: none; cursor: default; }
     .heatmap-cell.level-1 { background: rgba(102,126,234,.28); }
@@ -745,11 +747,15 @@
             <section class="panel">
                 <div class="panel-head"><h3>Yearly heatmap</h3><span>${readingInteractive ? `${year} · Click a day to see books` : year}</span></div>
                 <div class="heatmap-shell">
-                    <div class="heatmap-months"><div></div><div class="heatmap-month-track">${labels.map(label => `<span class="heatmap-month-label" style="left:${label.index * 16}px">${escapeHtml(label.label)}</span>`).join("")}</div></div>
                     <div class="heatmap-main">
                         <div class="heatmap-days"><span>Sun</span><span></span><span>Tue</span><span></span><span>Thu</span><span></span><span>Sat</span></div>
-                        <div class="heatmap-grid">
-                            ${weeks.map(week => `<div class="heatmap-week">${week.map(cell => `<button type="button" class="heatmap-cell ${cell.level ? `level-${cell.level}` : ""} ${readingInteractive && cell.inYear ? "is-clickable" : ""}" ${readingInteractive && cell.inYear ? `data-reading-date="${cell.iso}"` : ""} title="${cell.inYear ? `${cell.iso}: ${formatDurationLong(cell.seconds)}` : ""}" ${readingInteractive && cell.inYear ? `aria-label="Show reading books for ${cell.iso}"` : 'tabindex="-1" aria-hidden="true"'}></button>`).join("")}</div>`).join("")}
+                        <div class="heatmap-scroll">
+                            <div class="heatmap-canvas">
+                                <div class="heatmap-month-track">${labels.map(label => `<span class="heatmap-month-label" style="left:${label.index * 16}px">${escapeHtml(label.label)}</span>`).join("")}</div>
+                                <div class="heatmap-grid">
+                                    ${weeks.map(week => `<div class="heatmap-week">${week.map(cell => `<button type="button" class="heatmap-cell ${cell.level ? `level-${cell.level}` : ""} ${readingInteractive && cell.inYear ? "is-clickable" : ""}" ${readingInteractive && cell.inYear ? `data-reading-date="${cell.iso}"` : ""} title="${cell.inYear ? `${cell.iso}: ${formatDurationLong(cell.seconds)}` : ""}" ${readingInteractive && cell.inYear ? `aria-label="Show reading books for ${cell.iso}"` : 'tabindex="-1" aria-hidden="true"'}></button>`).join("")}</div>`).join("")}
+                                </div>
+                            </div>
                         </div>
                     </div>
                     <div class="heatmap-legend"><span>Less</span><span class="legend-swatches"><span class="heatmap-cell"></span><span class="heatmap-cell level-1"></span><span class="heatmap-cell level-2"></span><span class="heatmap-cell level-3"></span><span class="heatmap-cell level-4"></span></span><span>More</span></div>
