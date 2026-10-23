@@ -232,10 +232,9 @@ class TestSmilExtractorRobustness(unittest.TestCase):
         self.assertEqual(offsets([320.0, 80.0, 40.0], chapters), by_chapter)
         # With no chapters to fall back on, nothing is placed.
         self.assertEqual(offsets([320.0, 80.0, 40.0], None), {})
-        # Recorded lengths that run past the audiobook give way to the chapters.
-        self.assertEqual(offsets([120.0, 80.0, 40.0], chapters[:2] + [{'start': 200.0, 'end': 230.0}],
-                                 clip_ends=[119.9, 79.9, 29.9]),
-                         by_chapter | {'00000-00003.m4a': 200.0})
+        # Chapters that leave a gap between them aren't one file each.
+        gapped = [{'start': 0.0, 'end': 120.0}, {'start': 125.0, 'end': 205.0}, {'start': 205.0, 'end': 245.0}]
+        self.assertEqual(offsets(None, gapped), {})
         # Counts that match while the boundaries don't: the second file's clips run past its chapter.
         misaligned = [{'start': 0.0, 'end': 150.0}, {'start': 150.0, 'end': 210.0}, {'start': 210.0, 'end': 240.0}]
         self.assertEqual(offsets(None, misaligned), {})
@@ -243,6 +242,30 @@ class TestSmilExtractorRobustness(unittest.TestCase):
         self.assertEqual(offsets(None, chapters, clip_ends=[119.9, 15.0, 39.9]), {})
         # A file with no clips at all can't contradict its chapter.
         self.assertEqual(offsets(None, chapters, clip_ends=[119.9, None, 39.9]), by_chapter)
+
+    def test_recorded_lengths_must_end_with_the_audiobook(self):
+        """Verify recorded lengths are used only when they add up to the audiobook's length."""
+        two_chapters = [{'start': 0.0, 'end': 200.0}, {'start': 200.0, 'end': 240.0}]
+        one_per_file = [{'start': 0.0, 'end': 120.0}, {'start': 120.0, 'end': 200.0}, {'start': 200.0, 'end': 240.0}]
+
+        def offsets(lengths, chapters, clip_ends=(119.9, 79.9, 39.9)):
+            return self.extractor._audio_file_offsets(
+                self._numbered_audio_epub(lengths, list(clip_ends)), ['OEBPS/ch1.smil'], chapters)
+
+        # A file with no clips, such as the credits, recorded 10 s short would start every later file early.
+        self.assertEqual(offsets([120.0, 70.0, 40.0], two_chapters, clip_ends=(119.9, None, 39.9)), {})
+        # Each re-encoded file runs a little long; that adds up and is allowed.
+        self.assertEqual(offsets([120.2, 80.2, 40.2], two_chapters),
+                         {'00000-00001.m4a': 0.0, '00000-00002.m4a': 120.2, '00000-00003.m4a': 200.4})
+        # Running 5 s long over three files is more than that.
+        self.assertEqual(offsets([121.7, 81.7, 41.6], two_chapters), {})
+        # When the files are one per chapter, the chapter starts are used: they're on the audiobook's own clock.
+        by_chapter = {'00000-00001.m4a': 0.0, '00000-00002.m4a': 120.0, '00000-00003.m4a': 200.0}
+        self.assertEqual(offsets([120.2, 80.2, 40.2], one_per_file), by_chapter)
+        # The last chapter ends at the audiobook's recorded length, which can fall short of the audio in the
+        # last file; clips past it can't move any other file. A middle file running that far over still fails.
+        self.assertEqual(offsets(None, one_per_file, clip_ends=(119.9, 79.9, 42.6)), by_chapter)
+        self.assertEqual(offsets(None, one_per_file, clip_ends=(119.9, 82.6, 39.9)), {})
 
     def test_xml_parsing_with_prefixes(self):
         """Verify stripped XML is valid and parseable by ElementTree."""

@@ -21,6 +21,11 @@ AUDIO_DURATIONS_ENTRY = "META-INF/bookbridge-audio-durations.json"
 # than UNTIMED_TAIL_SECONDS before that length and no more than OVERRUN_SECONDS past it.
 UNTIMED_TAIL_SECONDS = 60.0
 OVERRUN_SECONDS = 2.0
+# Each audio file a read-along builder re-encodes comes out a little longer than the
+# part of the audiobook it holds: 0 to 0.22 s per file in the books measured, 10 s
+# over A Naked Singularity's 45 files. Recorded lengths may add up to that much past
+# the audiobook's end, but never fall short of it.
+PADDING_PER_FILE_SECONDS = 0.25
 
 class SmilExtractor:
     """
@@ -177,13 +182,14 @@ class SmilExtractor:
         """
         Map each audio file to its start in the audiobook.
         
-        Clip times count from the start of their own audio file. When the archive
-        records every file's length, each file starts where the files before it end.
-        Otherwise a read-along made by splitting the audiobook at its chapters has
-        one numbered file per chapter. Files the aligner gave no clips still take up
-        their place, so they're counted from the archive too. Either placement is
-        used only when every file's clips fit the length it gives that file. Returns
-        an empty dict when neither does.
+        Clip times count from the start of their own audio file. A read-along made by
+        splitting the audiobook at its chapters has one numbered file per chapter, and
+        each file starts at its chapter, on the audiobook's own clock. Otherwise, when
+        the archive records every file's length, each file starts where the files
+        before it end. Files the aligner gave no clips still take up their place, so
+        they're counted from the archive too. Either placement is used only when every
+        file's clips fit the length it gives that file. Returns an empty dict when
+        neither does.
         """
         names, folders, suffixes = set(), set(), set()
         clip_ends: Dict[str, float] = {}
@@ -212,6 +218,12 @@ class SmilExtractor:
         audiobook_end = float(abs_chapters[-1].get('end', 0)) if abs_chapters else None
 
         placements = []
+        if abs_chapters and len(audio_files) == len(abs_chapters):
+            starts = [float(chapter.get('start', 0)) for chapter in abs_chapters]
+            ends = [float(chapter.get('end', 0)) for chapter in abs_chapters]
+            if all(abs(end - start) <= 1.0 for end, start in zip(ends, starts[1:])):
+                placements.append(("one file per chapter", dict(zip(audio_files, starts)),
+                                   {name: end - start for name, start, end in zip(audio_files, starts, ends)}))
         recorded = self._recorded_audio_lengths(zf)
         if all(name in recorded for name in audio_files):
             offsets, start = {}, 0.0
@@ -219,11 +231,6 @@ class SmilExtractor:
                 offsets[name] = start
                 start += recorded[name]
             placements.append(("recorded lengths", offsets, {name: recorded[name] for name in audio_files}))
-        if abs_chapters and len(audio_files) == len(abs_chapters):
-            offsets = {name: float(chapter.get('start', 0)) for name, chapter in zip(audio_files, abs_chapters)}
-            lengths = {name: float(chapter.get('end', 0)) - float(chapter.get('start', 0))
-                       for name, chapter in zip(audio_files, abs_chapters)}
-            placements.append(("one file per chapter", offsets, lengths))
 
         for method, offsets, lengths in placements:
             problems = self._placement_problems(audio_files, offsets, lengths, clip_ends, audiobook_end)
@@ -246,18 +253,26 @@ class SmilExtractor:
         nothing times, as a wrong pairing of files and chapters does.
         """
         problems = []
+        padding = OVERRUN_SECONDS + PADDING_PER_FILE_SECONDS * len(audio_files)
+        last = audio_files[-1]
         for name in audio_files:
             if name not in clip_ends:
                 continue
             spare = lengths[name] - clip_ends[name]
-            if spare < -OVERRUN_SECONDS:
+            # The last length can end at the audiobook's recorded length, which can fall
+            # short of the decoded audio; clips past it can't move another file.
+            if spare < -(padding if name == last else OVERRUN_SECONDS):
                 problems.append(f"{name} has clips {-spare:.0f}s past its {lengths[name]:.0f}s")
             elif spare > UNTIMED_TAIL_SECONDS:
                 problems.append(f"{name} ends {spare:.0f}s before its {lengths[name]:.0f}s")
-        last = audio_files[-1]
-        if audiobook_end and offsets[last] + lengths[last] > audiobook_end + OVERRUN_SECONDS:
-            problems.append(f"the files run {offsets[last] + lengths[last] - audiobook_end:.0f}s "
-                            f"past the {audiobook_end:.0f}s audiobook")
+        # Files with no clips can't be checked one by one, but a wrong length for one
+        # of them still moves the files' end away from the audiobook's.
+        if audiobook_end:
+            past_end = offsets[last] + lengths[last] - audiobook_end
+            if past_end < -OVERRUN_SECONDS:
+                problems.append(f"the files end {-past_end:.0f}s before the {audiobook_end:.0f}s audiobook")
+            elif past_end > padding:
+                problems.append(f"the files run {past_end:.0f}s past the {audiobook_end:.0f}s audiobook")
         return problems
 
     def _recorded_audio_lengths(self, zf: zipfile.ZipFile) -> Dict[str, float]:
