@@ -11926,7 +11926,8 @@ def _abs_finished_books(progress, items, tz):
         finished.append({
             "bookKey": f"abs:{item_id}", "absId": item_id,
             "title": title or "Unknown book", "author": author or None,
-            "finishedAt": int(finished_dt.timestamp()), "month": finished_dt.month,
+            "finishedAt": int(finished_dt.timestamp()),
+            "finishedDate": finished_dt.date().isoformat(), "month": finished_dt.month,
         })
     finished.sort(key=lambda book: book["finishedAt"], reverse=True)
     return finished

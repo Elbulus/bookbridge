@@ -919,7 +919,7 @@
         // The current year stays reachable even before it has any activity.
         const maxYear = Math.max(years.length ? years[years.length - 1] : recap.year, serverToday().getFullYear());
         const finished = (recap.finishedBooks || []).slice(0, 40).map(b =>
-            `<div class="finished-row"><div class="recent-title" style="font-size:14px;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml(b.title || "Unknown book")}</div><div class="s" style="color:var(--muted-soft);font-size:12px;flex-shrink:0">${escapeHtml(formatLongDate(new Date((b.finishedAt || 0) * 1000).toISOString().slice(0, 10)))}</div></div>`
+            `<div class="finished-row"><div class="recent-title" style="font-size:14px;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml(b.title || "Unknown book")}</div><div class="s" style="color:var(--muted-soft);font-size:12px;flex-shrink:0">${escapeHtml(formatLongDate(b.finishedDate))}</div></div>`
         ).join("");
         const finishedBlock = finished
             ? `<div style="margin-top:16px"><div class="panel-head" style="margin-bottom:8px"><h3 style="font-size:14px">Finished this year</h3><span>${recap.booksFinished || 0} books</span></div><div class="scroll-list">${finished}</div></div>`

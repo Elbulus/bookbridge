@@ -5951,7 +5951,8 @@ class DatabaseService:
                 finished_books.append({
                     "bookKey": book_key, "absId": ctx["absId"],
                     "title": ctx["title"], "author": ctx["author"],
-                    "finishedAt": int(last_end), "month": finished_dt.month,
+                    "finishedAt": int(last_end),
+                    "finishedDate": finished_dt.date().isoformat(), "month": finished_dt.month,
                 })
                 months[finished_dt.month - 1]["finished"] += 1
             finished_books.sort(key=lambda item: item["finishedAt"], reverse=True)

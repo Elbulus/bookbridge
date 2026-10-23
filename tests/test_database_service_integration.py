@@ -838,6 +838,8 @@ class TestDatabaseServiceIntegration(unittest.TestCase):
         finished_keys = {b['bookKey'] for b in recap['finishedBooks']}
         self.assertEqual(recap['booksFinished'], 1)
         self.assertIn('koreader:md5-fin', finished_keys)   # 300/300 = 100% complete
+        finished = next(b for b in recap['finishedBooks'] if b['bookKey'] == 'koreader:md5-fin')
+        self.assertEqual(finished['finishedDate'], (base - timedelta(minutes=10)).date().isoformat())
         self.assertNotIn('abs:abs-a', finished_keys)       # 100/200 = 50%, not finished
 
     def test_koreader_heatmap_range_runs_across_new_year(self):

@@ -25,8 +25,20 @@ def test_finished_books_come_from_abs_progress_with_titles():
 
     assert books == [{
         "bookKey": "abs:book-a", "absId": "book-a", "title": "Dark Matter", "author": "Blake Crouch",
-        "finishedAt": _ms(2026, 8, 20) // 1000, "month": 8,
+        "finishedAt": _ms(2026, 8, 20) // 1000, "finishedDate": "2026-08-20", "month": 8,
     }]
+
+
+def test_finish_date_is_the_calendar_day_in_the_server_time_zone():
+    # 9:55 PM in Denver is already the next day in UTC.
+    evening = int(datetime(2026, 9, 16, 21, 55, tzinfo=DENVER).timestamp() * 1000)
+    progress = {"book-a": {"libraryItemId": "book-a", "isFinished": True, "finishedAt": evening}}
+
+    items = {"book-a": {"mediaMetadata": {"title": "White Noise"}}}
+
+    (book,) = _abs_finished_books(progress, items, DENVER)
+
+    assert book["finishedDate"] == "2026-09-16"
 
 
 def test_listening_recap_counts_books_finished_that_year():
