@@ -724,6 +724,8 @@
         const weeks = [];
         const labels = [];
         const cursor = new Date(firstSunday);
+        const todayKey = new Date().toDateString();
+        let currentWeek = -1;
 
         while (cursor <= lastSaturday) {
             const weekStart = new Date(cursor);
@@ -731,6 +733,7 @@
             for (let day = 0; day < 7; day += 1) {
                 const current = new Date(weekStart);
                 current.setDate(weekStart.getDate() + day);
+                if (current.toDateString() === todayKey) currentWeek = weeks.length;
                 const iso = current.toISOString().slice(0, 10);
                 const inYear = current.getFullYear() === year;
                 const seconds = inYear ? (map.get(iso) || 0) : 0;
@@ -753,7 +756,7 @@
                             <div class="heatmap-canvas">
                                 <div class="heatmap-month-track">${labels.map(label => `<span class="heatmap-month-label" style="left:${label.index * 16}px">${escapeHtml(label.label)}</span>`).join("")}</div>
                                 <div class="heatmap-grid">
-                                    ${weeks.map(week => `<div class="heatmap-week">${week.map(cell => `<button type="button" class="heatmap-cell ${cell.level ? `level-${cell.level}` : ""} ${readingInteractive && cell.inYear ? "is-clickable" : ""}" ${readingInteractive && cell.inYear ? `data-reading-date="${cell.iso}"` : ""} title="${cell.inYear ? `${cell.iso}: ${formatDurationLong(cell.seconds)}` : ""}" ${readingInteractive && cell.inYear ? `aria-label="Show reading books for ${cell.iso}"` : 'tabindex="-1" aria-hidden="true"'}></button>`).join("")}</div>`).join("")}
+                                    ${weeks.map((week, index) => `<div class="heatmap-week"${index === currentWeek ? " data-current-week" : ""}>${week.map(cell => `<button type="button" class="heatmap-cell ${cell.level ? `level-${cell.level}` : ""} ${readingInteractive && cell.inYear ? "is-clickable" : ""}" ${readingInteractive && cell.inYear ? `data-reading-date="${cell.iso}"` : ""} title="${cell.inYear ? `${cell.iso}: ${formatDurationLong(cell.seconds)}` : ""}" ${readingInteractive && cell.inYear ? `aria-label="Show reading books for ${cell.iso}"` : 'tabindex="-1" aria-hidden="true"'}></button>`).join("")}</div>`).join("")}
                                 </div>
                             </div>
                         </div>
@@ -762,6 +765,16 @@
                 </div>
             </section>
         `;
+    }
+
+    // Narrow screens can't fit the year, so end the visible range on this week
+    // rather than January; later weeks are empty until they happen.
+    function scrollHeatmapToCurrentWeek() {
+        const scroller = dashboardRoot.querySelector(".heatmap-scroll");
+        const week = scroller?.querySelector("[data-current-week]");
+        if (!week) return;
+        const weekRight = week.getBoundingClientRect().right - scroller.getBoundingClientRect().left + scroller.scrollLeft;
+        scroller.scrollLeft = weekRight - scroller.clientWidth;
     }
 
     function renderChart(dataset) {
@@ -938,6 +951,7 @@
             </section>
         `;
         renderChart(dataset);
+        scrollHeatmapToCurrentWeek();
         if (state.activeTab === "reading") {
             const container = dashboardRoot.querySelector(".insights-grid:last-child .panel:last-child");
             loadReadingCalendarMonth(state.readingCalendarMonth)
