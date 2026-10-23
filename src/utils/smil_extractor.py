@@ -94,7 +94,11 @@ class SmilExtractor:
                 logger.info(f"📖 Found {len(smil_files)} SMIL files in EPUB")
                 if abs_chapters:
                     logger.info(f"📖 Audio source has {len(abs_chapters)} chapters")
-                
+
+                # Another overlay file can time a span nested in this file's spans, so
+                # every file's ids must be known before any text is read.
+                self._register_all_overlay_ids(zf, smil_files)
+
                 # Detect timestamp mode
                 timestamp_mode = self._detect_timestamp_mode(zf, smil_files)
                 logger.info(f"⚙️ Detected timestamp mode: {timestamp_mode}")
@@ -672,6 +676,17 @@ class SmilExtractor:
             file_path, fragment_id = text_src.split('#', 1)
             full_path = self._resolve_path(smil_dir, file_path)
             self._overlay_ids.setdefault(full_path, set()).add(fragment_id)
+
+    def _register_all_overlay_ids(self, zf: zipfile.ZipFile, smil_files: List[str]) -> None:
+        """Record the timed element ids from every overlay file."""
+        for smil_path in smil_files:
+            try:
+                root = ET.fromstring(self._strip_namespaces(zf.read(smil_path).decode('utf-8')))
+            except (KeyError, UnicodeDecodeError, ET.ParseError, DefusedXmlException):
+                continue
+            smil_dir = str(Path(smil_path).parent)
+            if smil_dir == '.': smil_dir = ''
+            self._register_overlay_ids(root, smil_dir)
 
 
 def extract_transcript_from_epub(epub_path: str, abs_chapters: List[Dict] = None, 
