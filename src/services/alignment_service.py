@@ -347,6 +347,12 @@ class AlignmentService:
         return AlignmentService._env_true("CTC_ENABLED", "false")
 
     @staticmethod
+    def smil_skip_ctc_enabled() -> bool:
+        """Whether a read-along's own timings replace CTC when they check out (read per call).
+        Uses `env_truthy` so the settings checkbox's "on" spelling is honored."""
+        return env_truthy("SMIL_SKIP_CTC", "false")
+
+    @staticmethod
     def segmented_maps_enabled() -> bool:
         """Whether per-chapter segment placement (issue #426 phase 2) replaces the
         global monotonic LIS filter for books whose narration order differs from

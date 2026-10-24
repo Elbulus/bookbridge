@@ -3722,10 +3722,11 @@ class SyncManager:
                     logger.info(f"Storyteller manifest unavailable for '{abs_id}', falling back to SMIL/Whisper")
 
             # A read-along EPUB (Storyteller, storyalign) already carries SMIL timings for
-            # this text. When they have no slips they are the map, so neither CTC pass
-            # runs; CTC would spend hours of CPU deriving the same timings.
+            # this text. With SMIL_SKIP_CTC on, timings with no slips are the map, so
+            # neither CTC pass runs; CTC would spend hours of CPU deriving the same timings.
+            smil_first = AlignmentService.smil_skip_ctc_enabled()
             smil_trusted = False
-            if not direct_aligned and hasattr(self.transcriber, 'transcribe_from_smil'):
+            if smil_first and not direct_aligned and hasattr(self.transcriber, 'transcribe_from_smil'):
                 raw_transcript = self.transcriber.transcribe_from_smil(
                     abs_id, epub_path, chapters,
                     full_book_text=book_text,
@@ -3762,6 +3763,16 @@ class SyncManager:
                     raise
                 except Exception as ctc_err:
                     logger.warning(f"CTC alignment failed for '{abs_id}': {ctc_err}", exc_info=True)
+
+            # Attempt SMIL extraction
+            if not smil_first and not direct_aligned and hasattr(self.transcriber, 'transcribe_from_smil'):
+                  raw_transcript = self.transcriber.transcribe_from_smil(
+                      abs_id, epub_path, chapters,
+                      full_book_text=book_text,
+                       progress_callback=lambda p: update_progress(p, 2)
+                  )
+                  if raw_transcript:
+                      transcript_source = "smil"
 
             # Step 3: Fallback to Whisper (Slow Path) - Only runs if SMIL failed
             if not direct_aligned and not raw_transcript:
