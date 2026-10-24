@@ -13,7 +13,7 @@ import threading
 import time
 import unicodedata
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 from contextlib import contextmanager
@@ -5389,7 +5389,7 @@ class DatabaseService:
             dates = self._get_koreader_activity_dates(session, md5s, tz_name)
             return [day.isoformat() for day in sorted(dates)]
 
-    def get_koreader_heatmap(self, start_date, end_date, tz_name: str) -> list[dict]:
+    def get_koreader_heatmap(self, start_date: date, end_date: date, tz_name: str) -> list[dict]:
         """Get KOReader daily totals for each date from start_date through end_date."""
         with self.get_session() as session:
             md5s = self._get_all_koreader_active_md5s(session)
