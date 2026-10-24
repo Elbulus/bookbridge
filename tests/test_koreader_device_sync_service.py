@@ -718,7 +718,7 @@ class TestKOReaderDeviceSyncService(unittest.TestCase):
         self.service.build_manifest()
 
         self.assertEqual(
-            self.db.get_kosync_document("name-kavita_187.epub").linked_abs_id, "abs-1"
+            self.db.get_kosync_document("name-Dragon's Justice.epub").linked_abs_id, "abs-1"
         )
         self.assertIsNone(self.db.get_kosync_document("content-kavita_187"))
 
@@ -738,7 +738,7 @@ class TestKOReaderDeviceSyncService(unittest.TestCase):
 
         self.assertEqual(summary["linked"], 1)
         self.assertEqual(
-            self.db.get_kosync_document("name-kavita_187.epub").linked_abs_id, "abs-1"
+            self.db.get_kosync_document("name-Dragon's Justice.epub").linked_abs_id, "abs-1"
         )
         self.assertIsNone(self.db.get_kosync_document("content-kavita_187"))
 

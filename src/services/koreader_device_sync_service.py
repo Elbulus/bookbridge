@@ -92,12 +92,11 @@ class KOReaderDeviceSyncService:
         items = []
 
         for book in books:
-            resolved = self._resolve_download_artifact(book)
-            if not resolved:
-                continue
-
             filename = filename_map.get(str(book.abs_id))
             if not filename:
+                continue
+            resolved = self._resolve_download_artifact(book, device_filename=filename)
+            if not resolved:
                 continue
 
             items.append({
@@ -132,11 +131,10 @@ class KOReaderDeviceSyncService:
         if not book or getattr(book, "status", None) != "active":
             return None
 
-        resolved = self._resolve_download_artifact(book)
+        filename = self._resolve_manifest_filename(book)
+        resolved = self._resolve_download_artifact(book, device_filename=filename)
         if not resolved:
             return None
-
-        filename = self._resolve_manifest_filename(book)
         mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
         return {
             "path": resolved["path"],
@@ -235,7 +233,8 @@ class KOReaderDeviceSyncService:
         return content_hash
 
     def _resolve_download_artifact(self, book, link_hashes: bool = True,
-                                   allow_revalidation: bool = False) -> Optional[dict]:
+                                   allow_revalidation: bool = False,
+                                   device_filename: Optional[str] = None) -> Optional[dict]:
         source_filename = self._select_source_filename(book)
         if not source_filename:
             return None
@@ -259,7 +258,7 @@ class KOReaderDeviceSyncService:
             )
             return None
 
-        kosync_hash = self._kosync_hash_for_path(source_path, content_hash)
+        kosync_hash = self._kosync_hash_for(book, content_hash, device_filename)
         stored_hash = self._select_content_hash(book)
         abs_id = str(getattr(book, "abs_id", "") or "").strip()
 
@@ -293,24 +292,16 @@ class KOReaderDeviceSyncService:
             "linked": linked,
         }
 
-    def _kosync_hash_for_path(self, source_path: Path, content_hash: str) -> Optional[str]:
-        """The hash a device reports for this file over KoSync.
+    def _kosync_hash_for(self, book, content_hash: str, device_filename: Optional[str] = None) -> Optional[str]:
+        """The hash a device reports for this book over KoSync.
 
-        In filename mode that's the filename's hash, not the content hash the
-        manifest carries, and it's the one progress lookups have to find.
+        In filename mode KOReader hashes the name of the file on the device, which
+        BridgeSync saves under the manifest filename, not the library's.
         """
         if getattr(self.ebook_parser, "hash_method", None) != "filename":
             return content_hash
-        try:
-            return str(self.ebook_parser.get_kosync_id(source_path) or "").strip() or None
-        except Exception as e:
-            logger.warning(
-                "KOReader device-sync could not compute the KoSync hash for '%s': %s",
-                sanitize_log_data(source_path.name),
-                e,
-                exc_info=True,
-            )
-            return None
+        filename = device_filename or self._resolve_manifest_filename(book)
+        return str(self.ebook_parser.get_kosync_id(Path(filename)) or "").strip() or None
 
     def _link_sibling_hash(self, abs_id: str, doc_hash: str) -> bool:
         """Ensure ``doc_hash`` exists as a KosyncDocument linked to ``abs_id`` (best effort).
@@ -342,8 +333,10 @@ class KOReaderDeviceSyncService:
         """
         summary = {"checked": 0, "linked": 0, "skipped": 0, "errors": 0, "conflicts": 0}
         claimed_by: Dict[str, str] = {}
+        books = self._get_active_books()
+        filename_map = self._build_manifest_filename_map(books)
 
-        for book in self._get_active_books():
+        for book in books:
             summary["checked"] += 1
             label = sanitize_log_data(getattr(book, "abs_title", None) or getattr(book, "abs_id", None))
             try:
@@ -352,7 +345,8 @@ class KOReaderDeviceSyncService:
                 # path allowed to re-download an expired copy: it runs in the
                 # background, never inside a device request.
                 resolved = self._resolve_download_artifact(
-                    book, link_hashes=False, allow_revalidation=True
+                    book, link_hashes=False, allow_revalidation=True,
+                    device_filename=filename_map.get(str(getattr(book, "abs_id", ""))),
                 )
             except Exception as e:
                 summary["errors"] += 1
