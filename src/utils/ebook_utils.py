@@ -338,6 +338,38 @@ class EbookParser:
                 ids.add(norm)
         return ids
 
+    def get_book_authors(self, filepath) -> list[str]:
+        """Return every dc:creator of an EPUB in package order, or [] if unreadable.
+
+        Reads only the container and the package document, not the whole book,
+        because filename matching calls this for every library book.
+        """
+        import xml.etree.ElementTree as ElementTree
+
+        path = Path(filepath)
+        if not path.is_absolute():
+            try:
+                path = self.resolve_book_path(str(path))
+            except FileNotFoundError:
+                return []
+        try:
+            with zipfile.ZipFile(path) as archive:
+                container = ElementTree.fromstring(archive.read("META-INF/container.xml"))
+                rootfile = next(
+                    (el for el in container.iter() if el.tag.rsplit("}", 1)[-1] == "rootfile"), None
+                )
+                if rootfile is None or not rootfile.get("full-path"):
+                    return []
+                package = ElementTree.fromstring(archive.read(rootfile.get("full-path")))
+        except Exception as e:
+            logger.debug(f"Could not read authors for '{path}': {e}")
+            return []
+        return [
+            el.text.strip()
+            for el in package.iter()
+            if el.tag.rsplit("}", 1)[-1] == "creator" and el.text and el.text.strip()
+        ]
+
     @staticmethod
     def _normalize_identifier(raw) -> str:
         """Normalize an EPUB identifier for cross-file comparison.
