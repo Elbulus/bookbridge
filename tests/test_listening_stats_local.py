@@ -137,6 +137,18 @@ def test_book_listening_detail_sessions_carry_progress_and_limit(database):
     }
 
 
+def test_book_listening_detail_progress_is_the_newest_known_position(database):
+    assert _as_user(1, database.get_book_listening_detail, "b1")["progressPercent"] is None
+    begin = _epoch("2026-07-04T09:00:00")
+    with database.get_session() as session:
+        session.add(ReadingSession(abs_id="b1", session_type="AUDIOBOOK", start_time=begin,
+                                   end_time=begin + 60, duration_seconds=60, user_id=1,
+                                   start_progress=0.25, end_progress=0.3046))
+        session.add(ReadingSession(abs_id="b1", session_type="AUDIOBOOK", start_time=begin + 120,
+                                   end_time=begin + 180, duration_seconds=60, user_id=1))
+    assert _as_user(1, database.get_book_listening_detail, "b1")["progressPercent"] == 30.5
+
+
 def test_listening_book_list_counts_and_averages_only_audiobook_sessions(database, monkeypatch):
     monkeypatch.setattr(web_server, "database_service", database)
     books = {b["absId"]: b for b in _as_user(1, web_server._build_listening_book_list)}

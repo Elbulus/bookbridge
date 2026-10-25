@@ -6424,10 +6424,12 @@ class DatabaseService:
             if not rows:
                 return None
             total_seconds = sum(int(rs.duration_seconds or 0) for rs in rows)
+            latest_progress = next((rs.end_progress for rs in rows if rs.end_progress is not None), None)
             return {
                 "totalSeconds": total_seconds,
                 "sessionCount": len(rows),
                 "avgSessionSeconds": total_seconds // len(rows),
+                "progressPercent": round(min(latest_progress, 1.0) * 100, 1) if latest_progress is not None else None,
                 "lastReadAt": int(rows[0].end_time),
                 "bookTitle": rows[0].book_title,
                 "sessions": [{
