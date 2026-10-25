@@ -124,6 +124,7 @@ _KOREADER_STATS_MAX_PAGE_STATS = 10000
 _KOREADER_STATS_MERGE_LIMIT = 10000
 _KOREADER_STATUS_MAX_BOOKS = 5000
 _KOREADER_STATUS_MERGE_LIMIT = 5000
+_DEVICE_HASH_PAIRS_MAX = 2000
 # KOReader's own vocabulary for sidecar summary.status. An unknown value is
 # rejected rather than stored: these strings are written straight back into a
 # device's sidecar, and a typo there is a status the reader can never clear.
@@ -2583,6 +2584,78 @@ def koreader_merged_book_status():
         return jsonify({"error": "Failed to fetch merged status"}), 500
 
     return jsonify({"enabled": True, "books": winners}), 200
+
+
+def _link_device_hash_pair(content_hash, filename_hash, user_id) -> str:
+    """Link a reader's own copy's content hash to the book its filename hash names.
+
+    In filename mode KOSync identifies a copy by its filename hash, but KOReader's
+    statistics, statuses and highlights use its content hash, and a copy added
+    outside Bridge Sync has bytes the bridge never served. Returns the counter
+    this pair falls under: linked, unchanged, unresolved, conflicts or invalid.
+    """
+    if not (isinstance(content_hash, str) and isinstance(filename_hash, str)
+            and _is_valid_hex_hash(content_hash) and _is_valid_hex_hash(filename_hash)):
+        return "invalid"
+    content_hash, filename_hash = content_hash.lower(), filename_hash.lower()
+
+    doc = _database_service.get_kosync_document(filename_hash)
+    book = None
+    if doc and doc.linked_abs_id:
+        book = _database_service.get_book(doc.linked_abs_id)
+    if not book:
+        book = _database_service.get_book_by_kosync_id(filename_hash)
+    if not book:
+        book = _resolve_book_by_sibling_hash(filename_hash, doc, user_id=user_id, filename_variants=True)
+    if not book or not _kosync_user_may_access_book(book):
+        return "unresolved"
+
+    current = _database_service.get_kosync_document(content_hash)
+    if current and current.linked_abs_id:
+        if current.linked_abs_id == book.abs_id:
+            return "unchanged"
+        # The same bytes already belong to another book; relinking would flip it
+        # back and forth on every sync.
+        logger.warning(
+            "⚠️ Device copy: content hash %s is linked to '%s', not relinking it to '%s'",
+            content_hash, current.linked_abs_id, book.abs_id,
+        )
+        return "conflicts"
+
+    _database_service.ensure_linked_kosync_document(content_hash, book.abs_id)
+    logger.info(f"🔗 Device copy: linked content hash {content_hash} to '{book.abs_title}'")
+    return "linked"
+
+
+@kosync_sync_bp.route('/device-sync/hashes', methods=['POST'])
+@kosync_sync_bp.route('/koreader/device-sync/hashes', methods=['POST'])
+@kosync_auth_required
+def koreader_link_device_hashes():
+    """Link the content hashes of a reader's own copies to their books."""
+    data = request.json
+    if not data or not isinstance(data, dict):
+        return jsonify({"error": "Expected JSON object"}), 400
+    pairs = data.get("pairs")
+    if not isinstance(pairs, list):
+        return jsonify({"error": "Expected 'pairs' array"}), 400
+    if len(pairs) > _DEVICE_HASH_PAIRS_MAX:
+        return jsonify({"error": f"Too many pairs (max {_DEVICE_HASH_PAIRS_MAX})"}), 413
+    if not _database_service:
+        return jsonify({"error": "Database service unavailable"}), 503
+
+    user_id = getattr(g, "kosync_user_id", None)
+    counts = {"linked": 0, "unchanged": 0, "unresolved": 0, "conflicts": 0, "invalid": 0}
+    for pair in pairs:
+        if not isinstance(pair, dict):
+            counts["invalid"] += 1
+            continue
+        try:
+            outcome = _link_device_hash_pair(pair.get("content_hash"), pair.get("filename_hash"), user_id)
+        except Exception as e:
+            logger.warning("Device copy: linking a hash pair failed: %s", e, exc_info=True)
+            outcome = "unresolved"
+        counts[outcome] += 1
+    return jsonify(counts), 200
 
 
 def _annotation_sync_enabled() -> bool:
