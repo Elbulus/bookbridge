@@ -111,6 +111,23 @@ class TestDeviceHashPairs(unittest.TestCase):
         self.assertEqual(response.get_json()['linked'], 1)
         self.assertEqual(self.db.get_kosync_document(COPY_CONTENT_HASH).linked_abs_id, ABS_ID)
 
+    def test_links_through_an_already_linked_filename_hash_document(self):
+        renamed_hash = hashlib.md5(b"renamed on the device.epub").hexdigest()
+        self.db.ensure_linked_kosync_document(renamed_hash, ABS_ID)
+
+        response = self._post([self._pair(filename_hash=renamed_hash)])
+
+        self.assertEqual(response.get_json()['linked'], 1)
+        self.assertEqual(self.db.get_kosync_document(COPY_CONTENT_HASH).linked_abs_id, ABS_ID)
+
+    def test_too_many_pairs_is_rejected(self):
+        pairs = [self._pair()] * (kosync_server._DEVICE_HASH_PAIRS_MAX + 1)
+
+        response = self._post(pairs)
+
+        self.assertEqual(response.status_code, 413)
+        self.assertIsNone(self.db.get_kosync_document(COPY_CONTENT_HASH))
+
     def test_second_upload_is_unchanged(self):
         self._post([self._pair()])
         response = self._post([self._pair()])
