@@ -2963,9 +2963,17 @@ function BridgeSync:_runStatisticsSync(stats_state)
     end
     result.merge_history = merge.merge_history
 
+    -- Both exchanges below need the history sidecars; on a reader each one is a
+    -- file open, so read them once.
+    local ok_hist, history_pairs, history_index = pcall(self._historyHashPairs, self)
+    if not ok_hist then
+        self:logWarn("Reading history hashes failed:", history_pairs)
+        history_pairs, history_index = {}, {}
+    end
+
     -- Before the status exchange, so the bridge has linked the reader's own
     -- copies by the time it returns merged statuses for them.
-    local pair_result = self:_runHashPairSync()
+    local pair_result = self:_runHashPairSync(history_pairs)
     if pair_result.err then
         self:logWarn("Hash pair upload failed:", pair_result.err)
     elseif (pair_result.linked or 0) > 0 then
@@ -2975,7 +2983,7 @@ function BridgeSync:_runStatisticsSync(stats_state)
     -- Reading status rides the same cadence as stats but is a separate exchange:
     -- it comes from the sidecars, not statistics.sqlite, and a failure on either
     -- side must not cost the other its results.
-    local status_result = self:_runBookStatusSync()
+    local status_result = self:_runBookStatusSync(history_index)
     result.status_uploaded = status_result.uploaded or 0
     result.status_applied = status_result.applied or 0
     result.status_deferred = status_result.deferred or 0
@@ -3008,9 +3016,13 @@ end
 -- The managed folder's index plus the reader's own copies from history. Only
 -- for reading and writing sidecar statuses: _runSync must keep using
 -- _buildHashIndex, because it moves any file it finds there into the folder.
-function BridgeSync:_buildLibraryHashIndex()
+-- `history_index` is _historyHashPairs()'s index, read here when not given.
+function BridgeSync:_buildLibraryHashIndex(history_index)
     local index = self:_buildHashIndex()
-    local _, history_index = self:_historyHashPairs()
+    if not history_index then
+        local _
+        _, history_index = self:_historyHashPairs()
+    end
     for content_hash, path in pairs(history_index) do
         if not index[content_hash] then
             index[content_hash] = path
@@ -3021,10 +3033,11 @@ end
 
 -- Report the reader's own copies so the bridge links their content hashes to the
 -- books their filename hashes name. A failure is returned, never raised.
-function BridgeSync:_runHashPairSync()
+-- `found` is _historyHashPairs()'s pairs, read here when not given.
+function BridgeSync:_runHashPairSync(found)
     local result = { linked = 0, unresolved = 0, err = nil }
     local ok_run, run_err = pcall(function()
-        local found = self:_historyHashPairs()
+        found = found or self:_historyHashPairs()
         if #found == 0 then
             return
         end
@@ -3052,7 +3065,8 @@ end
 -- Every book the bridge knows comes back, not just ones this device reported:
 -- the point of the feature is a book delivered here but never opened, which by
 -- definition has nothing to report and still needs its status.
-function BridgeSync:_runBookStatusSync()
+-- `history_index` is passed on to _buildLibraryHashIndex.
+function BridgeSync:_runBookStatusSync(history_index)
     local result = {
         uploaded = 0, applied = 0, unchanged = 0,
         deferred = 0, errors = 0, err = nil, disabled = false,
@@ -3060,7 +3074,7 @@ function BridgeSync:_runBookStatusSync()
 
     local ok_run, run_err = pcall(function()
         local device, device_id = self:_currentDeviceIdentity()
-        local hash_index = self:_buildLibraryHashIndex()
+        local hash_index = self:_buildLibraryHashIndex(history_index)
         -- `dir` lets collect() also read sidecars whose book file is gone. Mirror
         -- deletion removes the ebook and leaves the .sdr, and on a real device
         -- those are most of the statused sidecars -- their status is still worth

@@ -1021,4 +1021,47 @@ do
     assert(index.own == "/docs/Own.epub", "the library index must include the reader's own copies")
 end
 
+-- One stats sync reads the history sidecars once, for both the pair upload and
+-- the status exchange.
+do
+    local BookStatus = require("bridge_book_status")
+    local original_collect = BookStatus.collect
+    local original_apply = BookStatus.apply
+    local history_reads = 0
+    local status_index
+    BookStatus.collect = function(hash_index) status_index = hash_index; return {} end
+    BookStatus.apply = function() return { applied = 0, unchanged = 0, deferred = 0, errors = 0 } end
+    local reader = BridgeSync:new{
+        api = {
+            uploadHashPairs = function() return true, { linked = 0, unresolved = 0 } end,
+            uploadBookStatus = function() return true, { accepted = 0 } end,
+            getMergedBookStatus = function() return true, { books = {} } end,
+        },
+        _currentDeviceIdentity = function() return "reader", "device-1" end,
+        _collectStatisticsPayload = function() return { page_stats = {}, books = {}, device_key = "reader" } end,
+        _mergeForeignStatistics = function() return {} end,
+        _buildHashIndex = function() return {} end,
+        _currentDocumentPath = function() return nil end,
+        _historyHashPairs = function()
+            history_reads = history_reads + 1
+            return { { content_hash = "c1", filename_hash = "f1", filename = "Own.epub" } }, { c1 = "/docs/Own.epub" }
+        end,
+        logInfo = function() end,
+        logWarn = function() end,
+    }
+
+    reader:_runStatisticsSync({})
+    assert(history_reads == 1, "a stats sync must read the history sidecars once, read " .. history_reads)
+    assert(status_index and status_index.c1 == "/docs/Own.epub",
+        "the status exchange must still see the reader's own copies")
+
+    status_index = nil
+    reader._historyHashPairs = function() error("history unreadable") end
+    local result = reader:_runStatisticsSync({})
+    BookStatus.collect = original_collect
+    BookStatus.apply = original_apply
+    assert(status_index and not result.status_error,
+        "an unreadable history must not stop the status exchange")
+end
+
 print("BridgeSync Lua init regression test passed")
