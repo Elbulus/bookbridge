@@ -2,7 +2,7 @@
 
 import hashlib
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -45,12 +45,40 @@ def test_without_authors_is_unchanged():
 
 
 def test_resolves_coauthor_copy_to_the_book(library):
-    with patch.object(kosync_server, "_epub_authors_for", return_value=AUTHORS):
-        book = kosync_server._resolve_book_by_filename_variants(
-            _md5("Boris Strugatsky - Roadside Picnic.epub"), user_id=1,
-        )
+    kosync_server._epub_author_cache[LIBRARY_NAME] = AUTHORS
+
+    book = kosync_server._resolve_book_by_filename_variants(
+        _md5("Boris Strugatsky - Roadside Picnic.epub"), user_id=1,
+    )
 
     assert book is library
+
+
+def test_index_build_reads_no_epub_and_warms_authors_off_request(library, monkeypatch):
+    """A KOSync request must not wait on reading every library EPUB."""
+    container = MagicMock()
+    monkeypatch.setattr(kosync_server, "_container", container)
+    warmed = []
+    monkeypatch.setattr(kosync_server, "_start_author_warm", lambda names: warmed.append(list(names)))
+
+    kosync_server._filename_variant_index(1)
+
+    container.ebook_parser.return_value.get_book_authors.assert_not_called()
+    assert warmed == [[LIBRARY_NAME]]
+
+
+def test_coauthor_copy_resolves_once_the_warm_finishes(library, monkeypatch):
+    container = MagicMock()
+    container.ebook_parser.return_value.get_book_authors.return_value = list(AUTHORS)
+    monkeypatch.setattr(kosync_server, "_container", container)
+    monkeypatch.setattr(kosync_server, "_start_author_warm", kosync_server._warm_epub_authors)
+    copy_hash = _md5("Boris Strugatsky - Roadside Picnic.epub")
+
+    first = kosync_server._resolve_book_by_filename_variants(copy_hash, user_id=1)
+    second = kosync_server._resolve_book_by_filename_variants(copy_hash, user_id=1)
+
+    assert first is None
+    assert second is library
 
 
 def test_unreadable_epub_falls_back(library, monkeypatch):

@@ -3949,9 +3949,15 @@ def _filename_variant_index(user_id) -> tuple[dict, dict]:
         return cached
     exact_map: dict = {}
     reordered_map: dict = {}
+    unread: list = []
     for book in _database_service.get_books_by_status("active", user_id=user_id) or []:
         for filename in (getattr(book, "original_ebook_filename", None), getattr(book, "ebook_filename", None)):
-            exact, reordered = _filename_variant_hashes(filename, _epub_authors_for(filename) if filename else ())
+            # Authors come only from the cache: reading every library EPUB here
+            # would hold up the device request that triggered the build.
+            authors = _epub_author_cache.get(filename, ()) if filename else ()
+            if filename and filename not in _epub_author_cache and " - " in Path(filename).name:
+                unread.append(filename)
+            exact, reordered = _filename_variant_hashes(filename, authors)
             for variant in exact:
                 exact_map.setdefault(variant, {}).setdefault(book.abs_id, filename)
             for variant in reordered - exact:
@@ -3960,6 +3966,8 @@ def _filename_variant_index(user_id) -> tuple[dict, dict]:
     with _variant_index_lock:
         if generation == _variant_index_generation:
             _variant_index[user_id] = built
+    if unread:
+        _start_author_warm(unread)
     return built
 
 
@@ -4036,6 +4044,34 @@ def _epub_authors_for(filename: str) -> tuple:
         authors = ()
     _epub_author_cache[filename] = authors
     return authors
+
+
+_author_warm_lock = threading.Lock()
+_author_warm_running = False
+
+
+def _start_author_warm(filenames) -> None:
+    """Read these files' authors in the background; one warm runs at a time."""
+    global _author_warm_running
+    with _author_warm_lock:
+        if _author_warm_running:
+            return
+        _author_warm_running = True
+    threading.Thread(
+        target=_warm_epub_authors, args=(list(filenames),), name="epub-author-warm", daemon=True,
+    ).start()
+
+
+def _warm_epub_authors(filenames) -> None:
+    """Cache each file's authors, then rebuild the variant index so it uses them."""
+    global _author_warm_running
+    try:
+        for filename in filenames:
+            _epub_authors_for(filename)
+    finally:
+        with _author_warm_lock:
+            _author_warm_running = False
+        _invalidate_filename_variant_index()
 
 
 def _resolve_book_by_epub_identifier(epub_filename: str, doc_id: str = None):
