@@ -24,6 +24,7 @@ local BridgeSweep = require("bridge_sweep")
 local BridgeSyncCoordinator = require("bridge_sync_coordinator")
 local BridgeStatsBatches = require("bridge_stats_batches")
 local BridgeBookStatus = require("bridge_book_status")
+local BridgeHashPairs = require("bridge_hash_pairs")
 local BridgeReadHistory = require("bridge_read_history")
 local BridgeVersion = require("bridge_version")
 local ManifestRules = require("bridge_manifest_rules")
@@ -2962,6 +2963,15 @@ function BridgeSync:_runStatisticsSync(stats_state)
     end
     result.merge_history = merge.merge_history
 
+    -- Before the status exchange, so the bridge has linked the reader's own
+    -- copies by the time it returns merged statuses for them.
+    local pair_result = self:_runHashPairSync()
+    if pair_result.err then
+        self:logWarn("Hash pair upload failed:", pair_result.err)
+    elseif (pair_result.linked or 0) > 0 then
+        self:logInfo("Linked", pair_result.linked, "of the reader's own copies to their books")
+    end
+
     -- Reading status rides the same cadence as stats but is a separate exchange:
     -- it comes from the sidecars, not statistics.sqlite, and a failure on either
     -- side must not cost the other its results.
@@ -2987,6 +2997,56 @@ function BridgeSync:_runStatisticsSync(stats_state)
     return result
 end
 
+-- Content and filename hashes of the books in KOReader's history, and an index
+-- of those copies by content hash.
+function BridgeSync:_historyHashPairs()
+    local ok_hist, ReadHistory = pcall(require, "readhistory")
+    local history = (ok_hist and ReadHistory and ReadHistory.hist) or {}
+    return BridgeHashPairs.collect(history)
+end
+
+-- The managed folder's index plus the reader's own copies from history. Only
+-- for reading and writing sidecar statuses: _runSync must keep using
+-- _buildHashIndex, because it moves any file it finds there into the folder.
+function BridgeSync:_buildLibraryHashIndex()
+    local index = self:_buildHashIndex()
+    local _, history_index = self:_historyHashPairs()
+    for content_hash, path in pairs(history_index) do
+        if not index[content_hash] then
+            index[content_hash] = path
+        end
+    end
+    return index
+end
+
+-- Report the reader's own copies so the bridge links their content hashes to the
+-- books their filename hashes name. A failure is returned, never raised.
+function BridgeSync:_runHashPairSync()
+    local result = { linked = 0, unresolved = 0, err = nil }
+    local ok_run, run_err = pcall(function()
+        local found = self:_historyHashPairs()
+        if #found == 0 then
+            return
+        end
+        local device, device_id = self:_currentDeviceIdentity()
+        local ok, response = self.api:uploadHashPairs({
+            device = device,
+            device_id = device_id,
+            pairs = found,
+        })
+        if not ok then
+            result.err = tostring(response or "hash pair upload failed")
+            return
+        end
+        result.linked = tonumber(response and response.linked) or 0
+        result.unresolved = tonumber(response and response.unresolved) or 0
+    end)
+    if not ok_run and not result.err then
+        result.err = tostring(run_err or "hash pair upload failed")
+    end
+    return result
+end
+
 -- Exchange this device's sidecar reading statuses with the bridge.
 --
 -- Every book the bridge knows comes back, not just ones this device reported:
@@ -3000,7 +3060,7 @@ function BridgeSync:_runBookStatusSync()
 
     local ok_run, run_err = pcall(function()
         local device, device_id = self:_currentDeviceIdentity()
-        local hash_index = self:_buildHashIndex()
+        local hash_index = self:_buildLibraryHashIndex()
         -- `dir` lets collect() also read sidecars whose book file is gone. Mirror
         -- deletion removes the ebook and leaves the .sdr, and on a real device
         -- those are most of the statused sidecars -- their status is still worth
