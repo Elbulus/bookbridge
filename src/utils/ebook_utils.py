@@ -339,10 +339,12 @@ class EbookParser:
         return ids
 
     def get_book_authors(self, filepath) -> list[str]:
-        """Return every dc:creator of an EPUB in package order, or [] if unreadable.
+        """Return the authors among an EPUB's dc:creators in package order, or [] if unreadable.
 
-        Reads only the container and the package document, not the whole book,
-        because filename matching calls this for every library book.
+        A creator whose role (EPUB 2 ``opf:role`` or an EPUB 3 ``refines`` meta) is
+        not ``aut`` is skipped, unless no creator is an author. Reads only the
+        container and the package document, not the whole book, because filename
+        matching calls this for every library book.
         """
         import xml.etree.ElementTree as ElementTree
 
@@ -364,11 +366,21 @@ class EbookParser:
         except Exception as e:
             logger.debug(f"Could not read authors for '{path}': {e}")
             return []
-        return [
-            el.text.strip()
+        refined_roles = {
+            el.get("refines")[1:]: (el.text or "").strip().lower()
             for el in package.iter()
-            if el.tag.rsplit("}", 1)[-1] == "creator" and el.text and el.text.strip()
-        ]
+            if el.tag.rsplit("}", 1)[-1] == "meta" and el.get("property") == "role"
+            and (el.get("refines") or "").startswith("#")
+        }
+        creators = []
+        for el in package.iter():
+            if el.tag.rsplit("}", 1)[-1] != "creator" or not (el.text and el.text.strip()):
+                continue
+            role = refined_roles.get(el.get("id")) or el.get("{http://www.idpf.org/2007/opf}role") or ""
+            creators.append((el.text.strip(), role.strip().lower()))
+        authors = [name for name, role in creators if role in ("", "aut")]
+        # An anthology may credit only its editor; that name beats no name for matching.
+        return authors or [name for name, _role in creators]
 
     @staticmethod
     def _normalize_identifier(raw) -> str:
