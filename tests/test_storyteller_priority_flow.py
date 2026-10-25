@@ -391,8 +391,8 @@ def test_new_book_upgrades_to_ctc_after_transcription(tmp_path, monkeypatch):
     assert book.transcript_source == "ctc"
 
 
-def _run_read_along_job(tmp_path, monkeypatch, slips, skip_ctc_setting):
-    monkeypatch.setenv("CTC_ENABLED", "true")
+def _run_read_along_job(tmp_path, monkeypatch, slips, skip_ctc_setting, ctc_enabled="true"):
+    monkeypatch.setenv("CTC_ENABLED", ctc_enabled)
     if skip_ctc_setting is None:
         monkeypatch.delenv("SMIL_SKIP_CTC", raising=False)
     else:
@@ -442,6 +442,19 @@ def test_read_along_smil_goes_through_ctc_unless_the_setting_is_on(tmp_path, mon
     alignment_service.preview_alignment_map.assert_not_called()
     alignment_service.align_forced_and_store.assert_called()
     assert book.transcript_source == "ctc"
+
+
+def test_read_along_setting_does_nothing_without_ctc(tmp_path, monkeypatch):
+    """With CTC off there is nothing to skip: the read-along's timings are used as before, unchecked."""
+    book, transcriber, alignment_service, checked, _preview, _transcript = _run_read_along_job(
+        tmp_path, monkeypatch, slips=[], skip_ctc_setting="true", ctc_enabled="false")
+
+    assert checked == []
+    alignment_service.preview_alignment_map.assert_not_called()
+    alignment_service.align_forced_and_store.assert_not_called()
+    transcriber.transcribe_from_smil.assert_called_once()
+    alignment_service.align_and_store.assert_called_once()
+    assert book.transcript_source == "smil"
 
 
 def test_read_along_smil_without_slips_skips_ctc(tmp_path, monkeypatch):
