@@ -2163,7 +2163,12 @@ end
 -- for a book added outside Bridge Sync must carry the same hash to be found.
 function BridgeSync:_sessionDocumentHash(file_path)
     local ok, kosync = pcall(function()
-        return LuaSettings:open(DataStorage:getSettingsDir() .. "/kosync.lua"):readSetting("settings")
+        local settings = LuaSettings:open(DataStorage:getSettingsDir() .. "/kosync.lua"):readSetting("settings")
+        -- KOReader kept these in the reader settings until its 20260623 migration (koreader#15591).
+        if type(settings) ~= "table" and G_reader_settings then
+            settings = G_reader_settings:readSetting("kosync")
+        end
+        return settings
     end)
     if ok and type(kosync) == "table" and kosync.checksum_method == KOSYNC_CHECKSUM_FILENAME then
         local file_name = file_path:match("([^/]*)$")

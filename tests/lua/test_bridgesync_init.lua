@@ -743,6 +743,14 @@ do
     assert(session_hash() == "content-hash",
         "without KOReader sync settings a session must keep the content hash")
 
+    -- KOReader kept these settings in the reader settings until its 20260623 migration.
+    G_reader_settings = { readSetting = function(_, key)
+        if key == "kosync" then return { checksum_method = 1 } end
+    end }
+    assert(session_hash() == "David Scott Hay - The Butcher of Nazareth.epub",
+        "an older KOReader's filename checksum setting must be honored too")
+    G_reader_settings = nil
+
     kosync_settings = { checksum_method = 1 }
     managed[reader.ui.document.file] = "abs-1"
     assert(session_hash() == nil and reader.current_session.abs_id == "abs-1",
