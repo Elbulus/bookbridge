@@ -2611,18 +2611,21 @@ def _link_device_hash_pair(content_hash, filename_hash, user_id) -> str:
         return "unresolved"
 
     current = _database_service.get_kosync_document(content_hash)
-    if current and current.linked_abs_id:
-        if current.linked_abs_id == book.abs_id:
-            return "unchanged"
-        # The same bytes already belong to another book; relinking would flip it
-        # back and forth on every sync.
+    if current and current.linked_abs_id == book.abs_id:
+        return "unchanged"
+    owner = _database_service.get_book_by_kosync_id(content_hash)
+    foreign_user = current is not None and current.user_id not in (None, user_id)
+    # The same bytes already belong to another book, or are another user's
+    # unlinked document; relinking would move them on every sync. The adopt
+    # write repeats the book checks atomically and never relinks a linked row.
+    if (current and current.linked_abs_id) or (owner and owner.abs_id != book.abs_id) or foreign_user \
+            or not _database_service.adopt_kosync_document_if_unowned(content_hash, book.abs_id):
         logger.warning(
-            "⚠️ Device copy: content hash %s is linked to '%s', not relinking it to '%s'",
-            content_hash, current.linked_abs_id, book.abs_id,
+            "⚠️ Device copy: content hash %s belongs to another book or user, not linking it to '%s'",
+            content_hash, book.abs_id,
         )
         return "conflicts"
 
-    _database_service.ensure_linked_kosync_document(content_hash, book.abs_id)
     logger.info(f"🔗 Device copy: linked content hash {content_hash} to '{book.abs_title}'")
     return "linked"
 

@@ -134,6 +134,24 @@ class TestDeviceHashPairs(unittest.TestCase):
         self.assertEqual(response.get_json()['conflicts'], 1)
         self.assertEqual(self.db.get_kosync_document(COPY_CONTENT_HASH).linked_abs_id, OTHER_ABS_ID)
 
+    def test_content_hash_that_is_another_books_primary_hash_is_a_conflict(self):
+        self.db.save_book(Book(abs_id=OTHER_ABS_ID, abs_title="Other", kosync_doc_id=COPY_CONTENT_HASH, status="active"))
+
+        response = self._post([self._pair()])
+
+        self.assertEqual(response.get_json()['conflicts'], 1)
+        doc = self.db.get_kosync_document(COPY_CONTENT_HASH)
+        self.assertTrue(doc is None or doc.linked_abs_id is None)
+
+    def test_unlinked_document_of_another_user_is_a_conflict(self):
+        other = self.db.create_user("reader3", "secret3")
+        self.db.save_kosync_document(KosyncDocument(document_hash=COPY_CONTENT_HASH, user_id=other.id))
+
+        response = self._post([self._pair()])
+
+        self.assertEqual(response.get_json()['conflicts'], 1)
+        self.assertIsNone(self.db.get_kosync_document(COPY_CONTENT_HASH).linked_abs_id)
+
     def test_other_users_book_is_not_linked(self):
         other = self.db.create_user("reader2", "secret2")
         with self.db.get_session() as session:
