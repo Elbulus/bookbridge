@@ -125,6 +125,7 @@ _KOREADER_STATS_MERGE_LIMIT = 10000
 _KOREADER_STATUS_MAX_BOOKS = 5000
 _KOREADER_STATUS_MERGE_LIMIT = 5000
 _DEVICE_HASH_PAIRS_MAX = 2000
+_reported_hash_conflicts: set = set()
 # KOReader's own vocabulary for sidecar summary.status. An unknown value is
 # rejected rather than stored: these strings are written straight back into a
 # device's sidecar, and a typo there is a status the reader can never clear.
@@ -2620,7 +2621,11 @@ def _link_device_hash_pair(content_hash, filename_hash, user_id) -> str:
     # write repeats the book checks atomically and never relinks a linked row.
     if (current and current.linked_abs_id) or (owner and owner.abs_id != book.abs_id) or foreign_user \
             or not _database_service.adopt_kosync_document_if_unowned(content_hash, book.abs_id):
-        logger.warning(
+        # A device reports the same pair on every stats sync, so warn only the
+        # first time this process sees the conflict.
+        log = logger.debug if (content_hash, book.abs_id) in _reported_hash_conflicts else logger.warning
+        _reported_hash_conflicts.add((content_hash, book.abs_id))
+        log(
             "⚠️ Device copy: content hash %s belongs to another book or user, not linking it to '%s'",
             content_hash, book.abs_id,
         )

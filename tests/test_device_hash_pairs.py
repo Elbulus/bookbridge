@@ -151,6 +151,19 @@ class TestDeviceHashPairs(unittest.TestCase):
         self.assertEqual(response.get_json()['conflicts'], 1)
         self.assertEqual(self.db.get_kosync_document(COPY_CONTENT_HASH).linked_abs_id, OTHER_ABS_ID)
 
+    def test_a_repeated_conflict_is_warned_about_once(self):
+        content_hash = "d" * 32
+        self.db.save_book(Book(abs_id=OTHER_ABS_ID, abs_title="Other", status="active"))
+        self.db.ensure_linked_kosync_document(content_hash, OTHER_ABS_ID)
+
+        with self.assertLogs(kosync_server.logger, level="WARNING") as captured:
+            self._post([self._pair(content_hash=content_hash)])
+            self._post([self._pair(content_hash=content_hash)])
+            kosync_server.logger.warning("end of test")
+
+        conflict_warnings = [line for line in captured.output if content_hash in line]
+        self.assertEqual(len(conflict_warnings), 1)
+
     def test_content_hash_that_is_another_books_primary_hash_is_a_conflict(self):
         self.db.save_book(Book(abs_id=OTHER_ABS_ID, abs_title="Other", kosync_doc_id=COPY_CONTENT_HASH, status="active"))
 
