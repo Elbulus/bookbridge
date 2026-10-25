@@ -3806,13 +3806,17 @@ def _resolve_book_by_cwa_checksum(doc_id: str):
 _FILENAME_VARIANT_EXTENSIONS = (".kepub.epub", ".epub", ".pdf", ".mobi", ".azw3", ".cbz", ".fb2")
 
 
-def _filename_variant_hashes(filename) -> tuple[set, set]:
+def _filename_variant_hashes(filename, authors: tuple = ()) -> tuple[set, set]:
     """Return ``(exact, reordered)`` KOReader filename-mode hashes for a library filename.
 
     Calibre names the library file "Title - Author" but sends the device copy as
     "Author - Title", so the device hashes a reordering of the same " - " parts.
     Both Unicode forms are hashed because KOReader hashes the basename bytes as
     the device stores them, while the bridge's own filename hash does not normalize.
+
+    The library name carries only the first author, while an OPDS download can be
+    named after another one (KOReader keeps the last <author> of an Atom entry) or
+    after all of them, so ``authors`` adds those names for the same title.
     """
     if not isinstance(filename, str) or not filename.strip():
         return set(), set()
@@ -3823,7 +3827,15 @@ def _filename_variant_hashes(filename) -> tuple[set, set]:
         return set(), set()
     stem, ext = name[:-ext_length], name[-ext_length:]
     parts = stem.split(" - ")
-    reordered = {" - ".join(parts[i:] + parts[:i]) for i in range(1, len(parts))} - {stem}
+    reordered = {" - ".join(parts[i:] + parts[:i]) for i in range(1, len(parts))}
+    for author in authors:
+        suffix = f" - {author}"
+        if stem.endswith(suffix) and len(stem) > len(suffix):
+            title = stem[:-len(suffix)]
+            reordered |= {f"{name} - {title}" for name in authors}
+            reordered.add(f"{', '.join(authors)} - {title}")
+            break
+    reordered -= {stem}
 
     def _hashes(stems):
         return {
@@ -3863,7 +3875,7 @@ def _filename_variant_index(user_id) -> tuple[dict, dict]:
     reordered_map: dict = {}
     for book in _database_service.get_books_by_status("active", user_id=user_id) or []:
         for filename in (getattr(book, "original_ebook_filename", None), getattr(book, "ebook_filename", None)):
-            exact, reordered = _filename_variant_hashes(filename)
+            exact, reordered = _filename_variant_hashes(filename, _epub_authors_for(filename) if filename else ())
             for variant in exact:
                 exact_map.setdefault(variant, {}).setdefault(book.abs_id, filename)
             for variant in reordered - exact:
@@ -3932,6 +3944,22 @@ def _epub_identifiers_for(filename: str) -> set:
         ids = set()
     _epub_identifier_cache[filename] = ids
     return ids
+
+
+_epub_author_cache: dict = {}
+
+
+def _epub_authors_for(filename: str) -> tuple:
+    """Cached read of an ebook's dc:creator names (keyed by filename); () if unreadable."""
+    if filename in _epub_author_cache:
+        return _epub_author_cache[filename]
+    try:
+        authors = tuple(_container.ebook_parser().get_book_authors(filename))
+    except Exception as e:
+        logger.debug(f"KOSync: author read failed for '{filename}': {e}")
+        authors = ()
+    _epub_author_cache[filename] = authors
+    return authors
 
 
 def _resolve_book_by_epub_identifier(epub_filename: str, doc_id: str = None):
