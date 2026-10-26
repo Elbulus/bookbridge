@@ -1,4 +1,5 @@
 import base64
+import json
 import os
 import sys
 import tempfile
@@ -11,6 +12,7 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.api.storyteller_api import StorytellerAPIClient
+from src.utils.smil_extractor import AUDIO_DURATIONS_ENTRY
 from src.sync_clients.sync_client_interface import LocatorResult
 
 
@@ -201,6 +203,57 @@ class TestStorytellerSlimReadaloudEpub(unittest.TestCase):
                 self.assertEqual(z.read("mimetype").decode(), "application/epub+zip")
                 self.assertIn("id1-s1", z.read("MediaOverlays/part0000.smil").decode())
                 self.assertIn("hello", z.read("text/part0000.html").decode())
+
+    def test_strip_audio_records_each_audio_files_length(self):
+        lengths = {".mp3": 4549.62, ".m4a": 4653.31}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = Path(tmpdir) / "full.epub"
+            dst = Path(tmpdir) / "slim.epub"
+            again = Path(tmpdir) / "again.epub"
+            self._make_epub(src)
+
+            with patch("src.api.storyteller_api.probe_duration_seconds",
+                       side_effect=lambda path: lengths[Path(path).suffix]):
+                self.client._strip_audio_from_epub(src, dst)
+            # Stripping a stripped copy keeps the recorded lengths and adds no second entry.
+            self.client._strip_audio_from_epub(dst, again)
+
+            for path in (dst, again):
+                with zipfile.ZipFile(path, "r") as z:
+                    self.assertEqual(z.namelist().count(AUDIO_DURATIONS_ENTRY), 1)
+                    self.assertEqual(json.loads(z.read(AUDIO_DURATIONS_ENTRY)),
+                                     {"audio/part0000.mp3": 4549.62, "audio/part0001.m4a": 4653.31})
+
+    def test_strip_audio_keeps_lengths_the_read_along_already_recorded(self):
+        """A BookBridge read-along records each file's exact length; a padded re-probe
+        (100.2s for a 100s file) would push every later file's clips late."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = Path(tmpdir) / "full.epub"
+            dst = Path(tmpdir) / "slim.epub"
+            self._make_epub(src)
+            with zipfile.ZipFile(src, "a") as z:
+                z.writestr(AUDIO_DURATIONS_ENTRY, json.dumps({"audio/part0000.mp3": 100.0}))
+
+            with patch("src.api.storyteller_api.probe_duration_seconds", return_value=100.2) as probe:
+                self.client._strip_audio_from_epub(src, dst)
+
+            with zipfile.ZipFile(dst, "r") as z:
+                self.assertEqual(json.loads(z.read(AUDIO_DURATIONS_ENTRY)),
+                                 {"audio/part0000.mp3": 100.0, "audio/part0001.m4a": 100.2})
+            self.assertEqual(probe.call_count, 1)
+
+    def test_strip_audio_leaves_out_lengths_it_cannot_probe(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = Path(tmpdir) / "full.epub"
+            dst = Path(tmpdir) / "slim.epub"
+            self._make_epub(src)
+
+            with patch("src.api.storyteller_api.probe_duration_seconds",
+                       side_effect=lambda path: 12.5 if Path(path).suffix == ".mp3" else None):
+                self.client._strip_audio_from_epub(src, dst)
+
+            with zipfile.ZipFile(dst, "r") as z:
+                self.assertEqual(json.loads(z.read(AUDIO_DURATIONS_ENTRY)), {"audio/part0000.mp3": 12.5})
 
     def test_ensure_cached_short_circuits_when_present(self):
         with tempfile.TemporaryDirectory() as tmpdir:

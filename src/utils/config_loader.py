@@ -26,6 +26,7 @@ ALL_SETTINGS = [
     # Optional ABS
     'ABS_COLLECTION_NAME', 'ABS_COLLECTION_RECONCILE', 'ABS_PROGRESS_OFFSET_SECONDS', 'ABS_ONLY_SEARCH_IN_ABS_LIBRARY_ID',
     'ABS_SOCKET_ENABLED', 'ABS_SOCKET_DEBOUNCE_SECONDS',
+    'ABS_READING_CHECKPOINTS',
     
     'REMOTE_AUTH_ENABLED', 'REMOTE_AUTH_HEADER', 'REMOTE_AUTH_TRUSTED_PROXIES',
 
@@ -48,7 +49,7 @@ ALL_SETTINGS = [
     'KOREADER_SYNC_READ_HISTORY',
 
     # Storyteller
-    'STORYTELLER_ENABLED', 'STORYTELLER_API_URL', 'STORYTELLER_USER', 'STORYTELLER_PASSWORD',
+    'STORYTELLER_ENABLED', 'STORYTELLER_API_URL', 'STORYTELLER_USER', 'STORYTELLER_PASSWORD', 'STORYTELLER_AUTO_LINK',
     
     # Grimmory
     'BOOKLORE_ENABLED', 'BOOKLORE_SERVER', 'BOOKLORE_WEB_URL', 'BOOKLORE_USER', 'BOOKLORE_PASSWORD', 'BOOKLORE_SHELF_NAME', 'BOOKLORE_LIBRARY_ID',
@@ -69,7 +70,7 @@ ALL_SETTINGS = [
     'BOOKORBIT_READING_SESSIONS',
     'BOOKORBIT_SHELF_WATCH_ENABLED', 'BOOKORBIT_SHELF_WATCH_NAME',
     'BOOKORBIT_SHELF_WATCH_THRESHOLD', 'BOOKORBIT_SHELF_WATCH_RESCAN_HOURS',
-    'BOOKORBIT_READING_WATCH_ENABLED',
+    'BOOKORBIT_SHELF_WATCH_READALONG', 'BOOKORBIT_READING_WATCH_ENABLED',
     'BOOKORBIT_ANNOTATION_SYNC_MINUTES', 'BOOKORBIT_KOSYNC_OWNER',
     'BOOKORBIT_READALONG_POLICY',
 
@@ -153,6 +154,7 @@ ALL_SETTINGS = [
     'REPROCESS_ON_CLEAR_IF_NO_ALIGNMENT',
     'FUZZY_MATCH_THRESHOLD', 'SUGGESTIONS_ENABLED',
     'SUGGESTIONS_AUTO_MATCH_ENABLED', 'SUGGESTIONS_AUTO_MATCH_THRESHOLD',
+    'SUGGESTIONS_AUTO_MATCH_READALONG',
     'SUGGESTIONS_AUTO_SCAN_MINUTES', 'SUGGESTIONS_FULL_REFRESH_ENABLED', 'SUGGESTIONS_FULL_REFRESH_CRON', 'SUGGESTIONS_FULL_REFRESH_DAY',
     'SUGGESTIONS_FULL_REFRESH_TIME',
     'INSTANT_SYNC_ENABLED', 'KOREADER_SESSION_GAP_MINUTES', 'READING_SESSION_MERGE_MINUTES',
@@ -172,7 +174,7 @@ ALL_SETTINGS = [
     'WHISPER_DEVICE', 'WHISPER_COMPUTE_TYPE',
     'WHISPER_VAD_FILTER', 'WHISPER_LANGUAGE',
     'TRANSCRIPTION_PROVIDER', 'DEEPGRAM_API_KEY', 'DEEPGRAM_MODEL', 'WHISPER_CPP_URL', 'WHISPER_CPP_TIMEOUT', 'WHISPER_CPP_SEND_ORIGINAL', 'WHISPER_CPP_CHUNK_MINUTES',
-    'CTC_ENABLED', 'CTC_MODEL', 'CTC_QUARTZNET_MODEL_PATH', 'CTC_DEVICE',
+    'CTC_ENABLED', 'CTC_MODEL', 'CTC_QUARTZNET_MODEL_PATH', 'CTC_DEVICE', 'SMIL_SKIP_CTC',
     'ALIGNMENT_SEGMENTED_MAPS',
     'CONTENT_MATCH_GUARD', 'CONTENT_MATCH_MIN_OVERLAP',
     'AUDIO_SPLIT_DURATION_MINUTES',
@@ -235,6 +237,9 @@ DEFAULT_CONFIG = {
     # Optional local QuartzNet model.onnx (or its folder); empty downloads it once.
     'CTC_QUARTZNET_MODEL_PATH': '',
     'CTC_DEVICE': 'auto',
+    # Use a read-along's own SMIL timings instead of forced alignment when they span
+    # the audio with no slips. Off: forced alignment runs first, as before.
+    'SMIL_SKIP_CTC': 'false',
     # Per-chapter RANSAC segment placement (issue #426 phase 2), replacing the global
     # monotonic LIS filter only for books whose narration order genuinely differs from
     # spine order. See docs/PLAN_OUT_OF_ORDER_NARRATION.md and
@@ -272,6 +277,7 @@ DEFAULT_CONFIG = {
     'STORYTELLER_RECOVERY_MAX_WAIT_MINUTES': '360',
     'STORYTELLER_RECOVERY_POLL_INTERVAL_MINUTES': '2',
     'ABS_PROGRESS_OFFSET_SECONDS': '0',
+    'ABS_READING_CHECKPOINTS': 'false',
     'EBOOK_CACHE_SIZE': '3',
     'ALIGNMENT_CACHE_SIZE': '3',
     'KOSYNC_HASH_METHOD': 'content',
@@ -323,6 +329,7 @@ DEFAULT_CONFIG = {
     'KOSYNC_HASH_RECONCILE_MINUTES': '360',
     'KOSYNC_BOOKORBIT_DISCOVERY_LIMIT': '40',
     'STORYTELLER_ENABLED': 'false',
+    'STORYTELLER_AUTO_LINK': 'false',
     'BOOKLORE_ENABLED': 'false',
     'BOOKLORE_LIBRARY_ID': '',
     'GRIMMORY_READING_SESSIONS': 'true',
@@ -364,6 +371,7 @@ DEFAULT_CONFIG = {
     'BOOKORBIT_SHELF_WATCH_NAME': 'Up Next',
     'BOOKORBIT_SHELF_WATCH_THRESHOLD': '95',
     'BOOKORBIT_SHELF_WATCH_RESCAN_HOURS': '24',
+    'BOOKORBIT_SHELF_WATCH_READALONG': 'false',
     'BOOKORBIT_READING_WATCH_ENABLED': 'false',
     'BOOKORBIT_ANNOTATION_SYNC_MINUTES': '15',
     'BOOKORBIT_KOSYNC_OWNER': '',
@@ -465,6 +473,7 @@ DEFAULT_CONFIG = {
     'SUGGESTIONS_ENABLED': 'false',
     'SUGGESTIONS_AUTO_MATCH_ENABLED': 'false',
     'SUGGESTIONS_AUTO_MATCH_THRESHOLD': '100',
+    'SUGGESTIONS_AUTO_MATCH_READALONG': 'false',
     'SUGGESTIONS_AUTO_SCAN_MINUTES': '0',
     'SUGGESTIONS_FULL_REFRESH_ENABLED': 'false',
     'SUGGESTIONS_FULL_REFRESH_CRON': '',
@@ -574,22 +583,23 @@ class ConfigLoader:
         """
         try:
             settings = db_service.get_all_settings()
-            count = 0
-            
-            for key, value in settings.items():
+        except Exception as e:
+            logger.error(f"❌ Error loading settings from database: {e}", exc_info=True)
+            return
+
+        count = 0
+        for key, value in settings.items():
+            if key.startswith("STORYTELLER_519_HASHES:"):
+                continue
+            try:
                 # Apply validation or type conversion if needed (mostly string for env vars)
                 val_str = str(value) if value is not None else ""
                 
                 # DB values always win — if the user cleared a field, honor it
                 os.environ[key] = val_str
                 
-                # Mask secrets in logs
-                log_val = "******" if any(s in key for s in ['KEY', 'PASSWORD', 'TOKEN']) else val_str
-                # logger.debug(f"Loaded {key}={log_val}")
                 count += 1
-            
-            logger.info(f"⚙️  Loaded {count} settings from database")
-            
-        except Exception as e:
-            logger.error(f"❌ Error loading settings from database: {e}", exc_info=True)
-            # Do not re-raise, fall back to existing env vars
+            except Exception as e:
+                logger.error("❌ Error loading setting %s from database: %s", key, e, exc_info=True)
+
+        logger.info(f"⚙️  Loaded {count} settings from database")

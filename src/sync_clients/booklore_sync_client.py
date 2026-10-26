@@ -1,4 +1,5 @@
 import os
+import math
 from typing import Optional
 import logging
 
@@ -212,6 +213,15 @@ class BookloreSyncClient(SyncClient):
         if rich is not None:
             if rich.get("href"):
                 current["href"] = rich["href"]
+                if not bl_cfi:
+                    raw_progress = rich.get("content_source_pct")
+                    if raw_progress is not None and not isinstance(raw_progress, bool):
+                        try:
+                            chapter_progress = float(raw_progress)
+                            if math.isfinite(chapter_progress):
+                                current["chapter_progress"] = max(0.0, min(chapter_progress / 100.0, 1.0))
+                        except (TypeError, ValueError, OverflowError):
+                            pass
             if rich.get("page") is not None:
                 current["page"] = rich["page"]
                 current["_previous_page"] = page_from_persisted_state(prev_state)
@@ -246,6 +256,19 @@ class BookloreSyncClient(SyncClient):
         if bl_pct is not None and epub and self.ebook_parser:
             return self.ebook_parser.get_text_at_percentage(epub, bl_pct)
         return None
+
+    def get_exact_locator(self, book: Book, state: ServiceState, epub_file_name: str) -> Optional[LocatorResult]:
+        """Keep the CFI's own position when it refers to epub_file_name itself (#523)."""
+        if self._is_cbz_book(book) or not self.ebook_parser:
+            return None
+        cfi = state.current.get('cfi')
+        epub = self._resolve_epub_filename(book)
+        if not cfi or not epub or epub != epub_file_name:
+            return None
+        index = self.ebook_parser.resolve_cfi_to_index(epub, cfi)
+        if index is None:
+            return None
+        return self._locator_from_index(epub, index)
 
     def update_progress(self, book: Book, request: UpdateProgressRequest) -> SyncResult:
         # Prefer the original filename for updates too.

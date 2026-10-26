@@ -4,6 +4,64 @@ For the full history of changes, please refer to the **[GitHub Releases](https:/
 
 ---
 
+## [7.11.0]
+
+A Job Queue page shows and reorders BookBridge's work, Storyteller-only libraries
+link both EPUB editions to one reading position, and read-alongs can skip forced
+alignment when their own timings check out.
+
+### What's New
+
+- **Job Queue page (#529)** listing waiting, processing and recently finished
+  books; reorder staged Add Book items and books waiting for alignment.
+- **Storyteller EPUB editions share one KoSync position (#519)**, with optional
+  per-reader **Automatically link aligned Storyteller books**.
+- **Use a read-along's own timings when they check out (#553)** instead of running
+  forced alignment. Off by default.
+- **Read-alongs for BookOrbit collection-watch and Suggestions auto-matches
+  (#524)**, plus an **Also generate read-along EPUBs** box in the Suggestions queue.
+- **Optional reading checkpoints in ABS listening history (#530).**
+- **Groundwork for interface translations (#516)**; no translations ship yet.
+- **BridgeSync is listed in KOReader plugin stores (#547)** such as Storefront.
+
+### Fixed
+
+- Readers on the **same EPUB get the leader's exact XPath or CFI (#523)**, and
+  **Show position** uses the service that last led.
+- KOReader reading reaches the audiobook when the **percentages match by
+  coincidence (#531)**.
+- **Read-along imports**: multi-file audio is accepted (#545), sentence starts and
+  long sentences keep their timings (#544, #552), and long chapters load quickly (#543).
+- **Remap keeps transcripts that split hyphenated words or numbers (#527)**;
+  interrupted Whisper runs resume (#540); soft hyphens no longer trip the
+  content-match guard (#526).
+- **Suggestions**: Local Files auto-match by hash (#507), series volumes and
+  editions are told apart (#541), hidden folders are ignored (#539), and BookOrbit
+  ebooks pair by their metadata title (#549).
+- **Stats**: a rolling 12-month heatmap with earlier years (#548), correct
+  yearly finished-audiobook counts (#550), and listening sessions in a book's
+  detail (#555).
+- **Filename hashing works for every book (#554, #557, #558, #559)** with
+  **BridgeSync 0.9.10**: managed downloads, reading sessions, and copies you
+  added yourself all reach the right book. Reading time is kept after a match is
+  removed; stored names with a folder resolve again.
+- **Kobo finishes through Grimmory (#537)** and **Grimmory highlights across inline
+  formatting (#535)** sync correctly; Storyteller-only books keep their title (#519).
+- ABS instant sync connects to **`api.` hostnames**; multi-user rounds **fail
+  closed** when reader lookups fail; the `latest` image no longer shows a
+  permanent update banner.
+- Older **Calibre-Web Automated** books refresh for BridgeSync again; BookOrbit
+  cover pages and Hardcover/StoryGraph matching no longer flood the log.
+
+### Operational Notes
+
+- Back up `/data` before upgrading. **Database migrations run on startup**;
+  self-builds need a rebuild for a new Python dependency. BridgeSync is unchanged.
+- Multi-file read-alongs cached earlier need their cached `storyteller_<id>.epub`
+  deleted and the book remapped to use the new placement check.
+
+---
+
 ## [7.10.0]
 
 Listening stats work without Audiobookshelf, Suggestions can scan on a schedule,

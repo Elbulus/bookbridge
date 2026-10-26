@@ -5,6 +5,7 @@ import html
 import logging
 import json
 import contextvars
+import functools
 import os
 import posixpath
 import queue
@@ -41,22 +42,28 @@ from src.utils.user_config import SERVICE_ENABLE_KEYS
 from src.utils.kosync_url import is_builtin_kosync_url
 
 from src.utils.config_loader import ConfigLoader, KNOWN_SETTING_KEYS, env_truthy
-from src.utils.cache_paths import safe_cache_path, safe_library_path, is_plain_basename
+from src.utils.cache_paths import safe_cache_path, safe_library_path, is_plain_basename, contained_library_file
 from src.utils.ebook_utils import (
     LINKABLE_EBOOK_EXTENSIONS,
     LRUCache,
     is_comic_ebook_filename,
+    is_in_hidden_folder,
     is_linkable_ebook_filename,
 )
 from src.utils.ebook_sources import is_grimmory_source, local_ebook_filename, normalize_ebook_source
+from src.utils.local_ebook_metadata import read_local_ebook_metadata
 from src.utils.logging_utils import memory_log_handler, LOG_PATH
 from src.utils.logging_utils import sanitize_log_data
 from src.utils.logging_utils import get_persistent_condition_logger
 from src.services.diagnostics import setup_diagnostics_logging
 from src.services.aligned_shelf import defer_shelf_add, shelf_add_waits_for_alignment
+from src.services.job_queue_view import build_job_queue_view
 from src.services import whats_new
 from src.api.api_clients import ABS_DISABLED_SENTINEL, is_abs_disabled_value
 from src.api.kosync_server import kosync_sync_bp, kosync_admin_bp, init_kosync_server, signal_manifest_rebuild
+# This import adds the position-preview routes to kosync_admin_bp before
+# setup_dependencies registers the blueprint.
+from src.api import reading_position_preview_routes  # noqa: E402,F401
 from src.api.admin_api import admin_api_bp, init_admin_api
 from src.api.hardcover_routes import hardcover_bp, init_hardcover_routes
 from src.api.storygraph_routes import storygraph_bp, init_storygraph_routes
@@ -118,6 +125,15 @@ SUGGESTIONS_CACHE_LOCK = threading.RLock()
 # unbounded, survives container rebuilds, and is shared across the admin's tabs.
 MATCH_QUEUE_FILE_NAME = "match_queue.json"
 MATCH_QUEUE_LOCK = threading.RLock()
+# Read-only visibility of Add Book batches already handed to background threads.
+# This does not control, persist, or reorder the workers.
+_VISIBLE_BATCH_LOCK = threading.Lock()
+_VISIBLE_BATCHES = {}
+_VISIBLE_BATCH_LABELS = {
+    'batch-forge-match': 'Forge & Match batch',
+    'batch-match-process': 'Match batch',
+    'add-book-forge-only': 'Forge Only batch',
+}
 _READALONG_GENERATION_LOCK = threading.Lock()
 _ACTIVE_READALONG_GENERATIONS = set()
 
@@ -580,6 +596,105 @@ def current_user():
     return user
 
 
+# ---------------- i18n / UI LANGUAGE ----------------
+# The interface language. Resolution order: the user's saved `users.language`
+# (when it names a language we actually have a catalog for), then the request's
+# Accept-Language, then English. Wrapped strings and the catalogs are gettext
+# (Flask-Babel); only user-facing display text is translated — log messages,
+# setting keys and API/JSON field names stay English by design.
+
+# Babel wants `_`-style codes ("ru_RU"); browsers send tags ("ru-RU"). Everything
+# is reduced to the primary subtag, which is all we key catalogs and the column on.
+_BASE_LOCALE = "en"
+
+
+def _normalize_locale(value: Optional[str]) -> Optional[str]:
+    """'ru-RU' / 'ru_RU' / 'ru' -> 'ru'; junk -> None."""
+    if not value:
+        return None
+    primary = str(value).strip().replace("_", "-").split("-")[0].lower()
+    return primary or None
+
+
+def translations_dir() -> str:
+    """Directory holding the per-language catalogs (translations/<lang>/...).
+
+    Resolved from the app root the same way STATIC_DIR/TEMPLATE_DIR are, with an
+    env override so a deployment can point elsewhere. This module runs as
+    /app/src/web_server.py in the image, so the root is /app.
+    """
+    override = os.environ.get("TRANSLATIONS_DIR")
+    if override:
+        return override
+    app_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+    return os.path.join(app_root, "translations")
+
+
+def available_locales() -> tuple:
+    """UI languages that actually have a catalog, plus the English base.
+
+    Derived from the catalogs on disk, not a hardcoded list: a language the user
+    can pick must be a language we can render. Until a `ru` catalog ships, `ru`
+    is simply not offered — the picker never shows a choice that does nothing.
+
+    Cached: the catalogs only change on deploy, and this is called several times
+    per request. Call available_locales.cache_clear() after adding one.
+    """
+    locales = [_BASE_LOCALE]
+    try:
+        from babel import Locale
+
+        directory = translations_dir()
+        if os.path.isdir(directory):
+            for name in sorted(os.listdir(directory)):
+                candidate = _normalize_locale(name)
+                if not candidate or candidate in locales:
+                    continue
+                if os.path.isfile(os.path.join(directory, name, "LC_MESSAGES", "messages.mo")):
+                    try:
+                        Locale.parse(candidate)
+                    except Exception:
+                        continue
+                    locales.append(candidate)
+    except Exception:
+        # Never let catalog discovery break a page render.
+        return (_BASE_LOCALE,)
+    return tuple(locales)
+
+
+available_locales = functools.lru_cache(maxsize=1)(available_locales)
+
+
+def locale_display_name(code: str) -> str:
+    """'ru' -> 'Русский' (the language's name in itself); falls back to the code."""
+    try:
+        from babel import Locale
+
+        return Locale.parse(code).get_display_name(code).capitalize()
+    except Exception:
+        return code
+
+
+def get_locale():
+    """Flask-Babel locale selector (passed to Babel(locale_selector=...))."""
+    try:
+        user = current_user()
+        if user is not None:
+            wanted = _normalize_locale(getattr(user, "language", None))
+            if wanted and wanted in available_locales():
+                return wanted
+    except Exception:
+        pass
+    try:
+        if has_request_context():
+            best = request.accept_languages.best_match(available_locales())
+            if best:
+                return best
+    except Exception:
+        pass
+    return _BASE_LOCALE
+
+
 class _UnavailableClient:
     def is_configured(self):
         return False
@@ -739,6 +854,15 @@ def _enqueue_tracker_automatch(sync_clients, book):
     _TRACKER_AUTOMATCH_QUEUE.put((snapshot, book))
 
 
+def _visible_batch_items(items, token):
+    """Expose which submitted batch item is being handed off to a worker."""
+    for idx, item in enumerate(items):
+        with _VISIBLE_BATCH_LOCK:
+            if token in _VISIBLE_BATCHES:
+                _VISIBLE_BATCHES[token]['current'] = idx
+        yield item
+
+
 def _spawn_user_background(fn, *args, label="background"):
     """Run `fn(*args)` on a daemon thread with the request's user context re-bound.
 
@@ -752,11 +876,37 @@ def _spawn_user_background(fn, *args, label="background"):
     tests observe the side effects right after the request — the request context is
     still active there, so `uc()` resolves normally without the re-bind.
     """
+    batch_token = None
+    if label in _VISIBLE_BATCH_LABELS and args and isinstance(args[0], list) and args[0]:
+        owner = current_user()
+        batch_token = uuid.uuid4().hex
+        # Only retain display metadata, never file paths or service credentials.
+        safe_items = [
+            {key: item.get(key) for key in (
+                'abs_id', 'abs_title', 'audio_title', 'title', 'readalong_epub_requested'
+            )} for item in args[0]
+        ]
+        with _VISIBLE_BATCH_LOCK:
+            _VISIBLE_BATCHES[batch_token] = {
+                'user_id': owner.id if owner else None,
+                'label': _VISIBLE_BATCH_LABELS[label],
+                'items': safe_items,
+                'current': -1,
+            }
+        args = (_visible_batch_items(args[0], batch_token), *args[1:])
+
+    def finish_visible_batch():
+        if batch_token is not None:
+            with _VISIBLE_BATCH_LOCK:
+                _VISIBLE_BATCHES.pop(batch_token, None)
+
     if _BACKGROUND_TASKS_SYNCHRONOUS:
         try:
             fn(*args)
         except Exception as e:
             logger.error("%s failed: %s", label, e, exc_info=True)
+        finally:
+            finish_visible_batch()
         return
 
     bundle = uc()
@@ -765,6 +915,8 @@ def _spawn_user_background(fn, *args, label="background"):
         user_id = user.id if user is not None else None
     except Exception:
         user_id = None
+    if user_id is None:
+        user_id = get_current_user_id()
     creds = get_current_user_credentials()
 
     def runner():
@@ -779,8 +931,13 @@ def _spawn_user_background(fn, *args, label="background"):
             reset_current_user_credentials(tok_creds)
             reset_current_user_id(tok_uid)
             _active_bundle.reset(tok_bundle)
+            finish_visible_batch()
 
-    threading.Thread(target=runner, daemon=True, name=label).start()
+    try:
+        threading.Thread(target=runner, daemon=True, name=label).start()
+    except Exception:
+        finish_visible_batch()
+        raise
 
 
 def _request_wants_json() -> bool:
@@ -1246,7 +1403,32 @@ def account():
         error=error,
         message=message,
         account_user=user,
+        available_languages=[(code, locale_display_name(code)) for code in available_locales()],
+        current_language=_normalize_locale(user.language),
     )
+
+
+def account_language():
+    """Set the signed-in user's UI language, then reload the account page.
+
+    A redirect (rather than re-rendering in place) guarantees the whole page
+    comes back in the new locale on the next request.
+    """
+    user = current_user()
+    if user is None:
+        return redirect(url_for('login'))
+
+    # An empty value is the "Automatic (browser)" choice and clears the setting.
+    # Anything else must be a language we ship; a missing or unknown one is
+    # rejected so a stale form or a hand-crafted POST can't wipe the saved preference.
+    raw = request.form.get('language')
+    if raw is None:
+        return "Missing language", 400
+    language = _normalize_locale(raw)
+    if language is not None and language not in available_locales():
+        return "Unsupported language", 400
+    database_service.set_user_language(user.id, language)
+    return redirect(url_for('account'))
 
 
 def account_integrations():
@@ -2008,6 +2190,7 @@ def sync_daemon():
         schedule.every(1).minutes.do(manager.flush_reading_sessions_for_all_users)
         schedule.every(int(SYNC_PERIOD_MINS)).minutes.do(_reconcile_aligned_shelf)
         schedule.every(1).hours.do(_run_diagnostics_send)
+        schedule.every(1).hours.do(_run_storyteller_library_hourly)
         schedule.every(int(SYNC_PERIOD_MINS)).minutes.do(_reconcile_abs_collection)
 
         logger.info(f"🔄 Sync daemon started (period: {SYNC_PERIOD_MINS} minutes)")
@@ -2109,6 +2292,9 @@ def _reconcile_abs_collection():
 
 def find_ebook_file(filename):
     if not is_plain_basename(filename):
+        path = contained_library_file([EBOOK_DIR], filename)
+        if path:
+            return path
         logger.warning(
             "Refused ebook lookup for a non-basename filename: %s",
             sanitize_log_data(str(filename or "")),
@@ -2831,45 +3017,344 @@ def _preserve_or_reset_mapping_status(
 
 
 def _adopt_kosync_progress_for_book(abs_id: str, kosync_doc_id: str) -> None:
-    """Link an already-known KoSync document hash to a freshly mapped book.
+    """Link a hash KOReader already knows to a freshly mapped book (#431), never re-pointing.
 
-    KOReader stores progress under a document hash before the book is mapped. The
-    resolution path reaches that progress by joining KosyncDocument.linked_abs_id, so
-    an unlinked row stays invisible to sync and the book reads as unstarted even
-    though the position is durable and the hashes match exactly (#431). Add Book
-    already computes the same hash, so adopt it here rather than leaving the reader
-    to link it by hand.
-
-    Adoption is fail-closed: a hash already owned by a *different* book is left
-    alone, matching the sibling-hash step below and `_register_hash_for_book`.
-    `ensure_linked_kosync_document` re-points on conflict by design — hash
-    reconciliation needs that to keep sibling hashes of one book durable (#285) —
-    so the ownership check belongs here, at the one caller that must not steal.
-    Re-pointing would hide the loser's stored progress behind the same join this
-    function exists to repair, moving #431 rather than fixing it. The mapping paths
-    that legitimately consolidate a duplicate (`match`, `absorb_duplicate_mapping`,
-    the ebook-only tri-link) all migrate and delete the loser first, which clears
-    its link, so they reach this with nothing to conflict against.
+    One atomic statement leaves a hash another book owns, by link or as its primary,
+    with that book. The consolidating paths (match, absorb, ebook-only tri-link)
+    delete the loser first, so they reach this with nothing to conflict against.
     """
     if not abs_id or not isinstance(kosync_doc_id, str) or not kosync_doc_id.strip():
         return
     try:
         doc_id = kosync_doc_id.strip()
+        if database_service.adopt_kosync_document_if_unowned(doc_id, abs_id):
+            logger.info(
+                "🔗 Adopted existing KoSync document '%s' for '%s'",
+                sanitize_log_data(kosync_doc_id), sanitize_log_data(abs_id),
+            )
+            return
         existing = database_service.get_kosync_document(doc_id)
         owner = getattr(existing, "linked_abs_id", None) if existing else None
+        if not owner:
+            primary = database_service.get_book_by_kosync_id(doc_id)
+            owner = getattr(primary, "abs_id", None) if primary else None
         if owner and owner != abs_id:
             logger.info(
                 "🔒 KoSync document '%s' already belongs to '%s' — not re-pointing it to '%s'",
                 sanitize_log_data(doc_id), sanitize_log_data(owner), sanitize_log_data(abs_id),
             )
-            return
-        if database_service.ensure_linked_kosync_document(doc_id, abs_id):
-            logger.info(
-                "🔗 Adopted existing KoSync document '%s' for '%s'",
-                sanitize_log_data(kosync_doc_id), sanitize_log_data(abs_id),
-            )
     except Exception as e:
         logger.warning(f"⚠️ Failed to adopt KoSync document for '{abs_id}': {e}", exc_info=True)
+
+
+def _storyteller_register_file_hashes(storyteller_uuid, abs_id):
+    """Register Storyteller OPDS hashes off the match request thread."""
+    from src.services.storyteller_library_watch import register_hashes
+
+    try:
+        book = database_service.get_book(abs_id)
+        if not book or book.storyteller_uuid != storyteller_uuid:
+            logger.info("Storyteller hashes: stale mapping %s; skipping", abs_id)
+            return
+        user_id = get_current_user_id()
+        client = (container.user_client_registry().get_clients(user_id).storyteller_client
+                  if user_id is not None else uc().storyteller_client)
+        register_hashes(
+            database_service, client, book,
+            user_id=user_id,
+        )
+        get_persistent_condition_logger().resolve(
+            logger, f"storyteller-registration:{user_id}:{storyteller_uuid}",
+            "Storyteller hashes: registration recovered for %s", storyteller_uuid)
+    except Exception as exc:
+        get_persistent_condition_logger().warn(
+            logger, f"storyteller-registration:{get_current_user_id()}:{storyteller_uuid}",
+            "Storyteller hashes: registration failed for %s: %s", storyteller_uuid, exc, exc_info=True)
+
+
+def _storyteller_auto_link_candidates(user_id, client, library, books, claimed, deadline=None):
+    """Auto-link aligned books with bounded joins and round-robin attempts."""
+    from unicodedata import normalize
+    from src.services.storyteller_library_watch import _STATE_LOCK, state_key
+
+    enabled = str(user_setting("STORYTELLER_AUTO_LINK", "false") or "").strip().lower()
+    if enabled not in {"true", "on", "1", "yes"} or not library:
+        return 0
+    if deadline is None:
+        deadline = time.monotonic() + 600
+
+    def title_key(text):
+        return re.sub(r"[\W_]+", "", normalize("NFKC", str(text or "")).casefold())
+
+    key = state_key(user_id)
+    try:
+        state = database_service.get_json_setting(key, default={})
+    except Exception:
+        state = {}
+    state = state if isinstance(state, dict) else {}
+    skipped = state.get("_auto_skip", {})
+    skipped = dict(skipped) if isinstance(skipped, dict) else {}
+    skipped_before = dict(skipped)
+    start = int(state.get("_auto_cursor", 0) or 0) % len(library)
+    inspected = linked = joined = 0
+    conditions = get_persistent_condition_logger()
+    now = time.time()
+    for index in range(len(library)):
+        if time.monotonic() >= deadline:
+            logger.info("Storyteller auto-link: user %s reached pass time budget; stopping", user_id)
+            break
+        item = library[(start + index) % len(library)]
+        inspected += 1
+        if not isinstance(item, dict):
+            continue
+        uuid_value = str(item.get("uuid") or item.get("id") or "").strip()
+        readaloud = item.get("readaloud") or {}
+        if not uuid_value or not isinstance(readaloud, dict):
+            continue
+        if str(readaloud.get("status") or "").upper() != "ALIGNED" or readaloud.get("missing"):
+            logger.debug("Storyteller auto-link: %s not aligned; skipping", uuid_value)
+            continue
+        fingerprint = str(readaloud.get("fingerprint") or "")
+        failure_key = f"storyteller-auto-link:{user_id}:{uuid_value}"
+        failed = False
+        try:
+            already = next((book for book in books if book.storyteller_uuid == uuid_value), None)
+            if already:
+                if claimed is not None and already.abs_id not in claimed:
+                    if joined >= 25:
+                        continue
+                    access = _existing_mapping_access(
+                        already, storyteller_uuid=uuid_value,
+                        ebook_filename=already.ebook_filename,
+                        kosync_doc_id=already.kosync_doc_id,
+                    )
+                    if access in {"join", "modify"}:
+                        _claim_book_for_user_id(user_id, already.abs_id)
+                        claimed.add(already.abs_id)
+                        joined += 1
+                        skipped.pop(uuid_value, None)
+                        logger.info("Storyteller auto-link: joined existing %s for user %s",
+                                    uuid_value, user_id)
+                else:
+                    logger.debug("Storyteller auto-link: %s already mapped; skipping", uuid_value)
+                continue
+
+            decline = skipped.get(uuid_value)
+            if (isinstance(decline, dict) and decline.get("fingerprint") == fingerprint
+                    and isinstance(decline.get("ts"), (int, float))
+                    and 0 <= now - decline["ts"] < 7 * 24 * 60 * 60):
+                logger.debug("Storyteller auto-link: %s declined earlier; skipping", uuid_value)
+                continue
+            if "ebook" in item and not item["ebook"]:
+                logger.debug("Storyteller auto-link: %s has no plain EPUB; skipping", uuid_value)
+                continue
+            plain_hash = client.get_kosync_content_hash(uuid_value, "ebook")
+            if not isinstance(plain_hash, str) or not re.fullmatch(r"[0-9a-fA-F]{32}", plain_hash):
+                logger.info("Storyteller auto-link: plain hash unavailable for %s", uuid_value)
+                continue
+            existing = database_service.get_book_by_kosync_id(plain_hash)
+            if not existing:
+                doc = database_service.get_kosync_document(plain_hash)
+                existing = (database_service.get_book(doc.linked_abs_id)
+                            if doc and getattr(doc, "linked_abs_id", None) else None)
+            if existing:
+                access = _existing_mapping_access(
+                    existing, storyteller_uuid=uuid_value,
+                    ebook_filename=existing.ebook_filename,
+                    kosync_doc_id=existing.kosync_doc_id,
+                )
+                if access == "deny":
+                    skipped[uuid_value] = {"fingerprint": fingerprint, "ts": now}
+                    logger.info("Storyteller auto-link: %s belongs to another reader; skipping", uuid_value)
+                    continue
+                if access == "join":
+                    if joined >= 25:
+                        continue
+                    _claim_book_for_user_id(user_id, existing.abs_id)
+                    if claimed is not None:
+                        claimed.add(existing.abs_id)
+                    joined += 1
+                    skipped.pop(uuid_value, None)
+                    logger.info("Storyteller auto-link: joined existing %s for user %s",
+                                uuid_value, user_id)
+                    continue
+                saved, error, _status = _upsert_storyteller_mapping(
+                    mode_hint="existing", existing_book=existing,
+                    abs_id=existing.abs_id, abs_title=existing.abs_title,
+                    storyteller_uuid=uuid_value, preserve_primary_kosync=True,
+                )
+                if error or not saved:
+                    logger.info("Storyteller auto-link: attach failed for %s: %s", uuid_value, error)
+                    continue
+            else:
+                title = str(item.get("title") or "").strip()
+                authors = item.get("authors") or []
+                author_names = ", ".join(
+                    author.get("name", "") if isinstance(author, dict) else str(author)
+                    for author in authors
+                ) if isinstance(authors, list) else str(authors)
+                duplicate = False
+                for book in books:
+                    if title_key(book.abs_title) != title_key(title):
+                        continue
+                    # Older Book mappings have no author field. Fail closed on
+                    # their shared title rather than risk replacing an audio mapping.
+                    mapped_author = (getattr(book, "audio_author", None)
+                                     or getattr(book, "author", None) or "")
+                    if not mapped_author or not author_names or title_key(mapped_author) == title_key(author_names):
+                        duplicate = True
+                        break
+                if duplicate:
+                    skipped[uuid_value] = {"fingerprint": fingerprint, "ts": now}
+                    logger.info("Storyteller auto-link: '%s' title/author collides; use Add Book", title)
+                    continue
+                saved = _create_ebook_only_mapping_from_queue_item({
+                    "storyteller_uuid": uuid_value,
+                    "abs_title": title,
+                })
+                if not saved:
+                    logger.info("Storyteller auto-link: create failed for %s", uuid_value)
+                    continue
+
+            _claim_book_for_user_id(user_id, saved.abs_id)
+            if claimed is not None:
+                claimed.add(saved.abs_id)
+            books.append(saved)
+            skipped.pop(uuid_value, None)
+            linked += 1
+            logger.info("Storyteller auto-link: linked %s to %s for user %s",
+                        uuid_value, saved.abs_id, user_id)
+        except Exception as exc:
+            failed = True
+            conditions.warn(logger, failure_key, "Storyteller auto-link: failed for %s: %s",
+                            uuid_value, exc, exc_info=True)
+        finally:
+            if not failed:
+                conditions.resolve(logger, failure_key, "Storyteller auto-link: recovered for %s", uuid_value)
+    cursor = (start + inspected) % len(library)
+    if skipped != skipped_before or cursor != state.get("_auto_cursor", 0):
+        failure_key = f"storyteller-auto-state:{user_id}"
+        try:
+            with _STATE_LOCK:
+                current = database_service.get_json_setting(key, default={})
+                current = current if isinstance(current, dict) else {}
+                current["_auto_skip"] = skipped
+                current["_auto_cursor"] = cursor
+                database_service.set_json_setting(key, current)
+            conditions.resolve(logger, failure_key, "Storyteller auto-link: declined books saved for user %s", user_id)
+        except Exception as exc:
+            conditions.warn(logger, failure_key, "Storyteller auto-link: could not save declined books: %s",
+                            exc, exc_info=True)
+    return linked
+
+
+_STORYTELLER_PASS_LOCK = threading.Lock()
+_STORYTELLER_PASSES_IN_PROGRESS = set()
+
+
+def _storyteller_user_library_pass(user_id):
+    """Reconcile this reader once at a time; stop starting books after ten minutes."""
+    from src.services.storyteller_library_watch import scan_linked
+
+    with _STORYTELLER_PASS_LOCK:
+        if user_id in _STORYTELLER_PASSES_IN_PROGRESS:
+            logger.info("Storyteller hashes: user %s already scanning; skipping", user_id)
+            return
+        _STORYTELLER_PASSES_IN_PROGRESS.add(user_id)
+    conditions = get_persistent_condition_logger()
+    failure_key = f"storyteller-library-pass:{user_id}"
+    deadline = time.monotonic() + 600
+    try:
+        client = uc().storyteller_client
+        if not client or not client.is_configured():
+            return
+        library = client.list_library_books()
+        if library is None:
+            logger.info("Storyteller auto-link: library unavailable for user %s", user_id)
+            return
+        claimed = (
+            set(database_service.get_linked_abs_ids(user_id) or [])
+            if user_id is not None else None
+        )
+        all_books = list(database_service.get_all_books())
+        _storyteller_auto_link_candidates(user_id, client, library, all_books, claimed, deadline=deadline)
+        books = [
+            book for book in all_books
+            if book.storyteller_uuid and (claimed is None or book.abs_id in claimed)
+        ]
+        # Add Book used to save a Storyteller-only book under the placeholder 'Ebook'.
+        titles = {
+            str(item.get("uuid") or item.get("id")): str(item.get("title") or "").strip()
+            for item in library if isinstance(item, dict)
+        }
+        for book in books:
+            title = titles.get(book.storyteller_uuid)
+            if getattr(book, "abs_title", None) == "Ebook" and title:
+                fields = {"abs_title": title}
+                if getattr(book, "audio_title", None) == "Ebook":
+                    fields["audio_title"] = title
+                if database_service.update_book_fields(book.abs_id, **fields):
+                    book.abs_title = title
+                    logger.info("Storyteller: renamed '%s' from 'Ebook' to its Storyteller title '%s'",
+                                book.abs_id, title)
+        scan_linked(database_service, client, books, user_id, library=library, deadline=deadline)
+        conditions.resolve(logger, failure_key, "Storyteller hashes: pass recovered for user %s", user_id)
+    except Exception as exc:
+        conditions.warn(logger, failure_key, "Storyteller hashes: pass failed for user %s: %s",
+                        user_id, exc, exc_info=True)
+    finally:
+        with _STORYTELLER_PASS_LOCK:
+            _STORYTELLER_PASSES_IN_PROGRESS.discard(user_id)
+
+
+def _run_storyteller_library_hourly():
+    """Dispatch per-user scans via the existing scoped background helper."""
+    from src.utils.user_config import (
+        _ALLOW_GLOBAL_FALLBACK_KEY, PER_USER_CREDENTIAL_KEYS, global_fallback_allowed,
+    )
+
+    try:
+        users = [user for user in database_service.list_users() if getattr(user, "active", 1)]
+    except Exception as exc:
+        get_persistent_condition_logger().warn(
+            logger, "storyteller-library-users", "Storyteller hashes: could not list users: %s", exc, exc_info=True)
+        return
+    get_persistent_condition_logger().resolve(
+        logger, "storyteller-library-users", "Storyteller hashes: user list recovered")
+    for user in users:
+        uid_token = creds_token = bundle_token = None
+        try:
+            # Fail closed: uc() otherwise falls back to global clients when
+            # a reader's registry bundle is unavailable.
+            bundle = container.user_client_registry().get_clients(user.id)
+            client = getattr(bundle, "storyteller_client", None)
+            if not client or not client.is_configured():
+                continue
+            bundle_token = _active_bundle.set(bundle)
+            uid_token = set_current_user_id(user.id)
+            credentials = database_service.get_user_credentials(user.id) or {}
+            credentials = {key: val for key, val in credentials.items()
+                           if key in PER_USER_CREDENTIAL_KEYS}
+            credentials[_ALLOW_GLOBAL_FALLBACK_KEY] = global_fallback_allowed(database_service, user)
+            creds_token = set_current_user_credentials(credentials)
+            _spawn_user_background(
+                _storyteller_user_library_pass, user.id,
+                label=f"storyteller-library-{user.id}",
+            )
+            get_persistent_condition_logger().resolve(
+                logger, f"storyteller-library-schedule:{user.id}",
+                "Storyteller hashes: scheduling recovered for user %s", user.id)
+        except Exception as exc:
+            get_persistent_condition_logger().warn(
+                logger, f"storyteller-library-schedule:{user.id}",
+                "Storyteller hashes: cannot schedule user %s: %s", user.id, exc, exc_info=True)
+        finally:
+            if creds_token is not None:
+                reset_current_user_credentials(creds_token)
+            if uid_token is not None:
+                reset_current_user_id(uid_token)
+            if bundle_token is not None:
+                _active_bundle.reset(bundle_token)
 
 
 def _upsert_storyteller_mapping(
@@ -2883,6 +3368,7 @@ def _upsert_storyteller_mapping(
     ebook_source_id=None,
     existing_book=None,
     duration=None,
+    preserve_primary_kosync=False,
 ):
     """
     Shared Storyteller/ebook mapping upsert for:
@@ -2906,6 +3392,8 @@ def _upsert_storyteller_mapping(
             target_book = database_service.get_book(requested_abs_id)
         if not target_book:
             return None, "Book not found", 404
+        if preserve_primary_kosync and not (target_book.kosync_doc_id and target_book.ebook_filename):
+            return None, "Existing book has no primary KoSync EPUB to preserve", 400
 
     original_ebook_filename = selected_ebook_filename
     if not original_ebook_filename and target_book and target_book.original_ebook_filename:
@@ -2934,7 +3422,10 @@ def _upsert_storyteller_mapping(
         return None, "Please select a text source (Storyteller or Standard Ebook)", 400
 
     kosync_doc_id = None
-    if selected_storyteller_uuid:
+    if preserve_primary_kosync:
+        kosync_doc_id = target_book.kosync_doc_id
+        resolved_ebook_filename = target_book.ebook_filename
+    elif selected_storyteller_uuid:
         log_prefix = "Storyteller link" if mode_hint == "existing" else "Ebook-only Tri-Link"
         kosync_doc_id = _compute_storyteller_trilink_kosync_id(
             original_ebook_filename,
@@ -3171,6 +3662,11 @@ def _upsert_storyteller_mapping(
         database_service.dismiss_suggestion(saved_book.kosync_doc_id)
     _adopt_kosync_progress_for_book(saved_book.abs_id, saved_book.kosync_doc_id)
 
+    if selected_storyteller_uuid:
+        _spawn_user_background(
+            _storyteller_register_file_hashes, selected_storyteller_uuid, saved_book.abs_id,
+            label="storyteller-link-hashes",
+        )
     return saved_book, None, None
 
 
@@ -3473,6 +3969,7 @@ def get_suggestion_audiobooks():
                 "audio_source_id": source_id,
                 "audio_title": title,
                 "audio_subtitle": (item.subtitle or "").strip(),
+                "audio_series": (item.series_label or "").strip(),
                 "audio_author": author,
                 "audio_language": item.language or "",
                 "audio_duration": item.duration,
@@ -3502,19 +3999,22 @@ def _build_local_ebook_title_index():
 
     BookBridge and BookOrbit share the same files, so this lets us pair
     BookOrbit's clean metadata (title/author, no filename) with real filenames
-    without a per-book BookOrbit detail call. Indexes both the full stem and the
-    'Title' portion before ' - ' (filenames are 'Title - Author (year).epub')."""
+    without a per-book BookOrbit detail call. Indexes the full stem, the 'Title'
+    portion before ' - ' ('Title - Author (year).epub'), and the title in the
+    file's own metadata, which BookOrbit's title comes from whatever the naming
+    scheme ('Author - Series 15 - Title.epub', #549)."""
     index = {}
     try:
         if EBOOK_DIR.exists():
             for eb in EBOOK_DIR.rglob('*'):
                 if eb.suffix.lower() not in LINKABLE_EBOOK_EXTENSIONS or not eb.is_file():
                     continue
-                if is_generated_readalong_epub(eb.name):
+                if is_generated_readalong_epub(eb.name) or is_in_hidden_folder(eb, EBOOK_DIR):
                     continue
                 stem = eb.stem
                 title_part = stem.split(" - ", 1)[0]
-                for key in (_ebook_title_key(title_part), _ebook_title_key(stem)):
+                metadata_title = read_local_ebook_metadata(eb)[0]
+                for key in (_ebook_title_key(title_part), _ebook_title_key(stem), _ebook_title_key(metadata_title)):
                     if key:
                         index.setdefault(key, eb.name)
     except Exception as e:
@@ -3727,6 +4227,7 @@ def get_searchable_ebooks(search_term):
                 eb for eb in EBOOK_DIR.rglob('*')
                 if eb.suffix.lower() in LINKABLE_EBOOK_EXTENSIONS and eb.is_file()
                 and not is_generated_readalong_epub(eb.name)
+                and not is_in_hidden_folder(eb, EBOOK_DIR)
             ]
             for eb in all_ebooks:
                 fname_lower = eb.name.lower()
@@ -4572,9 +5073,11 @@ def settings():
             'TELEGRAM_ENABLED',
             'SUGGESTIONS_ENABLED',
             'SUGGESTIONS_AUTO_MATCH_ENABLED',
+            'SUGGESTIONS_AUTO_MATCH_READALONG',
             'SUGGESTIONS_FULL_REFRESH_ENABLED',
             'ABS_ONLY_SEARCH_IN_ABS_LIBRARY_ID',
             'ABS_COLLECTION_RECONCILE',
+            'ABS_READING_CHECKPOINTS',
             'REPROCESS_ON_CLEAR_IF_NO_ALIGNMENT',
             'INSTANT_SYNC_ENABLED',
             'STORYTELLER_POLL_WAIT_FOR_SETTLE',
@@ -4592,6 +5095,7 @@ def settings():
             'BOOKORBIT_ENABLED',
             'BOOKORBIT_READING_SESSIONS',
             'BOOKORBIT_SHELF_WATCH_ENABLED',
+            'BOOKORBIT_SHELF_WATCH_READALONG',
             'BOOKORBIT_READING_WATCH_ENABLED',
             'KAVITA_ENABLED',
             'KAVITA_SHELF_WATCH_ENABLED',
@@ -4611,6 +5115,7 @@ def settings():
             'WHISPER_CPP_SEND_ORIGINAL',
             'WHISPER_VAD_FILTER',
             'CTC_ENABLED',
+            'SMIL_SKIP_CTC',
             'ALIGNMENT_SEGMENTED_MAPS',
             'CONTENT_MATCH_GUARD',
             'SHARE_ALL_BOOKS_WITH_ALL_USERS',
@@ -6358,6 +6863,60 @@ def index():
     )
 
 
+def job_queue_page():
+    """Read-only overview of staged work, in-flight batches and recent jobs."""
+    user = current_user()
+    user_id = user.id if user else None
+    books = database_service.get_all_books(user_id=user_id)
+    books = _dashboard_visible_books_for_user(books, user)
+    with _VISIBLE_BATCH_LOCK:
+        batches = [
+            {**batch, 'items': list(batch['items'])}
+            for batch in _VISIBLE_BATCHES.values()
+            if batch['user_id'] == user_id
+        ]
+    with _READALONG_GENERATION_LOCK:
+        active_readalong = set(_ACTIVE_READALONG_GENERATIONS)
+    jobs = [
+        *database_service.get_latest_jobs(kind=JOB_KIND_ALIGNMENT).values(),
+        *database_service.get_latest_jobs(kind=JOB_KIND_READALONG).values(),
+    ]
+    alignment_queue = database_service.get_pending_alignment_queue()
+    alignment_movable_ids = {
+        book.abs_id for book in books
+        if book.status == 'pending' and user_id is not None and book.user_id == user_id
+    }
+    snapshot = build_job_queue_view(
+        _load_match_queue(), batches, books, jobs, active_readalong,
+        alignment_queue=alignment_queue,
+        alignment_movable_ids=alignment_movable_ids,
+    )
+    return render_template('job_queue.html', queue_view=snapshot)
+
+
+def job_queue_reorder():
+    """Move only an owned, still-pending entry in the chosen queue."""
+    key = request.form.get('queue_key', '')
+    direction = request.form.get('direction', '')
+    queue_kind = request.form.get('queue', 'staged')
+    if not key or direction not in {'up', 'down', 'top'} or queue_kind not in {'staged', 'alignment'}:
+        flash("That move isn't valid.", "warning")
+    elif queue_kind == 'alignment':
+        user = current_user()
+        result = database_service.move_pending_alignment_book(
+            user.id if user is not None else None, key, direction,
+        )
+        if result == 'missing':
+            flash("That book is no longer waiting for alignment.", "warning")
+    else:
+        result = _match_queue_move(key, direction)
+        if result == 'missing':
+            flash("That book is no longer waiting in Add Book.", "warning")
+        elif result == 'ambiguous':
+            flash("That book couldn't be identified; refresh and try again.", "warning")
+    return redirect(url_for('job_queue_page'))
+
+
 def shelfmark():
     """Shelfmark handoff - redirects to the configured SHELFMARK_URL."""
     url = os.environ.get("SHELFMARK_URL")
@@ -6656,6 +7215,8 @@ def forge_search_text():
         if local_books_dir.exists():
             for epub in local_books_dir.rglob("*.epub"):
                 if "(readaloud)" in epub.name.lower() or is_generated_readalong_epub(epub.name):
+                    continue
+                if is_in_hidden_folder(epub, local_books_dir):
                     continue
                 if query_lower in epub.name.lower():
                     key = f"local_{epub.name}"
@@ -7435,7 +7996,8 @@ def _create_audio_only_mapping_from_queue_item(item):
 
 
 def _record_readalong_intent_for_match(abs_id: str) -> None:
-    """Record "Also generate a read-along EPUB" for a Match All (non-forge) book.
+    """Record "Also generate a read-along EPUB" for a non-forge match (Match All,
+    suggestions auto-match).
 
     A book queued for alignment gets it consumed by the background job when its
     alignment completes (``SyncManager._dispatch_readalong_intent``). A re-match
@@ -8236,7 +8798,8 @@ def _queue_item_from_match_form(clients) -> "dict | None":
             bridge_key = f"ebook:{ebook_key}"
             audio_source_id = None
             audio_title = ebook_display_name or (
-                Path(ebook_filename).stem if ebook_filename else 'Ebook'
+                Path(ebook_filename).stem if ebook_filename
+                else _get_storyteller_display_metadata(storyteller_uuid).get('title') or 'Ebook'
             )
             audio_duration = None
             audio_cover_url = None
@@ -8726,6 +9289,8 @@ def _auto_match_suggestions(results: object, user_id: int | None) -> object:
     matches), and if that candidate's score is at or above the configurable threshold,
     links the book automatically via book_mapping_service.create_audio_mapping_from_match.
     Suggestions that are not auto-matched remain in the list for human review.
+    With SUGGESTIONS_AUTO_MATCH_READALONG on, a BookOrbit-audio match also
+    requests a read-along EPUB.
 
     Args:
         results: The scan results object (expected to be a dict with 'suggestions' key).
@@ -8767,6 +9332,56 @@ def _auto_match_suggestions(results: object, user_id: int | None) -> object:
             remaining.append(suggestion)
             continue
         try:
+            # The mapping service hashes by downloading from a library; a Local File
+            # has no library id, so hash the file itself as manual matching does.
+            # Without a hash the service can't link it either.
+            kosync_doc_id = None
+            if top.get('source') == 'Local File':
+                kosync_doc_id = get_kosync_id_for_ebook(
+                    top.get('ebook_filename') or '', source_path=top.get('source_path'),
+                )
+                if not kosync_doc_id:
+                    logger.warning(
+                        f"⚠️ Auto-match could not hash Local File '{top.get('ebook_filename')}' "
+                        f"for '{suggestion.get('abs_title')}'; left for review"
+                    )
+                    remaining.append(suggestion)
+                    continue
+                # Saving a mapping absorbs any other book on the same hash. With
+                # two audiobooks of one ebook, or two files sharing a filename
+                # hash, the second match deletes the first one's mapping.
+                audio_source_id = suggestion.get('audio_source_id') or suggestion.get('abs_id') or ''
+                holder = database_service.get_book_by_kosync_id(kosync_doc_id)
+                if (
+                    holder is not None
+                    and holder.sync_mode != 'ebook_only'
+                    and (holder.audio_source_id or holder.abs_id) != audio_source_id
+                ):
+                    logger.info(
+                        f"Auto-match skipped '{suggestion.get('abs_title')}': Local File "
+                        f"'{top.get('ebook_filename')}' is already linked to another audiobook "
+                        f"('{holder.abs_title}', {holder.abs_id}); left for review"
+                    )
+                    remaining.append(suggestion)
+                    continue
+                # Absorbing moves the holder's readers and progress, so unattended
+                # auto-match only folds in the scanning reader's own mapping.
+                document = database_service.get_kosync_document(kosync_doc_id)
+                document_owner = getattr(document, 'linked_abs_id', None) if document else None
+                other_readers = (
+                    holder is not None and holder.sync_mode == 'ebook_only'
+                    and any(uid != user_id for uid in database_service.get_book_user_ids(holder.abs_id))
+                )
+                if other_readers or document_owner not in (
+                    None, suggestion.get('abs_id'), getattr(holder, 'abs_id', None),
+                ):
+                    logger.info(
+                        f"Auto-match skipped '{suggestion.get('abs_title')}': Local File "
+                        f"'{top.get('ebook_filename')}' belongs to another reader's mapping; "
+                        f"left for review"
+                    )
+                    remaining.append(suggestion)
+                    continue
             saved = mapping_service.create_audio_mapping_from_match(
                 audio_source=suggestion.get('audio_source') or 'ABS',
                 audio_source_id=suggestion.get('audio_source_id') or suggestion.get('abs_id') or '',
@@ -8778,6 +9393,7 @@ def _auto_match_suggestions(results: object, user_id: int | None) -> object:
                 audio_provider_file_id=suggestion.get('audio_provider_file_id'),
                 ebook_source=top.get('source'),
                 ebook_source_id=str(top.get('source_id')) if top.get('source_id') is not None else None,
+                kosync_doc_id=kosync_doc_id,
                 user_id=user_id,
             )
         except Exception as e:
@@ -8793,6 +9409,16 @@ def _auto_match_suggestions(results: object, user_id: int | None) -> object:
             f"🔗 Auto-matched '{suggestion.get('abs_title')}' to "
             f"'{top.get('display_name') or top.get('ebook_filename')}' at {score:.1f}%"
         )
+        if (getattr(saved, 'audio_source', None) == 'BookOrbit'
+                and env_truthy('SUGGESTIONS_AUTO_MATCH_READALONG')):
+            try:
+                _record_readalong_intent_for_match(saved.abs_id)
+                logger.info("📖 Auto-match: read-along requested for '%s'", suggestion.get('abs_title'))
+            except Exception as e:
+                logger.warning(
+                    "Auto-match: could not request a read-along for '%s': %s",
+                    suggestion.get('abs_title'), e, exc_info=True,
+                )
         try:
             _shelve_saved_ebook(saved)
         except Exception as shelf_err:
@@ -9229,6 +9855,44 @@ def _match_queue_add(item: dict) -> bool:
         return True
 
 
+def _match_queue_move(queue_key: str, direction: str) -> str:
+    """Reorder an actor-owned, still-staged item, preserving every other user's order.
+
+    Moving a staged entry changes the durable Add Book queue. It therefore also
+    changes the execution order *if* those items are submitted together later.
+    Nothing already drained into a running batch can be moved here.
+    """
+    user_id, include_legacy = _match_queue_scope()
+    if direction not in {'up', 'down', 'top'}:
+        return 'missing'
+    with MATCH_QUEUE_LOCK:
+        items = _read_match_queue_unlocked()
+        visible_positions = [
+            idx for idx, item in enumerate(items)
+            if _match_queue_item_visible(item, user_id, include_legacy)
+        ]
+        positions = [
+            idx for idx in visible_positions
+            if (items[idx].get('bridge_key') or items[idx].get('abs_id')) == queue_key
+        ]
+        if len(positions) > 1:
+            return 'ambiguous'
+        if not positions:
+            return 'missing'
+        start = visible_positions.index(positions[0])
+        destination = {'up': max(0, start - 1),
+                       'down': min(len(visible_positions) - 1, start + 1),
+                       'top': 0}[direction]
+        if destination == start:
+            return 'unchanged'
+        staged = [items[idx] for idx in visible_positions]
+        staged.insert(destination, staged.pop(start))
+        for idx, item in zip(visible_positions, staged):
+            items[idx] = item
+        _write_match_queue_unlocked(items)
+    return 'moved'
+
+
 def _match_queue_remove(abs_id) -> None:
     user_id, include_legacy = _match_queue_scope()
     with MATCH_QUEUE_LOCK:
@@ -9277,6 +9941,16 @@ def _match_queue_response():
             storyteller_enabled=bool(uc().storyteller_client.is_configured()),
         )
     return redirect(url_for('suggestions'))
+
+
+def _apply_queue_readalong_request(queue_items: list[dict]) -> None:
+    """Mark BookOrbit-audio queue items for a read-along when the Suggestions
+    queue's "Also generate read-along EPUBs" box was ticked at submit time."""
+    if (request.form.get('readalong_epub_requested') or '').strip().lower() not in {'true', '1', 'yes', 'on'}:
+        return
+    for item in queue_items:
+        if item.get('audio_source') == 'BookOrbit':
+            item['readalong_epub_requested'] = True
 
 
 def _queue_item_from_suggestion(suggestion: dict) -> "dict | None":
@@ -9492,12 +10166,14 @@ def suggestions_page():
             # Same forge/match-all path as the Add Book page: Storyteller items just match,
             # ebook-only items run the forge (transcribe + align) pipeline in the background.
             _queue_items = _match_queue_drain()
+            _apply_queue_readalong_request(_queue_items)
             _spawn_user_background(_process_forge_match_queue, _queue_items, label="batch-forge-match")
             flash(f"Forging + matching {len(_queue_items)} book(s) in the background…", "info")
             return redirect(url_for('index'))
 
         elif action == 'process_queue':
             _queue_items = _match_queue_drain()
+            _apply_queue_readalong_request(_queue_items)
             _spawn_user_background(_process_batch_queue, _queue_items, label="batch-match-process")
             flash(f"Processing {len(_queue_items)} book(s) in the background…", "info")
             return redirect(url_for('index'))
@@ -11166,11 +11842,22 @@ def _recent_daily_from_mapping(days_map, tz, days=7):
     ]
 
 
-def _heatmap_from_mapping(days_map, year):
+# The stats page draws the 53 weeks ending this week. One extra day covers a
+# browser whose date is behind the server's.
+_HEATMAP_DAYS = 371
+
+
+def _heatmap_window(today):
+    """First and last date the stats heatmap can show."""
+    return today - timedelta(days=_HEATMAP_DAYS), today
+
+
+def _heatmap_from_mapping(days_map, start_date, end_date):
     days_map = days_map if isinstance(days_map, dict) else {}
+    first, last = start_date.isoformat(), end_date.isoformat()
     heatmap = []
     for key, value in days_map.items():
-        if str(key).startswith(f"{year}-"):
+        if first <= str(key)[:10] <= last:
             heatmap.append({
                 "date": str(key),
                 "seconds": int(round(float(value or 0))),
@@ -11222,14 +11909,63 @@ def _years_from_days(all_days):
     return sorted(years)
 
 
-def _build_listening_yearly_recap(all_days, year, items_finished):
-    """Year-in-review for listening: monthly hours from the ABS daily map.
+def _abs_finished_books(progress, items, tz, abs_client=None):
+    """Books ABS marks finished, newest first, with titles from the listening stats items."""
+    progress = progress if isinstance(progress, dict) else {}
+    items = items if isinstance(items, dict) else {}
+    titles = {}
+    finished = []
+    for item_id, entry in progress.items():
+        # Podcast episodes have their own progress entries; only whole books count.
+        if not isinstance(entry, dict) or not entry.get("isFinished") or entry.get("episodeId"):
+            continue
+        try:
+            finished_dt = datetime.fromtimestamp(float(entry["finishedAt"]) / 1000, tz)
+        except (KeyError, TypeError, ValueError, OverflowError, OSError):
+            continue
+        details = None
+        # ABS keeps ebook reading in the same progress records, with no duration. So does an
+        # audiobook marked finished unplayed, so only the item says whether it has audio.
+        if abs_client is not None and item_id not in items and not float(entry.get("duration") or 0) > 0:
+            details = abs_client.get_item_details(item_id)
+            media = (details or {}).get("media") or {}
+            if details is not None and not (media.get("audioFiles") or float(media.get("duration") or 0) > 0):
+                continue
+        metadata = (items.get(item_id) or {}).get("mediaMetadata") or {}
+        title = metadata.get("title")
+        if not title:
+            if not titles:
+                titles = {book.abs_id: book.abs_title for book in database_service.get_all_books()}
+            title = titles.get(item_id)
+        authors = metadata.get("authors") or []
+        # A book marked finished without a listening session: only ABS knows its title.
+        if not title and abs_client is not None:
+            if details is None:
+                details = abs_client.get_item_details(item_id)
+            metadata = ((details or {}).get("media") or {}).get("metadata") or {}
+            title = metadata.get("title")
+            authors = metadata.get("authors") or authors
+        author = ", ".join(a.get("name") for a in authors if isinstance(a, dict) and a.get("name"))
+        finished.append({
+            "bookKey": f"abs:{item_id}", "absId": item_id,
+            "title": title or "Unknown book", "author": author or None,
+            "finishedAt": int(finished_dt.timestamp()),
+            "finishedDate": finished_dt.date().isoformat(), "month": finished_dt.month,
+        })
+    finished.sort(key=lambda book: book["finishedAt"], reverse=True)
+    return finished
 
-    Per-month 'finished' is not available at daily granularity (would need an extra
-    ABS media-progress call), so finishedBooks stays empty and booksFinished reflects
-    the all-time items count for context only.
-    """
+
+def _build_listening_yearly_recap(all_days, year, finished_books, tz):
+    """Year-in-review for listening: monthly hours from the ABS daily map, and the
+    books ABS marks finished that year."""
     months = [{"month": m, "seconds": 0, "pages": 0, "finished": 0} for m in range(1, 13)]
+    finish_years = {
+        book["absId"]: datetime.fromtimestamp(book["finishedAt"], tz).year for book in (finished_books or [])
+    }
+    finished_books = [book for book in (finished_books or []) if finish_years[book["absId"]] == year]
+    for book in finished_books:
+        months[book["month"] - 1]["finished"] += 1
     total_seconds = 0
     for key, value in (all_days or {}).items():
         date_str = str(key)
@@ -11249,9 +11985,10 @@ def _build_listening_yearly_recap(all_days, year, items_finished):
         "months": months,
         "totalSeconds": total_seconds,
         "totalPages": 0,
-        "booksFinished": int(items_finished or 0),
-        "finishedBooks": [],
-        "availableYears": _years_from_days(all_days),
+        "booksFinished": len(finished_books),
+        "finishedBooks": finished_books,
+        # A book marked finished in a year with no listening time still needs its year listed.
+        "availableYears": sorted(set(_years_from_days(all_days)) | set(finish_years.values())),
     }
 
 
@@ -11267,6 +12004,7 @@ def _build_listening_book_list():
         if listen_seconds <= 0:
             continue
         book = books.get(abs_id)
+        listen_sessions = int(stats.get("listen_session_count") or 0)
         result.append({
             "bookKey": f"abs:{abs_id}",
             "absId": abs_id,
@@ -11274,8 +12012,8 @@ def _build_listening_book_list():
             "title": getattr(book, "abs_title", None) or stats.get("book_title") or "Unknown book",
             "author": None,
             "totalSeconds": listen_seconds,
-            "sessionCount": int(stats.get("session_count") or 0),
-            "avgSessionSeconds": int(stats.get("avg_session_seconds") or 0),
+            "sessionCount": listen_sessions,
+            "avgSessionSeconds": listen_seconds // listen_sessions if listen_sessions else 0,
             "lastReadAt": int(stats["last_session_time"]) if stats.get("last_session_time") else None,
         })
     result.sort(key=lambda item: int(item.get("lastReadAt") or 0), reverse=True)
@@ -11320,7 +12058,7 @@ def _build_listening_stats_payload(tz):
 
     all_days = raw_stats.get("days") or {}
     daily = _recent_daily_from_mapping(all_days, tz, days=7)
-    heatmap = _heatmap_from_mapping(all_days, datetime.now(tz).year)
+    heatmap = _heatmap_from_mapping(all_days, *_heatmap_window(datetime.now(tz).date()))
     all_activity_dates = _activity_dates_from_daily([
         {"date": key, "seconds": value}
         for key, value in all_days.items()
@@ -11344,7 +12082,10 @@ def _build_listening_stats_payload(tz):
         total_days=len(all_activity_dates),
         reference_date=datetime.now(tz).date(),
     )
-    summary["itemsFinished"] = len(raw_stats.get("items") or {})
+    finished_books = _abs_finished_books(
+        abs_client.get_all_progress_raw(), raw_stats.get("items"), tz, abs_client
+    ) if use_abs else database_service.get_listening_finished_books(getattr(tz, "key", str(tz)))
+    summary["itemsFinished"] = len(finished_books)
     summary["daysListened"] = len(all_activity_dates)
 
     session_durations = [int(s.get("durationSeconds") or 0) for s in normalized_sessions if s.get("durationSeconds")]
@@ -11362,7 +12103,7 @@ def _build_listening_stats_payload(tz):
             session.get("absId") for session in normalized_sessions if session.get("absId")
         }),
         "books": _build_listening_book_list(),
-        "yearlyRecap": _build_listening_yearly_recap(all_days, datetime.now(tz).year, summary["itemsFinished"]),
+        "yearlyRecap": _build_listening_yearly_recap(all_days, datetime.now(tz).year, finished_books, tz),
     }
 
 
@@ -11370,7 +12111,7 @@ def _build_reading_stats_payload(tz):
     tz_name = getattr(tz, "key", str(tz))
     summary = database_service.get_koreader_dashboard_summary(tz_name)
     daily = database_service.get_koreader_daily_totals(7, tz_name)
-    heatmap = database_service.get_koreader_heatmap(datetime.now(tz).year, tz_name)
+    heatmap = database_service.get_koreader_heatmap(*_heatmap_window(datetime.now(tz).date()), tz_name)
     recent_sessions = database_service.get_koreader_recent_sessions(10, tz_name)
     activity_dates = database_service.get_koreader_activity_dates(tz_name)
     hour_histogram = database_service.get_koreader_hour_histogram(tz_name)
@@ -11519,9 +12260,17 @@ def _build_combined_yearly_recap(reading_recap, listening_recap):
             "readingSeconds": read_secs,
             "listeningSeconds": listen_secs,
             "pages": int(rm.get("pages") or 0),
-            "finished": int(rm.get("finished") or 0) + int(lm.get("finished") or 0),
+            "finished": 0,
         })
-    finished_books = list((reading_recap or {}).get("finishedBooks") or [])
+    # A book finished as both an ebook and an audiobook counts once, at its first finish.
+    finished_by_book = {}
+    for book in list((reading_recap or {}).get("finishedBooks") or []) + list((listening_recap or {}).get("finishedBooks") or []):
+        key = book.get("absId") or book.get("bookKey")
+        if key not in finished_by_book or book["finishedAt"] < finished_by_book[key]["finishedAt"]:
+            finished_by_book[key] = book
+    finished_books = sorted(finished_by_book.values(), key=lambda book: book["finishedAt"], reverse=True)
+    for book in finished_books:
+        months[book["month"] - 1]["finished"] += 1
     available_years = sorted(
         set((reading_recap or {}).get("availableYears") or [])
         | set((listening_recap or {}).get("availableYears") or [])
@@ -11733,16 +12482,14 @@ def api_stats_book_detail():
 
         listening = None
         if abs_id:
-            row = database_service.get_reading_stats(abs_id)
-            if row and int(row.get("listen_seconds") or 0) > 0:
+            detail = database_service.get_book_listening_detail(abs_id)
+            if detail and int(detail.get("totalSeconds") or 0) > 0:
                 book = database_service.get_book(abs_id)
+                snapshot_title = detail.pop("bookTitle", None)
                 listening = {
                     "absId": abs_id,
-                    "title": getattr(book, "abs_title", None) or row.get("book_title"),
-                    "totalSeconds": int(row.get("listen_seconds") or 0),
-                    "sessionCount": int(row.get("session_count") or 0),
-                    "avgSessionSeconds": int(row.get("avg_session_seconds") or 0),
-                    "lastReadAt": int(row["last_session_time"]) if row.get("last_session_time") else None,
+                    "title": getattr(book, "abs_title", None) or snapshot_title,
+                    **detail,
                 }
 
         if not reading and not listening:
@@ -11770,27 +12517,40 @@ def api_stats_yearly_recap():
         return jsonify({"error": "Invalid year"}), 400
 
     try:
+        # Each recap carries that calendar year's heatmap, so the page can show it.
+        first_day, last_day = datetime(year, 1, 1).date(), datetime(year, 12, 31).date()
         reading_recap = database_service.get_koreader_yearly_recap(year, tz_name)
+        reading_heatmap = database_service.get_koreader_heatmap(first_day, last_day, tz_name)
 
         listening_recap = None
+        listening_heatmap = []
+        finished_books = []
         try:
             abs_client = _stats_abs_client()
             if abs_client:
                 raw_stats = abs_client.get_listening_stats()
+                if raw_stats:
+                    finished_books = _abs_finished_books(
+                        abs_client.get_all_progress_raw(), raw_stats.get("items"), tz, abs_client
+                    )
             else:
                 raw_stats = _local_listening_stats(tz)
+                finished_books = database_service.get_listening_finished_books(tz_name)
         except Exception:
             raw_stats = None
         if raw_stats:
             listening_recap = _build_listening_yearly_recap(
-                raw_stats.get("days") or {}, year, len(raw_stats.get("items") or {})
+                raw_stats.get("days") or {}, year, finished_books, tz
             )
+            listening_heatmap = _heatmap_from_mapping(raw_stats.get("days") or {}, first_day, last_day)
 
         if scope == "reading":
-            return jsonify(reading_recap)
+            return jsonify({**reading_recap, "heatmap": reading_heatmap})
         if scope == "listening":
-            return jsonify(listening_recap or _build_listening_yearly_recap({}, year, 0))
-        return jsonify(_build_combined_yearly_recap(reading_recap, listening_recap))
+            listening = listening_recap or _build_listening_yearly_recap({}, year, [], tz)
+            return jsonify({**listening, "heatmap": listening_heatmap})
+        combined = _build_combined_yearly_recap(reading_recap, listening_recap)
+        return jsonify({**combined, "heatmap": _merge_heatmap_activity(listening_heatmap, reading_heatmap)})
     except Exception as e:
         logger.warning("Stats API: yearly recap failed for %s/%s: %s", scope, year, e, exc_info=True)
         return jsonify({"error": "Failed to load yearly recap"}), 500
@@ -12727,7 +13487,10 @@ def proxy_bookorbit_audiobook_cover(book_id):
             return "Cover not found", 404
         from flask import Response
 
-        return Response(content, content_type=content_type or "image/jpeg")
+        response = Response(content, content_type=content_type or "image/jpeg")
+        # Without it, every visit to a page of covers fetched each one from BookOrbit again.
+        response.headers['Cache-Control'] = 'private, max-age=300'
+        return response
     except Exception as e:
         logger.error(f"❌ Error proxying BookOrbit cover for '{book_id}': {e}", exc_info=True)
         return "Error loading cover", 500
@@ -14096,6 +14859,22 @@ def create_app(test_container=None):
     app.jinja_env.globals['safe_folder_name'] = safe_folder_name
     app.jinja_env.globals['suggestion_source_badge'] = suggestion_source_badge
 
+    # i18n: gettext for the Jinja layer. The selector is passed as an argument
+    # (Flask-Babel >= 3.0 dropped the @babel.localeselector decorator); it is
+    # called lazily on the first get_locale()/render, so no before_request hook
+    # is needed. Flask-Babel is a hard dependency — a missing install must fail
+    # loudly here, not leave templates rendering with an undefined `_`.
+    import flask_babel
+
+    # Flask-Babel resolves catalogs relative to app.root_path unless told
+    # otherwise; point it at our translations dir (missing dir is fine — every
+    # string then falls back to English).
+    app.config.setdefault('BABEL_TRANSLATION_DIRECTORIES', translations_dir())
+    flask_babel.Babel(app, locale_selector=get_locale, default_locale=_BASE_LOCALE)
+    # Flask-Babel wires `_`/`gettext`/`ngettext` into Jinja but not
+    # `get_locale`, which base.html uses for the <html lang> attribute.
+    app.jinja_env.globals['get_locale'] = flask_babel.get_locale
+
     def format_duration(seconds: int) -> str:
         """Convert seconds to human-readable duration."""
         seconds = int(seconds)
@@ -14130,6 +14909,7 @@ def create_app(test_container=None):
     app.add_url_rule('/login', 'login', login, methods=['GET', 'POST'])
     app.add_url_rule('/logout', 'logout', logout, methods=['GET', 'POST'])
     app.add_url_rule('/account', 'account', account, methods=['GET', 'POST'])
+    app.add_url_rule('/account/language', 'account_language', account_language, methods=['POST'])
     app.add_url_rule('/account/integrations', 'account_integrations', account_integrations, methods=['GET', 'POST'])
     app.add_url_rule('/api/account/test-connection/<service>', 'account_test_connection', account_test_connection, methods=['POST'])
     app.add_url_rule('/api/account/abs-libraries', 'account_abs_libraries', account_abs_libraries, methods=['POST'])
@@ -14142,6 +14922,8 @@ def create_app(test_container=None):
     app.add_url_rule('/api/admin/users/<int:user_id>/bookfusion/device/start', 'admin_user_bookfusion_device_start', admin_user_bookfusion_device_start, methods=['POST'])
     app.add_url_rule('/api/admin/users/<int:user_id>/bookfusion/device/poll', 'admin_user_bookfusion_device_poll', admin_user_bookfusion_device_poll, methods=['POST'])
     app.add_url_rule('/', 'index', index)
+    app.add_url_rule('/job-queue', 'job_queue_page', job_queue_page, methods=['GET'])
+    app.add_url_rule('/job-queue/reorder', 'job_queue_reorder', job_queue_reorder, methods=['POST'])
     app.add_url_rule('/whats-new', 'whats_new_page', whats_new_page, methods=['GET'])
     app.add_url_rule('/whats-new/dismiss', 'whats_new_dismiss', whats_new_dismiss, methods=['POST'])
     app.add_url_rule('/shelfmark', 'shelfmark', shelfmark)
