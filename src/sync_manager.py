@@ -395,33 +395,13 @@ class SyncManager:
 
     @staticmethod
     def _completion_min_prior() -> float:
-        """How far through the book the reader must already be known to be before
-        a 100% report is believed at once. Read per call."""
+        """How far through the book the reader must already be known to be for a
+        99-100% report to count (`_unsupported_finishes`). Read per call."""
         try:
             value = float(os.environ.get("SYNC_COMPLETION_MIN_PRIOR", "60") or 60)
         except (TypeError, ValueError):
             value = 60.0
         return max(0.0, min(value, 100.0)) / 100.0
-
-    @staticmethod
-    def _known_progress(config: dict, client_name: str):
-        """The furthest the reader is known to have got before this report: the
-        client's own previous position, or any other client's current one. A Kobo
-        that jumps straight to "finished" was often behind itself; the audio being
-        near the end is what makes the finish believable."""
-        known = []
-        state = config.get(client_name) if config else None
-        previous = getattr(state, "previous_pct", None)
-        if isinstance(previous, (int, float)) and not isinstance(previous, bool):
-            known.append(float(previous))
-        for name, other in (config or {}).items():
-            if name == client_name:
-                continue
-            current = getattr(other, "current", None)
-            pct = current.get("pct") if isinstance(current, dict) else None
-            if isinstance(pct, (int, float)) and not isinstance(pct, bool):
-                known.append(float(pct))
-        return max(known) if known else None
 
     def _unsupported_finishes(self, config: dict, positions: dict) -> set:
         """Clients reporting a finish that nothing else in the system supports.
@@ -458,27 +438,10 @@ class SyncManager:
                 refused.add(name)
         return refused
 
-    def _is_believable_finish(self, config: dict, client_name: str, pct) -> bool:
-        """A completion report worth acting on at once: at or above the completion
-        threshold AND from a reader already known to be well into the book
-        (SYNC_COMPLETION_MIN_PRIOR, default 60%). A "finished" from early on never
-        gets here: `_unsupported_finishes` drops it from leader selection first."""
-        if not self._is_completion_report(pct):
-            return False
-        prior = self._known_progress(config, client_name)
-        return prior is not None and prior >= self._completion_min_prior()
-
     def _is_completion_report(self, pct) -> bool:
-        """Whether a client's own reading is a finish rather than a position.
-
-        A Kobo that finishes a book reports 100% and puts its bookmark back on the
-        title page, ready for a re-read. Resolved as a position, that is char 0: a
-        jump from wherever the audio sits to the start of the book, which the
-        rollback guards rightly refuse. Refused, the bridge wrote the listening
-        position back to Grimmory and pulled the reader's Kobo out of the finished
-        state, for about five minutes, until the hold expired and the same report
-        led anyway (observed live). The percentage is the reader's claim; judge it
-        as one. The start-of-book write guard still stops any 0% reaching a peer.
+        """Whether a client's reading is a finish (at or above the completion
+        threshold) rather than a position. The percentage is the reader's claim;
+        `_unsupported_finishes` decides whether anything supports it.
         """
         if pct is None or isinstance(pct, bool):
             return False
@@ -831,8 +794,6 @@ class SyncManager:
 
         if not self._trust_corroborated_rewind_enabled():
             return False
-        if self._is_believable_finish(config, client_name, leader_pct):
-            return False                      # a finish, not a rewind
         verdict = self._backward_move(config, client_name, leader_pct, primary_audio_client)
         if verdict is None:
             return False
@@ -4786,14 +4747,6 @@ class SyncManager:
 
                     material_rollback = changed_ts < (max_other_ts - MATERIAL_ROLLBACK_SECONDS)
                     mismatch_not_ahead = has_locator_mismatch and changed_ts <= (max_other_ts + NORMALIZED_LEAD_EPSILON_SECONDS)
-                    if (material_rollback or mismatch_not_ahead) and self._is_believable_finish(
-                            config, changed_client, changed_raw_pct):
-                        logger.info(
-                            f"🏁 '{abs_id}' '{title_snip}' '{changed_client}' reports "
-                            f"{changed_raw_pct:.1%}: a finish, not a rewind to "
-                            f"{changed_ts:.1f}s — keeping it as leader"
-                        )
-                        material_rollback = mismatch_not_ahead = False
                     if material_rollback or mismatch_not_ahead:
                         # A deliberate rewind is indistinguishable from a stale read in
                         # a single sample, so this guard demotes both and furthest-wins

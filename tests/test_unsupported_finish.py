@@ -1,10 +1,9 @@
 """0008 — a "finished" that nothing else supports is ignored, not followed.
 
-0007 decided when a 100% report that looks like a rewind still counts as a
-finish (the reader already known to be past SYNC_COMPLETION_MIN_PRIOR, 60%).
-This is the other half: a 99-100% report from a reader known to be early in
-the book is an old "read" mark or a stale end-of-book bookmark, and may not
-lead. The client stays a follower, so the real position is written back over
+A 99-100% report from a reader known to be early in the book (nothing puts
+them past SYNC_COMPLETION_MIN_PRIOR, 60%) is an old "read" mark or a stale
+end-of-book bookmark, and may not lead. (A genuine Kobo finish on the title
+page is handled upstream since 7.11.0, #537.) The client stays a follower, so the real position is written back over
 it; Hardcover and StoryGraph are not told the book is finished either.
 
 Observed live (A Court of Silver Flames, 2026-09-22): the book had been marked
@@ -71,6 +70,25 @@ class _Base(unittest.TestCase):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+
+
+class TestWhatCountsAsAFinish(_Base):
+    def test_the_kobos_hundred_percent(self):
+        self.assertTrue(self.manager._is_completion_report(1.0))
+
+    def test_the_default_threshold_is_ninety_nine(self):
+        self.assertTrue(self.manager._is_completion_report(0.99))
+        self.assertFalse(self.manager._is_completion_report(0.989))
+
+    def test_the_threshold_setting_is_honoured(self):
+        os.environ["SYNC_COMPLETION_THRESHOLD"] = "100"
+        self.assertFalse(self.manager._is_completion_report(0.995))
+        self.assertTrue(self.manager._is_completion_report(1.0))
+
+    def test_nothing_to_judge(self):
+        for value in (None, True, "abc"):
+            with self.subTest(value=value):
+                self.assertFalse(self.manager._is_completion_report(value))
 
 
 class TestWhichFinishesAreUnsupported(_Base):
