@@ -1,4 +1,5 @@
 import os
+import math
 from typing import Optional
 import logging
 
@@ -126,38 +127,6 @@ class BookloreSyncClient(SyncClient):
         target = self.booklore_client.find_book_by_filename(epub, allow_refresh=False)
         return bool(target)
 
-    @staticmethod
-    def _chapter_progress_from_rich(rich: dict) -> Optional[float]:
-        """Grimmory's within-chapter position, as the 0-1 fraction the normalizer wants.
-
-        A Kobo sync clears the CFI and leaves only the href, and
-        `_resolve_href_to_char_offset` can take a bare href no further than the
-        START of that chapter file ('href_only') — so a device three quarters of
-        the way through a chapter lands the audiobook at its opening line.
-        Grimmory also reports how far into the current content source the device
-        is, as contentSourceProgressPercent. Handed that, the same resolver takes
-        its 'href_progression' branch and lands on the real position; and that
-        source, unlike 'href_only', is in _HIGH_CONFIDENCE_NORMALIZATION_SOURCES,
-        so a corroborated device rewind is trusted rather than held.
-
-        Grimmory reports it 0-100 while the sibling `pct` is already a fraction,
-        so the scaling happens here rather than at the API boundary, where the
-        raw field still means exactly what Grimmory says it means. 0.0 is a real
-        value (the start of a chapter), so callers must test it against None and
-        never for truthiness. The range check also rejects NaN and both
-        infinities, since neither compares inside it.
-        """
-        raw = rich.get("content_source_pct")
-        if raw is None or isinstance(raw, bool):
-            return None
-        try:
-            value = float(raw)
-        except (TypeError, ValueError):
-            return None
-        if not 0.0 <= value <= 100.0:
-            return None
-        return value / 100.0
-
     def get_service_state(self, book: Book, prev_state: Optional[State], title_snip: str = "", bulk_context: dict = None) -> Optional[ServiceState]:
         # Prefer the original filename for tri-links, then fall back to the standard filename.
         epub = self._resolve_epub_filename(book)
@@ -244,6 +213,15 @@ class BookloreSyncClient(SyncClient):
         if rich is not None:
             if rich.get("href"):
                 current["href"] = rich["href"]
+                if not bl_cfi:
+                    raw_progress = rich.get("content_source_pct")
+                    if raw_progress is not None and not isinstance(raw_progress, bool):
+                        try:
+                            chapter_progress = float(raw_progress)
+                            if math.isfinite(chapter_progress):
+                                current["chapter_progress"] = max(0.0, min(chapter_progress / 100.0, 1.0))
+                        except (TypeError, ValueError, OverflowError):
+                            pass
             if rich.get("page") is not None:
                 current["page"] = rich["page"]
                 current["_previous_page"] = page_from_persisted_state(prev_state)
@@ -252,9 +230,6 @@ class BookloreSyncClient(SyncClient):
                 current["service_updated_at"] = service_updated_at
             if rich.get("status"):
                 current["status"] = rich["status"]
-            chapter_progress = self._chapter_progress_from_rich(rich)
-            if chapter_progress is not None:
-                current["chapter_progress"] = chapter_progress
 
         return ServiceState(
             current=current,
@@ -281,6 +256,19 @@ class BookloreSyncClient(SyncClient):
         if bl_pct is not None and epub and self.ebook_parser:
             return self.ebook_parser.get_text_at_percentage(epub, bl_pct)
         return None
+
+    def get_exact_locator(self, book: Book, state: ServiceState, epub_file_name: str) -> Optional[LocatorResult]:
+        """Keep the CFI's own position when it refers to epub_file_name itself (#523)."""
+        if self._is_cbz_book(book) or not self.ebook_parser:
+            return None
+        cfi = state.current.get('cfi')
+        epub = self._resolve_epub_filename(book)
+        if not cfi or not epub or epub != epub_file_name:
+            return None
+        index = self.ebook_parser.resolve_cfi_to_index(epub, cfi)
+        if index is None:
+            return None
+        return self._locator_from_index(epub, index)
 
     def update_progress(self, book: Book, request: UpdateProgressRequest) -> SyncResult:
         # Prefer the original filename for updates too.

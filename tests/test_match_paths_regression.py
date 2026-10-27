@@ -241,7 +241,7 @@ class TestMatchPathsRegression(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 302)
-        self.mock_container.mock_database_service.ensure_linked_kosync_document.assert_called_once_with(
+        self.mock_container.mock_database_service.adopt_kosync_document_if_unowned.assert_called_once_with(
             "hash-match-1", "ab-1"
         )
 
@@ -287,11 +287,8 @@ class TestMatchPathsRegression(unittest.TestCase):
     def test_match_route_never_steals_a_primary_hash_linked_elsewhere(self, _mock_kosync):
         """The primary hash gets the same fail-closed treatment as a sibling hash.
 
-        `_adopt_kosync_progress_for_book` reaches for `ensure_linked_kosync_document`,
-        whose upsert re-points a row that already names a different book — that is
-        deliberate for hash reconciliation's sibling hashes (#285) but wrong here.
-        Re-pointing would hide the losing book's stored progress behind the very join
-        the adoption exists to repair, relocating #431 instead of fixing it.
+        The database adoption operation checks ownership in the same statement
+        that links the hash. Consolidation's repointing operation stays separate.
         """
         owned = Mock()
         owned.document_hash = "hash-match-1"
@@ -318,7 +315,7 @@ class TestMatchPathsRegression(unittest.TestCase):
 
         web_server._adopt_kosync_progress_for_book("ab-1", "hash-orphan")
 
-        self.mock_container.mock_database_service.ensure_linked_kosync_document.assert_called_once_with(
+        self.mock_container.mock_database_service.adopt_kosync_document_if_unowned.assert_called_once_with(
             "hash-orphan", "ab-1"
         )
 
@@ -328,7 +325,7 @@ class TestMatchPathsRegression(unittest.TestCase):
 
         web_server._adopt_kosync_progress_for_book("ab-1", "hash-new")
 
-        self.mock_container.mock_database_service.ensure_linked_kosync_document.assert_called_once_with(
+        self.mock_container.mock_database_service.adopt_kosync_document_if_unowned.assert_called_once_with(
             "hash-new", "ab-1"
         )
 
@@ -341,7 +338,7 @@ class TestMatchPathsRegression(unittest.TestCase):
 
         web_server._adopt_kosync_progress_for_book("ab-1", "hash-mine")
 
-        self.mock_container.mock_database_service.ensure_linked_kosync_document.assert_called_once_with(
+        self.mock_container.mock_database_service.adopt_kosync_document_if_unowned.assert_called_once_with(
             "hash-mine", "ab-1"
         )
 
@@ -356,10 +353,18 @@ class TestMatchPathsRegression(unittest.TestCase):
         owned.document_hash = "hash-theirs"
         owned.linked_abs_id = "some-other-book"
         self.mock_container.mock_database_service.get_kosync_document.return_value = owned
+        self.mock_container.mock_database_service.adopt_kosync_document_if_unowned.return_value = False
 
-        web_server._adopt_kosync_progress_for_book("ab-1", "hash-theirs")
+        with self.assertLogs("src.web_server", level="INFO") as logs:
+            web_server._adopt_kosync_progress_for_book("ab-1", "hash-theirs")
 
-        self.mock_container.mock_database_service.ensure_linked_kosync_document.assert_not_called()
+        self.mock_container.mock_database_service.adopt_kosync_document_if_unowned.assert_called_once_with(
+            "hash-theirs", "ab-1"
+        )
+        self.assertTrue(any(
+            "🔒 KoSync document 'hash-theirs' already belongs to 'some-other-book'" in line
+            for line in logs.output
+        ))
 
     @patch("src.web_server.get_kosync_id_for_ebook", return_value="hash-match-1")
     def test_match_route_reuses_alignment_instead_of_requeueing_transcription(self, _mock_kosync):
@@ -507,6 +512,36 @@ class TestMatchPathsRegression(unittest.TestCase):
         saved_book = db.save_book.call_args[0][0]
         self.assertEqual(saved_book.series_name, "The Reckoning")
         self.assertEqual(saved_book.series_sequence, 3.0)
+
+    @patch("src.web_server.ingest_storyteller_transcripts", return_value=None)
+    @patch("src.web_server._download_storyteller_artifact",
+           return_value=("storyteller_abcd-1234.epub", None))
+    def test_auto_attach_storyteller_keeps_original_kosync_hash_and_epub(self, _download, _ingest):
+        from src.db.models import Book
+
+        existing = Book(
+            abs_id="existing-519", abs_title="Existing",
+            ebook_filename="original.epub",
+            kosync_doc_id="a" * 32, sync_mode="ebook_only",
+        )
+        db = self.mock_container.mock_database_service
+        db.get_book.return_value = existing
+        db.save_book.side_effect = lambda book: book
+
+        with patch("src.web_server.get_kosync_id_for_ebook") as recompute, \
+             patch("src.web_server._existing_mapping_access", return_value="modify"), \
+             patch("src.web_server._preserve_or_reset_mapping_status"), \
+             patch("src.web_server._enqueue_tracker_automatch"), \
+             patch("src.web_server._spawn_user_background"):
+            saved, error, _status = web_server._upsert_storyteller_mapping(
+                mode_hint="existing", existing_book=existing,
+                storyteller_uuid="abcd-1234", preserve_primary_kosync=True,
+            )
+        self.assertIsNone(error)
+        self.assertEqual(saved.storyteller_uuid, "abcd-1234")
+        self.assertEqual(saved.kosync_doc_id, "a" * 32)
+        self.assertEqual(saved.ebook_filename, "original.epub")
+        recompute.assert_not_called()
 
     @patch("src.web_server.get_kosync_id_for_ebook", return_value="1234567890abcdef1234567890abcdef")
     def test_match_route_creates_ebook_only_mapping_from_storyteller_without_audiobook(self, _mock_kosync):
@@ -1097,6 +1132,29 @@ class TestMatchPathsRegression(unittest.TestCase):
         self._match_all_library_audio(audio_source="BookLore")
 
         db.set_readalong_epub_requested.assert_not_called()
+
+    def test_suggestions_queue_readalong_box_marks_only_bookorbit_items(self):
+        self.mock_container.mock_storyteller_client.is_configured.return_value = True
+        for action in ("process_queue", "forge_and_match_queue"):
+            for flag, expected in ((None, None), ("true", True)):
+                with self.subTest(action=action, flag=flag):
+                    items = [{"abs_id": "bo-1", "audio_source": "BookOrbit"},
+                             {"abs_id": "ab-1", "audio_source": "ABS"}]
+                    data = {"action": action}
+                    if flag:
+                        data["readalong_epub_requested"] = flag
+                    with patch.object(web_server, "_match_queue_drain", return_value=items),                             patch.object(web_server, "_spawn_user_background") as mock_spawn:
+                        self.client.post("/suggestions", data=data)
+                    queued = mock_spawn.call_args.args[1]
+                    self.assertEqual(queued[0].get("readalong_epub_requested"), expected)
+                    self.assertIsNone(queued[1].get("readalong_epub_requested"))
+
+    def test_queue_panel_offers_readalong_box_only_with_bookorbit_items(self):
+        template = self.client.application.jinja_env.get_template("_match_queue_panel.html")
+        with_bookorbit = template.render(queue=[{"abs_id": "bo-1", "audio_source": "BookOrbit"}])
+        abs_only = template.render(queue=[{"abs_id": "ab-1", "audio_source": "ABS"}])
+        self.assertIn('id="queueReadalongCheckbox"', with_bookorbit)
+        self.assertNotIn('id="queueReadalongCheckbox"', abs_only)
 
     @patch("src.web_server._create_audio_only_mapping_from_queue_item")
     def test_suggestions_drains_shared_audio_only_queue(self, mock_audio_only):

@@ -43,7 +43,9 @@ class TestKOReaderDeviceSyncService(unittest.TestCase):
             raise FileNotFoundError(filename)
 
         ebook_parser.resolve_book_path.side_effect = resolve_book_path
+        ebook_parser.hash_method = "content"
         ebook_parser.get_kosync_id.side_effect = lambda filepath: f"hash-{Path(filepath).stem}"
+        ebook_parser.get_kosync_content_id.side_effect = lambda filepath: f"hash-{Path(filepath).stem}"
 
         self.service = KOReaderDeviceSyncService(
             database_service=self.db,
@@ -639,7 +641,7 @@ class TestKOReaderDeviceSyncService(unittest.TestCase):
         self.service.build_manifest()
 
         self.assertEqual(
-            self.service.ebook_parser.get_kosync_id.call_count,
+            self.service.ebook_parser.get_kosync_content_id.call_count,
             1,
             "Second manifest build should be served from mtime cache (issue #342)",
         )
@@ -668,8 +670,147 @@ class TestKOReaderDeviceSyncService(unittest.TestCase):
         self.service.build_manifest()
 
         self.assertEqual(
-            self.service.ebook_parser.get_kosync_id.call_count,
+            self.service.ebook_parser.get_kosync_content_id.call_count,
             2,
             "Changed file (different size) must be re-hashed",
         )
+
+    def _use_filename_hashing(self):
+        parser = self.service.ebook_parser
+        parser.hash_method = "filename"
+        parser.get_kosync_id.side_effect = lambda filepath: f"name-{Path(filepath).name}"
+        parser.get_kosync_content_id.side_effect = lambda filepath: f"content-{Path(filepath).stem}"
+
+    def test_filename_mode_manifest_carries_the_content_hash(self):
+        """BridgeSync checks each download against its content hash, so a filename
+        hash in the manifest fails every download."""
+        self._use_filename_hashing()
+        self._write_book_file("kavita_187.epub")
+        self.db.save_book(
+            Book(
+                abs_id="abs-1",
+                abs_title="Dragon's Justice",
+                original_ebook_filename="kavita_187.epub",
+                status="active",
+            )
+        )
+
+        manifest = self.service.build_manifest()
+        resolved = self.service.resolve_download("abs-1")
+
+        self.assertEqual(manifest["books"][0]["content_hash"], "content-kavita_187")
+        self.assertEqual(resolved["content_hash"], "content-kavita_187")
+
+    def test_filename_mode_links_the_filename_hash_for_progress(self):
+        """Devices on filename hashing report the filename's hash over KoSync, so
+        that is the hash linked to the book, not the content hash."""
+        self._use_filename_hashing()
+        self._write_book_file("kavita_187.epub")
+        self.db.save_book(
+            Book(
+                abs_id="abs-1",
+                abs_title="Dragon's Justice",
+                original_ebook_filename="kavita_187.epub",
+                status="active",
+            )
+        )
+
+        self.service.build_manifest()
+
+        self.assertEqual(
+            self.db.get_kosync_document("name-Dragon's Justice.epub").linked_abs_id, "abs-1"
+        )
+
+    def test_filename_mode_links_the_content_hash_for_reader_statistics(self):
+        """KOReader's statistics, reading statuses and highlights name a book by its
+        content hash in either hash method, so the served file's content hash is
+        linked too."""
+        self._use_filename_hashing()
+        self._write_book_file("kavita_187.epub")
+        self.db.save_book(
+            Book(
+                abs_id="abs-1",
+                abs_title="Dragon's Justice",
+                original_ebook_filename="kavita_187.epub",
+                status="active",
+            )
+        )
+
+        self.service.build_manifest()
+
+        self.assertEqual(self.db.get_kosync_document("content-kavita_187").linked_abs_id, "abs-1")
+
+    def test_filename_mode_shared_content_hash_keeps_its_owner_across_reconcile_and_manifest(self):
+        """Two books served from one file share its content hash. Reconcile gives it
+        to the first book; building the manifest must not move it to the second."""
+        self._use_filename_hashing()
+        self._write_book_file("shared.epub")
+        for abs_id, title in (("abs-a", "Book A"), ("abs-b", "Book B")):
+            self.db.save_book(Book(abs_id=abs_id, abs_title=title,
+                                   original_ebook_filename="shared.epub", status="active"))
+
+        owners = []
+        for _ in range(2):
+            self.service.reconcile_hashes()
+            owners.append(self.db.get_kosync_document("content-shared").linked_abs_id)
+            self.service.build_manifest()
+            owners.append(self.db.get_kosync_document("content-shared").linked_abs_id)
+
+        self.assertEqual(len(set(owners)), 1, owners)
+
+    def test_filename_mode_reconcile_binds_the_filename_hash(self):
+        self._use_filename_hashing()
+        self._write_book_file("kavita_187.epub")
+        self.db.save_book(
+            Book(
+                abs_id="abs-1",
+                abs_title="Dragon's Justice",
+                original_ebook_filename="kavita_187.epub",
+                status="active",
+            )
+        )
+
+        summary = self.service.reconcile_hashes()
+
+        self.assertEqual(summary["linked"], 2)
+        self.assertEqual(
+            self.db.get_kosync_document("name-Dragon's Justice.epub").linked_abs_id, "abs-1"
+        )
+        self.assertEqual(self.db.get_kosync_document("content-kavita_187").linked_abs_id, "abs-1")
+
+    def test_filename_mode_reconcile_uses_global_filename_map_across_users(self):
+        """Reader B adding another "Home" must not take the hash of reader A's Home.epub."""
+        self._use_filename_hashing()
+        self._write_book_file("HomeA.epub", content=b"epubA")
+        self._write_book_file("HomeB.epub", content=b"epubB")
+
+        user_a = self.db.create_user("userA", password="p")
+        user_b = self.db.create_user("userB", password="p")
+
+        self.db.save_book(Book(abs_id="abs-a", abs_title="Home", original_ebook_filename="HomeA.epub", status="active"))
+        self.db.save_book(Book(abs_id="abs-b", abs_title="Home", original_ebook_filename="HomeB.epub", status="active"))
+
+        self.db.link_user_book(user_a.id, "abs-a")
+        self.db.link_user_book(user_b.id, "abs-b")
+
+        # Reader A's hash already exists for the global manifest name
+        self.db.ensure_linked_kosync_document("name-Home.epub", "abs-a")
+
+        original_user_id = self.service.user_id
+        try:
+            self.service.user_id = user_b.id
+            self.service.reconcile_hashes()
+        finally:
+            self.service.user_id = original_user_id
+
+        # A's hash must still be linked to A's book
+        self.assertEqual(self.db.get_kosync_document("name-Home.epub").linked_abs_id, "abs-a")
+        # B's hash must be the suffixed global name, not the plain one
+        self.assertEqual(
+            self.db.get_kosync_document("name-Home__abs-b.epub").linked_abs_id, "abs-b"
+        )
+        # Ensure we didn't bind A's plain hash to B
+        doc = self.db.get_kosync_document("name-Home.epub")
+        self.assertIsNotNone(doc)
+        self.assertNotEqual(doc.linked_abs_id, "abs-b")
 

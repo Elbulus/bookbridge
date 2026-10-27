@@ -50,6 +50,7 @@ _DETAIL_TTL = 3600
 # normal poll cadence never re-logs-in, and refresh just ahead of expiry.
 _TOKEN_MAX_AGE = 840
 _LOGIN_RETRY_COOLDOWN = 60
+_SESSION_POOL_SIZE = 32
 _EBOOK_FORMATS = {"epub", "kepub", "pdf", "cbz", "cbr", "cb7", "mobi", "azw3", "azw", "fb2"}
 _AUDIO_FORMATS = {"m4b", "mp3", "m4a", "opus", "ogg", "flac", "aax", "aac"}
 # Which cached light-info id a kind-specific lookup may fall back to.
@@ -148,6 +149,17 @@ class BookOrbitClient:
         self._last_refresh_attempt: float = 0
 
         self.session = requests.Session()
+        # Pages such as Suggestions load many BookOrbit covers at once through this
+        # session (65 at once was seen). Requests past the pool size wait for a free
+        # connection instead of opening an extra one that urllib3 then discards with
+        # a "Connection pool is full" warning. Every request here has a timeout and
+        # releases its connection, so a wait is always short.
+        _adapter = requests.adapters.HTTPAdapter(
+            pool_connections=_SESSION_POOL_SIZE, pool_maxsize=_SESSION_POOL_SIZE,
+            pool_block=True,
+        )
+        self.session.mount("http://", _adapter)
+        self.session.mount("https://", _adapter)
 
     # ------------------------------------------------------------------
     # Configuration helpers

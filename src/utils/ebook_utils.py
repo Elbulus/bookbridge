@@ -23,7 +23,7 @@ import tempfile
 from pathlib import Path
 from collections import OrderedDict
 from src.sync_clients.sync_client_interface import LocatorResult
-from src.utils.cache_paths import safe_cache_path, is_plain_basename
+from src.utils.cache_paths import safe_cache_path, is_plain_basename, contained_library_file
 from src.utils.ebook_dom_map import (
     INLINE_TEXT_JOINER,
     content_string_nodes,
@@ -55,6 +55,20 @@ def is_linkable_ebook_filename(name: str | None) -> bool:
 def is_comic_ebook_filename(name: str | None) -> bool:
     """True for comic archive filenames (currently CBZ only)."""
     return str(name or '').strip().lower().endswith(tuple(COMIC_EBOOK_EXTENSIONS))
+
+
+def is_in_hidden_folder(path, root) -> bool:
+    """True when ``path`` sits in a hidden folder under ``root``.
+
+    Hidden folders in a library hold copies nobody means to match: Calibre's
+    ``.caltrash``, desktop trash, sync and snapshot folders. Only folders below
+    ``root`` count, so a library mounted under a hidden path still scans.
+    """
+    try:
+        folders = Path(path).relative_to(root).parts[:-1]
+    except ValueError:
+        return False
+    return any(folder.startswith('.') for folder in folders)
 
 
 # Names the bridge writes into the epub cache when it acquires an ebook for an
@@ -202,9 +216,14 @@ class EbookParser:
         return [self.books_dir, *self.extra_book_dirs]
 
     def resolve_book_path(self, filename):
-        # 0. Filename-only lookup: a name carrying a directory component or ".."
-        #    would let the glob scans below walk outside the library roots.
+        # 0. A name carrying a folder ("Author/Book.epub") is looked up only at that
+        #    exact path inside a library root: the glob scans below would follow its
+        #    "..", and a same-named file elsewhere is a different book.
         if not is_plain_basename(filename):
+            path = contained_library_file(self.search_dirs(), filename)
+            if path:
+                self._remember_resolved_path(filename, path)
+                return path
             logger.warning("Refused book path lookup for a non-basename filename: %s", filename)
             raise FileNotFoundError(f"Could not locate {filename}")
 
@@ -319,6 +338,50 @@ class EbookParser:
                 ids.add(norm)
         return ids
 
+    def get_book_authors(self, filepath) -> list[str]:
+        """Return the authors among an EPUB's dc:creators in package order, or [] if unreadable.
+
+        A creator whose role (EPUB 2 ``opf:role`` or an EPUB 3 ``refines`` meta) is
+        not ``aut`` is skipped, unless no creator is an author. Reads only the
+        container and the package document, not the whole book, because filename
+        matching calls this for every library book.
+        """
+        import xml.etree.ElementTree as ElementTree
+
+        path = Path(filepath)
+        if not path.is_absolute():
+            try:
+                path = self.resolve_book_path(str(path))
+            except FileNotFoundError:
+                return []
+        try:
+            with zipfile.ZipFile(path) as archive:
+                container = ElementTree.fromstring(archive.read("META-INF/container.xml"))
+                rootfile = next(
+                    (el for el in container.iter() if el.tag.rsplit("}", 1)[-1] == "rootfile"), None
+                )
+                if rootfile is None or not rootfile.get("full-path"):
+                    return []
+                package = ElementTree.fromstring(archive.read(rootfile.get("full-path")))
+        except Exception as e:
+            logger.debug(f"Could not read authors for '{path}': {e}")
+            return []
+        refined_roles = {
+            el.get("refines")[1:]: (el.text or "").strip().lower()
+            for el in package.iter()
+            if el.tag.rsplit("}", 1)[-1] == "meta" and el.get("property") == "role"
+            and (el.get("refines") or "").startswith("#")
+        }
+        creators = []
+        for el in package.iter():
+            if el.tag.rsplit("}", 1)[-1] != "creator" or not (el.text and el.text.strip()):
+                continue
+            role = refined_roles.get(el.get("id")) or el.get("{http://www.idpf.org/2007/opf}role") or ""
+            creators.append((el.text.strip(), role.strip().lower()))
+        authors = [name for name, role in creators if role in ("", "aut")]
+        # An anthology may credit only its editor; that name beats no name for matching.
+        return authors or [name for name, _role in creators]
+
     @staticmethod
     def _normalize_identifier(raw) -> str:
         """Normalize an EPUB identifier for cross-file comparison.
@@ -420,7 +483,15 @@ class EbookParser:
         filepath = Path(filepath)
         if self.hash_method == "filename":
             return hashlib.md5(filepath.name.encode('utf-8'), usedforsecurity=False).hexdigest()
-        
+        return self.get_kosync_content_id(filepath)
+
+    def get_kosync_content_id(self, filepath):
+        """KOReader's partial MD5 of the file's bytes, whatever the hash method is.
+
+        BridgeSync checks every download against this hash, so a device-sync
+        manifest has to carry it in filename mode too.
+        """
+        filepath = Path(filepath)
         md5 = hashlib.md5(usedforsecurity=False)
         try:
             file_size = os.path.getsize(filepath)
