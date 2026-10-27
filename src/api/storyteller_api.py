@@ -1,8 +1,10 @@
 import base64
+import json
 import logging
 import mimetypes
 import os
 import re
+import shutil
 import tempfile
 import time
 import zipfile
@@ -21,6 +23,8 @@ from src.utils.file_transfers import (
 )
 from src.sync_clients.sync_client_interface import LocatorResult
 from src.utils.logging_utils import get_persistent_condition_logger, sanitize_log_data
+from src.utils.audio_duration import probe_duration_seconds
+from src.utils.smil_extractor import AUDIO_DURATIONS_ENTRY
 from src.utils.user_config import resolve_setting
 
 logger = logging.getLogger(__name__)
@@ -761,6 +765,125 @@ class StorytellerAPIClient:
 
         return False
 
+    def list_library_books(self) -> Optional[list]:
+        """List Storyteller books with alignment fingerprints; None means failure."""
+        response = self._make_request("GET", "/api/v2/books", timeout=self._library_request_timeout())
+        if response is None or response.status_code != 200:
+            return None
+        try:
+            books = response.json()
+            get_persistent_condition_logger().resolve(
+                logger, f"storyteller-library-decode:{self.username}", "Storyteller library list decode recovered")
+            return books if isinstance(books, list) else None
+        except Exception as exc:
+            get_persistent_condition_logger().warn(
+                logger, f"storyteller-library-decode:{self.username}",
+                "Storyteller library list decode failed: %s", exc, exc_info=True)
+            return None
+
+    def get_kosync_content_hash(self, book_uuid: str, file_format: str) -> Optional[str]:
+        """Hash exact OPDS-delivered bytes using KOReader's partial-MD5 ranges."""
+        import hashlib
+
+        if os.environ.get("KOSYNC_HASH_METHOD", "content").strip().lower() != "content":
+            return None
+        if not book_uuid or file_format not in {"ebook", "readaloud"}:
+            return None
+        token = self._get_fresh_token()
+        if not token:
+            return None
+
+        conditions = get_persistent_condition_logger()
+        failure_key = f"storyteller-hash:{self.username}:{book_uuid}:{file_format}"
+        offsets = [0] + [1024 * (4 ** i) for i in range(11)]
+        digest = hashlib.md5(usedforsecurity=False)
+        url = f"{self.base_url}/api/v2/books/{book_uuid}/files"
+        for offset in offsets:
+            response = None
+            try:
+                for attempt in range(2):
+                    response = self.session.get(
+                        url,
+                        params={"format": file_format},
+                        headers={
+                            "Authorization": f"Bearer {token}",
+                            "Range": f"bytes={offset}-{offset + 1023}",
+                        },
+                        timeout=(10, 90),
+                        stream=True,
+                    )
+                    if response.status_code != 401 or attempt:
+                        break
+                    response.close()
+                    self._token = None
+                    token = self._get_fresh_token()
+                    if not token:
+                        return None
+
+                if response.status_code == 416:
+                    if offset == 0:
+                        return None
+                    break
+                if response.status_code == 206:
+                    content_range = response.headers.get("Content-Range", "")
+                    if content_range and not content_range.startswith(f"bytes {offset}-"):
+                        conditions.warn(logger, failure_key, "Storyteller hash: wrong range for %s (%s)",
+                                        book_uuid, content_range)
+                        return None
+                    sample = response.content
+                    if not sample or len(sample) > 1024:
+                        return None
+                    digest.update(sample)
+                    if len(sample) < 1024:
+                        break
+                    continue
+                if response.status_code == 200:
+                    # Servers ignoring Range return the entire body. Stream the
+                    # requested samples without holding a multi-GB EPUB in RAM.
+                    samples = [bytearray() for _ in offsets]
+                    position = 0
+                    chunks = (response.iter_content(chunk_size=256 * 1024)
+                              if hasattr(response, "iter_content") else [response.content])
+                    for chunk in chunks:
+                        if not chunk:
+                            continue
+                        end = position + len(chunk)
+                        for idx, start in enumerate(offsets):
+                            if start >= end:
+                                break
+                            if start + 1024 <= position:
+                                continue
+                            samples[idx].extend(
+                                chunk[max(start - position, 0):min(start + 1024 - position, len(chunk))]
+                            )
+                        position = end
+                    if not samples[0]:
+                        return None
+                    full_digest = hashlib.md5(usedforsecurity=False)
+                    for sample in samples:
+                        if not sample:
+                            break
+                        full_digest.update(sample)
+                    conditions.resolve(logger, failure_key, "Storyteller hash recovered for %s", book_uuid)
+                    return full_digest.hexdigest()
+
+                logger.info(
+                    "Storyteller hash: %s format=%s responded HTTP %s",
+                    book_uuid, file_format, response.status_code,
+                )
+                return None
+            except Exception as exc:
+                conditions.warn(
+                    logger, failure_key, "Storyteller hash failed for %s format=%s at %d: %s",
+                    book_uuid, file_format, offset, exc, exc_info=True,
+                )
+                return None
+            finally:
+                if response is not None:
+                    response.close()
+        conditions.resolve(logger, failure_key, "Storyteller hash recovered for %s", book_uuid)
+        return digest.hexdigest()
+
     def search_books(self, query: str) -> Optional[list]:
         """Search Storyteller's library. Returns [] for no matches, None if the request failed."""
         response = self._make_request("GET", "/api/v2/books", None, timeout=self._library_request_timeout())
@@ -922,6 +1045,9 @@ class StorytellerAPIClient:
 
         Audio entries are kept in the archive (so the OPF manifest stays resolvable
         for ebooklib) but written empty, shrinking a ~100MB ReadAloud EPUB to ~1MB.
+        Each audio file's length is recorded first, in ``AUDIO_DURATIONS_ENTRY``:
+        SMIL clip times count from the start of their own audio file, so placing them
+        on the audiobook's timeline needs the length of every file before it.
         Every other resource (XHTML, SMIL overlays, OPF, nav, CSS, images) is copied
         verbatim, preserving each entry's original compression so the EPUB
         ``mimetype`` entry stays stored.
@@ -929,15 +1055,36 @@ class StorytellerAPIClient:
         src_path = Path(src_path)
         dst_path = Path(dst_path)
         with zipfile.ZipFile(src_path, "r") as zin, \
-                zipfile.ZipFile(dst_path, "w", zipfile.ZIP_DEFLATED) as zout:
+                zipfile.ZipFile(dst_path, "w", zipfile.ZIP_DEFLATED) as zout, \
+                tempfile.TemporaryDirectory(dir=dst_path.parent, prefix=".audio-probe.") as scratch:
+            # A copy stripped before keeps the lengths it recorded then.
+            try:
+                durations = json.loads(zin.read(AUDIO_DURATIONS_ENTRY))
+            except (KeyError, ValueError):
+                durations = {}
+            if not isinstance(durations, dict):
+                durations = {}
             for item in zin.infolist():
+                if item.filename == AUDIO_DURATIONS_ENTRY:
+                    continue
                 ext = os.path.splitext(item.filename)[1].lower()
                 if ext in cls._AUDIO_EXTENSIONS:
+                    # A length already recorded (a builder's exact one) beats a padded re-probe.
+                    if item.file_size > 0 and item.filename not in durations:
+                        probe_path = Path(scratch) / f"audio{ext}"
+                        with zin.open(item) as audio, open(probe_path, "wb") as out:
+                            shutil.copyfileobj(audio, out, 1 << 20)
+                        seconds = probe_duration_seconds(probe_path)
+                        probe_path.unlink()
+                        if seconds is not None:
+                            durations[item.filename] = round(seconds, 3)
                     placeholder = zipfile.ZipInfo(item.filename, date_time=item.date_time)
                     placeholder.compress_type = zipfile.ZIP_DEFLATED
                     zout.writestr(placeholder, b"")
                 else:
                     zout.writestr(item, zin.read(item.filename))
+            if durations:
+                zout.writestr(AUDIO_DURATIONS_ENTRY, json.dumps(durations, sort_keys=True))
 
     @classmethod
     def _epub_has_embedded_audio(cls, path) -> bool:

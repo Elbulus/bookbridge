@@ -54,11 +54,11 @@ class KOReaderDeviceSyncService:
         self._content_hash_cache: dict[str, tuple[float, int, str]] = {}
         self._content_hash_cache_lock = threading.Lock()
 
-    def _get_active_books(self) -> list:
+    def _get_active_books(self, all_users: bool = False) -> list:
         # Audiobook-only mappings have no ebook file by design, so they're never
         # relevant to this ebook-focused device manifest -- including them just
         # produces a "no original ebook filename" warning every cycle, forever.
-        if self.user_id is not None:
+        if self.user_id is not None and not all_users:
             books = self.database_service.get_books_by_status("active", user_id=self.user_id)
         else:
             books = self.database_service.get_books_by_status("active")
@@ -69,6 +69,11 @@ class KOReaderDeviceSyncService:
             ),
             key=lambda book: (str(getattr(book, "abs_title", "") or "").lower(), str(book.abs_id)),
         )
+
+    def _device_filename_map(self) -> dict[str, str]:
+        """Each book's filename on the device: the manifest disambiguates names across every
+        reader's books, so a per-reader map would hash another reader's file."""
+        return self._build_manifest_filename_map(self._get_active_books(all_users=True))
 
     @staticmethod
     def _safe_file_size(path) -> Optional[int]:
@@ -92,12 +97,11 @@ class KOReaderDeviceSyncService:
         items = []
 
         for book in books:
-            resolved = self._resolve_download_artifact(book)
-            if not resolved:
-                continue
-
             filename = filename_map.get(str(book.abs_id))
             if not filename:
+                continue
+            resolved = self._resolve_download_artifact(book, device_filename=filename)
+            if not resolved:
                 continue
 
             items.append({
@@ -132,11 +136,10 @@ class KOReaderDeviceSyncService:
         if not book or getattr(book, "status", None) != "active":
             return None
 
-        resolved = self._resolve_download_artifact(book)
+        filename = self._resolve_manifest_filename(book)
+        resolved = self._resolve_download_artifact(book, device_filename=filename)
         if not resolved:
             return None
-
-        filename = self._resolve_manifest_filename(book)
         mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
         return {
             "path": resolved["path"],
@@ -147,7 +150,7 @@ class KOReaderDeviceSyncService:
 
     def _resolve_manifest_filename(self, target_book) -> str:
         target_abs_id = str(target_book.abs_id)
-        filename_map = self._build_manifest_filename_map(self._get_active_books())
+        filename_map = self._device_filename_map()
         if target_abs_id in filename_map:
             return filename_map[target_abs_id]
         source_filename = self._select_source_filename(target_book) or f"{target_abs_id}.epub"
@@ -218,7 +221,7 @@ class KOReaderDeviceSyncService:
                     return cached[2]
 
         try:
-            content_hash = self.ebook_parser.get_kosync_id(source_path)
+            content_hash = self.ebook_parser.get_kosync_content_id(source_path)
         except Exception as e:
             logger.warning(
                 "KOReader device-sync could not compute content hash for '%s': %s",
@@ -235,7 +238,8 @@ class KOReaderDeviceSyncService:
         return content_hash
 
     def _resolve_download_artifact(self, book, link_hashes: bool = True,
-                                   allow_revalidation: bool = False) -> Optional[dict]:
+                                   allow_revalidation: bool = False,
+                                   device_filename: Optional[str] = None) -> Optional[dict]:
         source_filename = self._select_source_filename(book)
         if not source_filename:
             return None
@@ -259,6 +263,7 @@ class KOReaderDeviceSyncService:
             )
             return None
 
+        kosync_hash = self._kosync_hash_for(book, content_hash, device_filename)
         stored_hash = self._select_content_hash(book)
         abs_id = str(getattr(book, "abs_id", "") or "").strip()
 
@@ -266,10 +271,14 @@ class KOReaderDeviceSyncService:
         # downloaded it via BridgeSync links to this book regardless of which hash the
         # primary book.kosync_doc_id column currently points at.
         linked = False
-        if abs_id and content_hash and link_hashes:
-            linked = self._link_sibling_hash(abs_id, content_hash)
+        if abs_id and kosync_hash and link_hashes:
+            linked = self._link_sibling_hash(abs_id, kosync_hash)
+            # KOReader's statistics, reading statuses and highlights name a book by
+            # its content hash in either hash method, so link that one too.
+            if content_hash != kosync_hash:
+                self._link_sibling_hash(abs_id, content_hash, adopt_only=True)
 
-        if stored_hash and stored_hash != content_hash:
+        if stored_hash and kosync_hash and stored_hash != kosync_hash:
             # The primary hash may deliberately identify a different EPUB build, such
             # as a manually pinned or Storyteller-forged copy. Keep it primary and link
             # both hashes as siblings; GET/PUT resolution aggregates progress across
@@ -281,23 +290,39 @@ class KOReaderDeviceSyncService:
                 "(stored hash %s; served hash %s linked as sibling)",
                 sanitize_log_data(getattr(book, "abs_title", None) or abs_id),
                 sanitize_log_data(stored_hash),
-                sanitize_log_data(content_hash),
+                sanitize_log_data(kosync_hash),
             )
 
         return {
             "path": source_path,
             "source_filename": source_filename,
             "content_hash": content_hash,
+            "kosync_hash": kosync_hash,
             "linked": linked,
         }
 
-    def _link_sibling_hash(self, abs_id: str, doc_hash: str) -> bool:
+    def _kosync_hash_for(self, book, content_hash: str, device_filename: Optional[str] = None) -> Optional[str]:
+        """The hash a device reports for this book over KoSync.
+
+        In filename mode KOReader hashes the name of the file on the device, which
+        BridgeSync saves under the manifest filename, not the library's.
+        """
+        if getattr(self.ebook_parser, "hash_method", None) != "filename":
+            return content_hash
+        filename = device_filename or self._resolve_manifest_filename(book)
+        return str(self.ebook_parser.get_kosync_id(Path(filename)) or "").strip() or None
+
+    def _link_sibling_hash(self, abs_id: str, doc_hash: str, adopt_only: bool = False) -> bool:
         """Ensure ``doc_hash`` exists as a KosyncDocument linked to ``abs_id`` (best effort).
 
         Returns True when a row was created or its link changed, so callers can
-        report how much drift a reconcile pass actually repaired.
+        report how much drift a reconcile pass actually repaired. ``adopt_only``
+        never takes a hash another book owns: in filename mode every book served
+        from the same file shares one content hash.
         """
         try:
+            if adopt_only:
+                return bool(self.database_service.adopt_kosync_document_if_unowned(doc_hash, abs_id))
             return bool(self.database_service.ensure_linked_kosync_document(doc_hash, abs_id))
         except Exception as e:
             logger.debug(
@@ -321,8 +346,10 @@ class KOReaderDeviceSyncService:
         """
         summary = {"checked": 0, "linked": 0, "skipped": 0, "errors": 0, "conflicts": 0}
         claimed_by: Dict[str, str] = {}
+        books = self._get_active_books()
+        filename_map = self._device_filename_map()
 
-        for book in self._get_active_books():
+        for book in books:
             summary["checked"] += 1
             label = sanitize_log_data(getattr(book, "abs_title", None) or getattr(book, "abs_id", None))
             try:
@@ -331,7 +358,8 @@ class KOReaderDeviceSyncService:
                 # path allowed to re-download an expired copy: it runs in the
                 # background, never inside a device request.
                 resolved = self._resolve_download_artifact(
-                    book, link_hashes=False, allow_revalidation=True
+                    book, link_hashes=False, allow_revalidation=True,
+                    device_filename=filename_map.get(str(getattr(book, "abs_id", ""))),
                 )
             except Exception as e:
                 summary["errors"] += 1
@@ -342,30 +370,38 @@ class KOReaderDeviceSyncService:
                 summary["skipped"] += 1
                 continue
 
-            content_hash = resolved.get("content_hash")
+            doc_hash = resolved.get("kosync_hash")
             abs_id = str(getattr(book, "abs_id", "") or "").strip()
-            if not content_hash or not abs_id:
+            if not doc_hash or not abs_id:
                 summary["skipped"] += 1
                 continue
 
-            # Two active books resolving to the same file would otherwise steal the
-            # hash from each other on every pass. That is a catalogue mis-mapping, not
-            # drift: leave the existing link alone and surface it instead.
-            owner = claimed_by.get(content_hash)
-            if owner and owner != abs_id:
-                summary["conflicts"] += 1
-                logger.warning(
-                    "🔗 Hash reconcile: '%s' resolves to the same file as '%s' (hash %s) — "
-                    "leaving the existing link alone; check these books' ebook mapping",
-                    label, sanitize_log_data(owner), sanitize_log_data(content_hash),
-                )
-                continue
-            claimed_by[content_hash] = abs_id
+            # In filename mode the content hash differs and is bound too, for the
+            # reader statistics, statuses and highlights that use it.
+            hashes = [doc_hash]
+            content_hash = resolved.get("content_hash")
+            if content_hash and content_hash != doc_hash:
+                hashes.append(content_hash)
 
-            if self._link_sibling_hash(abs_id, content_hash):
-                summary["linked"] += 1
-                logger.info("🔗 Hash reconcile: bound new hash %s to '%s'",
-                            sanitize_log_data(content_hash), label)
+            for bound_hash in hashes:
+                # Two active books resolving to the same file would otherwise steal the
+                # hash from each other on every pass. That is a catalogue mis-mapping, not
+                # drift: leave the existing link alone and surface it instead.
+                owner = claimed_by.get(bound_hash)
+                if owner and owner != abs_id:
+                    summary["conflicts"] += 1
+                    logger.warning(
+                        "🔗 Hash reconcile: '%s' resolves to the same file as '%s' (hash %s) — "
+                        "leaving the existing link alone; check these books' ebook mapping",
+                        label, sanitize_log_data(owner), sanitize_log_data(bound_hash),
+                    )
+                    continue
+                claimed_by[bound_hash] = abs_id
+
+                if self._link_sibling_hash(abs_id, bound_hash, adopt_only=bound_hash != doc_hash):
+                    summary["linked"] += 1
+                    logger.info("🔗 Hash reconcile: bound new hash %s to '%s'",
+                                sanitize_log_data(bound_hash), label)
 
         logger.info(
             "🔗 Hash reconcile: checked=%d linked=%d skipped=%d conflicts=%d errors=%d",

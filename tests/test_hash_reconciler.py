@@ -67,14 +67,14 @@ class TestReconcileHashes(unittest.TestCase):
             bookorbit_client=MagicMock(),
         )
         self.books = [_book("a", "Book A"), _book("b", "Book B")]
-        self.service._get_active_books = lambda: list(self.books)
+        self.service._get_active_books = lambda all_users=False: list(self.books)
 
     def test_counts_only_newly_linked_hashes(self):
         results = {
-            "a": {"path": Path("a"), "content_hash": "hash-a"},
-            "b": {"path": Path("b"), "content_hash": "hash-b"},
+            "a": {"path": Path("a"), "content_hash": "hash-a", "kosync_hash": "hash-a"},
+            "b": {"path": Path("b"), "content_hash": "hash-b", "kosync_hash": "hash-b"},
         }
-        self.service._resolve_download_artifact = lambda book, link_hashes=True, allow_revalidation=False: results[book.abs_id]
+        self.service._resolve_download_artifact = lambda book, link_hashes=True, allow_revalidation=False, device_filename=None: results[book.abs_id]
         self.service.database_service.ensure_linked_kosync_document.side_effect = [True, False]
 
         summary = self.service.reconcile_hashes()
@@ -87,11 +87,11 @@ class TestReconcileHashes(unittest.TestCase):
     def test_failing_book_does_not_abort_the_pass(self):
         seen = []
 
-        def resolve(book, link_hashes=True, allow_revalidation=False):
+        def resolve(book, link_hashes=True, allow_revalidation=False, device_filename=None):
             seen.append(book.abs_id)
             if book.abs_id == "a":
                 raise RuntimeError("boom")
-            return {"path": Path("b"), "content_hash": "hash-b"}
+            return {"path": Path("b"), "content_hash": "hash-b", "kosync_hash": "hash-b"}
 
         self.service._resolve_download_artifact = resolve
         self.service.database_service.ensure_linked_kosync_document.return_value = True
@@ -104,7 +104,7 @@ class TestReconcileHashes(unittest.TestCase):
         self.assertEqual(summary["checked"], 2)
 
     def test_unresolvable_book_counts_as_skipped(self):
-        self.service._resolve_download_artifact = lambda book, link_hashes=True, allow_revalidation=False: None
+        self.service._resolve_download_artifact = lambda book, link_hashes=True, allow_revalidation=False, device_filename=None: None
 
         summary = self.service.reconcile_hashes()
 
@@ -118,8 +118,8 @@ class TestReconcileHashes(unittest.TestCase):
         Observed live: 'Northern Reach' and 'Salt Marsh' both pointed at the same EPUB,
         so each pass rebound the same hash to whichever book came last.
         """
-        same = {"path": Path("shared"), "content_hash": "shared-hash"}
-        self.service._resolve_download_artifact = lambda book, link_hashes=True, allow_revalidation=False: dict(same)
+        same = {"path": Path("shared"), "content_hash": "shared-hash", "kosync_hash": "shared-hash"}
+        self.service._resolve_download_artifact = lambda book, link_hashes=True, allow_revalidation=False, device_filename=None: dict(same)
         self.service.database_service.ensure_linked_kosync_document.return_value = True
 
         summary = self.service.reconcile_hashes()
@@ -131,13 +131,34 @@ class TestReconcileHashes(unittest.TestCase):
             "the second book must not rebind the shared hash",
         )
 
+    def test_two_books_sharing_one_file_keep_their_filename_hashes(self):
+        """In filename mode each book has its own filename hash; only the shared
+        content hash is withheld from the second book."""
+        results = {
+            "a": {"path": Path("shared"), "content_hash": "shared-hash", "kosync_hash": "name-a"},
+            "b": {"path": Path("shared"), "content_hash": "shared-hash", "kosync_hash": "name-b"},
+        }
+        self.service._resolve_download_artifact = lambda book, link_hashes=True, allow_revalidation=False, device_filename=None: results[book.abs_id]
+        db = self.service.database_service
+        db.ensure_linked_kosync_document.return_value = True
+        db.adopt_kosync_document_if_unowned.return_value = True
+
+        summary = self.service.reconcile_hashes()
+
+        linked = [c.args for c in db.ensure_linked_kosync_document.call_args_list]
+        self.assertEqual(linked, [("name-a", "a"), ("name-b", "b")])
+        adopted = [c.args for c in db.adopt_kosync_document_if_unowned.call_args_list]
+        self.assertEqual(adopted, [("shared-hash", "a")])
+        self.assertEqual(summary["conflicts"], 1)
+        self.assertEqual(summary["linked"], 3)
+
     def test_resolution_during_reconcile_does_not_link_internally(self):
         """reconcile must resolve with link_hashes=False so it can veto a conflict."""
         captured = {}
 
-        def resolve(book, link_hashes=True, allow_revalidation=False):
+        def resolve(book, link_hashes=True, allow_revalidation=False, device_filename=None):
             captured[book.abs_id] = link_hashes
-            return {"path": Path("p"), "content_hash": f"hash-{book.abs_id}"}
+            return {"path": Path("p"), "content_hash": f"hash-{book.abs_id}", "kosync_hash": f"hash-{book.abs_id}"}
 
         self.service._resolve_download_artifact = resolve
         self.service.database_service.ensure_linked_kosync_document.return_value = False

@@ -6,6 +6,7 @@ Unit test for the "no changes detected" scenario using unittest.TestCase.
 import unittest
 import sys
 from pathlib import Path
+from unittest.mock import patch
 # Add the project root to the path to resolve module imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -71,6 +72,81 @@ class TestNoChangesDetectedSync(BaseSyncCycleTestCase):
         log_output = super().run_test(None, None)
         self.assertNotIn("States saved to database", log_output,
                       "Logs should show no change")
+
+    def test_instant_sync_compares_positions_on_the_audio_timeline(self):
+        """Equal raw percentages can be different places: a book whose EPUB has a lot of
+        unnarrated back matter. A read event's instant sync must still resolve that."""
+        normalized = {"ABS": 250.0, "KoSync": 400.0}
+        with patch("src.sync_manager.SyncManager._normalize_for_cross_format_comparison",
+                   return_value=normalized):
+            log_output = super().run_test(None, None, target_abs_id="test-abs-id-nochange")
+        self.assertIn("Change detected", log_output)
+        self.assertIn("KoSync leads", log_output)
+
+    def test_issue_531_kosync_put_equal_percentages_must_push_audio(self):
+        """A saved KoSync PUT at 12.22% is ~1287 audio seconds beyond ABS at 12.25%."""
+        states = self.get_test_state_data()
+        states['abs'].update(pct=0.1225, ts=4112.8)
+        states['kosync'].update(pct=0.1222)
+        states['storyteller'].update(pct=0.1222)
+        states['booklore'].update(pct=0.1222)
+        progress = self.get_progress_mock_returns()
+        progress['abs_progress'] = {'ebookProgress': 0.1225, 'currentTime': 4112.8}
+        progress['abs_in_progress'] = [{'id': 'test-abs-id-nochange', 'progress': 0.1225, 'duration': 33573.9}]
+        progress['kosync_progress'] = (0.1222, '/html/body/div[1]/p[6]')
+        progress['storyteller_progress'] = (0.1222, 12.22, 'ch2', 'frag2')
+        progress['booklore_progress'] = (0.1222, None)
+        normalized = {'ABS': 4112.8, 'KoSync': 5400.0}
+        self.test_book.duration = 33573.9
+        with patch.object(self, 'get_progress_mock_returns', return_value=progress), \
+                patch('src.sync_manager.SyncManager._normalize_for_cross_format_comparison',
+                      return_value=normalized):
+            self.test_states = [
+                type(state)(abs_id=state.abs_id, client_name=state.client_name,
+                            last_updated=state.last_updated,
+                            percentage=states[state.client_name]['pct'],
+                            timestamp=states[state.client_name].get('ts'))
+                for state in self.test_states
+            ]
+            log_output = super().run_test(None, None, target_abs_id='test-abs-id-nochange')
+        self.assertIn('Positions differ by 1287.2s', log_output)
+        self.assertIn('KoSync leads', log_output)
+
+    def test_instant_sync_audio_ahead_never_rewinds_to_ebook(self):
+        """Equal raw percentages cannot make a quiet ebook rewind audio ahead of it."""
+        # An earlier test's push to ABS would mark ABS as our own write-back (Guard 3).
+        from src.services import write_tracker
+        with write_tracker._writes_lock:
+            write_tracker._recent_writes.clear()
+        self.addCleanup(write_tracker._recent_writes.clear)
+        normalized = {"ABS": 400.0, "KoSync": 250.0}
+        with patch("src.sync_manager.SyncManager._normalize_for_cross_format_comparison",
+                   return_value=normalized):
+            log_output = super().run_test(None, None, target_abs_id="test-abs-id-nochange")
+        self.assertIn("Change detected", log_output)
+        self.assertIn("ABS leads", log_output)
+        self.assertNotIn("KoSync leads", log_output)
+
+    def test_instant_sync_with_a_gap_below_the_threshold_changes_nothing(self):
+        """Guard: 4s apart is past the 2s deadband but under 0.5% of the 1000s book."""
+        normalized = {"ABS": 250.0, "KoSync": 254.0}
+        with patch("src.sync_manager.SyncManager._normalize_for_cross_format_comparison",
+                   return_value=normalized):
+            log_output = super().run_test(None, None, target_abs_id="test-abs-id-nochange")
+        self.assertNotIn("Change detected", log_output)
+
+    def test_instant_sync_leaves_a_small_audio_move_to_the_thresholds(self):
+        """Guard: ABS moved, but by less than its threshold. The timeline gap must not
+        let that small move lead and rewind the reader."""
+        normalized = {"ABS": 251.4, "KoSync": 400.0}
+        returns = {**self.get_progress_mock_returns(),
+                   'abs_progress': {'ebookProgress': 0.25, 'currentTime': 251.4}}
+        with patch("src.sync_manager.SyncManager._normalize_for_cross_format_comparison",
+                   return_value=normalized), \
+                patch.object(self, "get_progress_mock_returns", return_value=returns):
+            log_output = super().run_test(None, None, target_abs_id="test-abs-id-nochange")
+        self.assertIn("Below threshold", log_output)
+        self.assertNotIn("Change detected", log_output)
 
 
 if __name__ == '__main__':

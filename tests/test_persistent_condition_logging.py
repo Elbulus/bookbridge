@@ -239,8 +239,24 @@ class TestPersistentConditionLoggerThreadSafety(unittest.TestCase):
     """Smoke test proving the single lock serializes concurrent increments."""
 
     def test_concurrent_warn_calls_produce_correct_total_count(self):
+        class CountingLogger:
+            """MagicMock's call counters are not thread-safe (CI saw 784 of 999)."""
+
+            def __init__(self):
+                self._lock = threading.Lock()
+                self.log_calls = 0
+                self.debug_calls = 0
+
+            def log(self, *args, **kwargs):
+                with self._lock:
+                    self.log_calls += 1
+
+            def debug(self, *args, **kwargs):
+                with self._lock:
+                    self.debug_calls += 1
+
         pcl = PersistentConditionLogger()
-        logger = MagicMock()
+        logger = CountingLogger()
         key = "concurrent-key"
         iterations = 500
 
@@ -261,8 +277,8 @@ class TestPersistentConditionLoggerThreadSafety(unittest.TestCase):
         self.assertEqual(total, iterations * 2)
         # If increments were racy, either >1 call could see count==1 (double
         # WARNING) or a count could be skipped/duplicated (wrong DEBUG total).
-        self.assertEqual(logger.log.call_count, 1)
-        self.assertEqual(logger.debug.call_count, iterations * 2 - 1)
+        self.assertEqual(logger.log_calls, 1)
+        self.assertEqual(logger.debug_calls, iterations * 2 - 1)
 
 
 class TestGetPersistentConditionLoggerSingleton(unittest.TestCase):
@@ -556,13 +572,13 @@ class TestCWAGetBookByIdPersistentCondition(unittest.TestCase):
         mock_get.return_value = not_found
 
         with self.assertLogs("src.api.cwa_client", level="DEBUG") as logs:
-            self.client.get_book_by_id("missing-book")
-            self.client.get_book_by_id("missing-book")
+            self.client.get_book_by_id("9999")
+            self.client.get_book_by_id("9999")
 
         warnings = [l for l in logs.output if l.startswith("WARNING") and "CWA metadata lookup failed" in l]
         debugs = [l for l in logs.output if l.startswith("DEBUG") and "CWA metadata lookup failed" in l]
         self.assertEqual(len(warnings), 1)
-        self.assertIn("ID 'missing-book'", warnings[0])
+        self.assertIn("ID '9999'", warnings[0])
         self.assertEqual(len(debugs), 1)
 
     @patch("requests.Session.get")
@@ -573,8 +589,8 @@ class TestCWAGetBookByIdPersistentCondition(unittest.TestCase):
         mock_get.return_value = not_found
 
         with self.assertLogs("src.api.cwa_client", level="DEBUG") as logs:
-            self.client.get_book_by_id("first-bad-id")
-            self.client.get_book_by_id("some-other-bad-id")
+            self.client.get_book_by_id("1001")
+            self.client.get_book_by_id("1002")
 
         warnings = [l for l in logs.output if l.startswith("WARNING") and "CWA metadata lookup failed" in l]
         self.assertEqual(len(warnings), 1)

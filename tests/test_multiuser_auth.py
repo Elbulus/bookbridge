@@ -1042,7 +1042,8 @@ class TestMultiUserAuth(unittest.TestCase):
 
         ebook_parser = MagicMock()
         ebook_parser.resolve_book_path.return_value = ebook_path
-        ebook_parser.get_kosync_id.return_value = "original-content-hash"
+        ebook_parser.hash_method = "content"
+        ebook_parser.get_kosync_content_id.return_value = "original-content-hash"
         service = KOReaderDeviceSyncService(
             database_service=self.svc,
             ebook_parser=ebook_parser,
@@ -1744,6 +1745,13 @@ class TestCoverProxyUserIsolation(unittest.TestCase):
         resp = self.client.get('/api/bookorbit/audiobook-cover/bo-audio-1')
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.data, b"bookorbit-cover")
+
+    def test_bookorbit_cover_is_cacheable_by_the_browser(self):
+        """Each visit to a page of covers re-fetched every one from BookOrbit."""
+        self._login("reg", "pw")
+        resp = self.client.get('/api/bookorbit/audiobook-cover/bo-audio-1')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.headers.get('Cache-Control'), 'private, max-age=300')
 
 
 class TestForgeActiveUserIsolation(unittest.TestCase):

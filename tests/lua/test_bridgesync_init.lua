@@ -702,6 +702,63 @@ assert(bridge.session_upload_attempts["still-queued"] == 2,
 assert(bridge.session_upload_attempts["gone"] == nil,
     "pruning kept the counter for a session that is no longer queued")
 
+-- A book the reader added outside Bridge Sync is identified by hash. With
+-- KOReader's progress sync on filename checksums, the bridge links that
+-- filename hash to the book, so a session carrying the content hash instead
+-- was rejected as book_not_found and its reading time lost.
+do
+    local LuaSettings = require("luasettings")
+    local original_open = LuaSettings.open
+    local kosync_settings
+    LuaSettings.open = function(self, path)
+        if path == settings_dir .. "/kosync.lua" then
+            return { readSetting = function(_, key)
+                if key == "settings" then return kosync_settings end
+            end }
+        end
+        return original_open(self, path)
+    end
+
+    local managed = {}
+    local reader = BridgeSync:new{
+        is_enabled = true,
+        session_tracking_enabled = true,
+        ui = { document = { file = "/storage/emulated/0/Documents/David Scott Hay - The Butcher of Nazareth.epub", info = {} } },
+        _resolveAbsId = function(_, path) return managed[path] end,
+        _calculateBookHash = function() return "content-hash" end,
+        logInfo = function() end,
+    }
+    local function session_hash()
+        reader:startSession()
+        return reader.current_session.document_hash
+    end
+
+    kosync_settings = { checksum_method = 1 }
+    assert(session_hash() == "David Scott Hay - The Butcher of Nazareth.epub",
+        "with filename checksums a session must carry the hash of the file name")
+    kosync_settings = { checksum_method = 0 }
+    assert(session_hash() == "content-hash",
+        "with binary checksums a session must keep the content hash")
+    kosync_settings = nil
+    assert(session_hash() == "content-hash",
+        "without KOReader sync settings a session must keep the content hash")
+
+    -- KOReader kept these settings in the reader settings until its 20260623 migration.
+    G_reader_settings = { readSetting = function(_, key)
+        if key == "kosync" then return { checksum_method = 1 } end
+    end }
+    assert(session_hash() == "David Scott Hay - The Butcher of Nazareth.epub",
+        "an older KOReader's filename checksum setting must be honored too")
+    G_reader_settings = nil
+
+    kosync_settings = { checksum_method = 1 }
+    managed[reader.ui.document.file] = "abs-1"
+    assert(session_hash() == nil and reader.current_session.abs_id == "abs-1",
+        "a managed download is identified by its abs_id, not a hash")
+
+    LuaSettings.open = original_open
+end
+
 -- Drive the real manifest sweep: failed publication must keep the old file,
 -- its progress sidecar and its tracked entry, and leave the revision retryable.
 local function file_bytes(path)
@@ -915,6 +972,96 @@ do
         "the next sync must retain Household Inheritance without downloading it again")
     SQLite.new = original_new
     os.remove(target)
+end
+
+-- A reader's own copies report their hash pairs before the status exchange, so
+-- the bridge has linked them by the time merged statuses come back.
+do
+    local calls = {}
+    local logged = {}
+    local reader = BridgeSync:new{
+        api = {
+            uploadHashPairs = function(_, payload)
+                calls[#calls + 1] = "pairs"
+                assert(payload.device == "reader" and payload.device_id == "device-1",
+                    "the pair upload must carry the device identity")
+                assert(#payload.pairs == 1 and payload.pairs[1].content_hash == "c1",
+                    "the pair upload must carry the history pairs")
+                return true, { linked = 1, unresolved = 0 }
+            end,
+        },
+        _currentDeviceIdentity = function() return "reader", "device-1" end,
+        _collectStatisticsPayload = function() return { page_stats = {}, books = {}, device_key = "reader" } end,
+        _mergeForeignStatistics = function() return {} end,
+        _historyHashPairs = function()
+            return { { content_hash = "c1", filename_hash = "f1", filename = "Own.epub" } }, { c1 = "/docs/Own.epub" }
+        end,
+        _runBookStatusSync = function() calls[#calls + 1] = "status"; return {} end,
+        logInfo = function() end,
+        logWarn = function(_, ...) logged[#logged + 1] = table.concat({ ... }, " ") end,
+    }
+
+    reader:_runStatisticsSync({})
+    assert(calls[1] == "pairs" and calls[2] == "status",
+        "hash pairs must upload before the status exchange, got " .. table.concat(calls, ","))
+
+    calls, logged = {}, {}
+    reader.api.uploadHashPairs = function() calls[#calls + 1] = "pairs"; return false, "HTTP 500" end
+    reader:_runStatisticsSync({})
+    assert(calls[2] == "status", "a failed pair upload must not stop the status exchange")
+    assert(#logged > 0 and logged[1]:find("HTTP 500", 1, true), "a failed pair upload must be logged")
+
+    -- Status sync sees the reader's own copies; a managed copy wins a shared hash.
+    reader._buildHashIndex = function() return { shared = "/managed/Book.epub" } end
+    reader._historyHashPairs = function()
+        return {}, { shared = "/docs/Book.epub", own = "/docs/Own.epub" }
+    end
+    local index = reader:_buildLibraryHashIndex()
+    assert(index.shared == "/managed/Book.epub", "the managed copy must win a shared content hash")
+    assert(index.own == "/docs/Own.epub", "the library index must include the reader's own copies")
+end
+
+-- One stats sync reads the history sidecars once, for both the pair upload and
+-- the status exchange.
+do
+    local BookStatus = require("bridge_book_status")
+    local original_collect = BookStatus.collect
+    local original_apply = BookStatus.apply
+    local history_reads = 0
+    local status_index
+    BookStatus.collect = function(hash_index) status_index = hash_index; return {} end
+    BookStatus.apply = function() return { applied = 0, unchanged = 0, deferred = 0, errors = 0 } end
+    local reader = BridgeSync:new{
+        api = {
+            uploadHashPairs = function() return true, { linked = 0, unresolved = 0 } end,
+            uploadBookStatus = function() return true, { accepted = 0 } end,
+            getMergedBookStatus = function() return true, { books = {} } end,
+        },
+        _currentDeviceIdentity = function() return "reader", "device-1" end,
+        _collectStatisticsPayload = function() return { page_stats = {}, books = {}, device_key = "reader" } end,
+        _mergeForeignStatistics = function() return {} end,
+        _buildHashIndex = function() return {} end,
+        _currentDocumentPath = function() return nil end,
+        _historyHashPairs = function()
+            history_reads = history_reads + 1
+            return { { content_hash = "c1", filename_hash = "f1", filename = "Own.epub" } }, { c1 = "/docs/Own.epub" }
+        end,
+        logInfo = function() end,
+        logWarn = function() end,
+    }
+
+    reader:_runStatisticsSync({})
+    assert(history_reads == 1, "a stats sync must read the history sidecars once, read " .. history_reads)
+    assert(status_index and status_index.c1 == "/docs/Own.epub",
+        "the status exchange must still see the reader's own copies")
+
+    status_index = nil
+    reader._historyHashPairs = function() error("history unreadable") end
+    local result = reader:_runStatisticsSync({})
+    BookStatus.collect = original_collect
+    BookStatus.apply = original_apply
+    assert(status_index and not result.status_error,
+        "an unreadable history must not stop the status exchange")
 end
 
 print("BridgeSync Lua init regression test passed")

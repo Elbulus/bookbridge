@@ -13,7 +13,7 @@ import threading
 import time
 import unicodedata
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 from contextlib import contextmanager
@@ -58,6 +58,9 @@ from src.utils.time_utils import utcnow
 
 logger = logging.getLogger(__name__)
 
+# Default for adopt_kosync_document_if_unowned: None is a real owner (no user).
+_ANY_USER = object()
+
 # Reading-session buffer delivery destinations, mapped to the status column each
 # one owns. A buffered session is delivered to these independently, so one being
 # unreachable never holds up or duplicates the other.
@@ -66,6 +69,9 @@ _EBOOK_INPUT_RECOVERY_IDENTITY_FIELDS = (
     "ebook_source", "ebook_source_id", "ebook_filename", "original_ebook_filename",
     "kosync_doc_id", "sync_mode",
 )
+
+# Audio positions are exact, so 99% is the end (KOReader's page-count finish uses 95%).
+_LISTENING_FINISHED_PROGRESS = 0.99
 
 _READING_SESSION_DESTINATIONS = {
     "grimmory": "grimmory_status",
@@ -494,6 +500,17 @@ class DatabaseService:
             if not user:
                 return False
             user.password_hash = generate_password_hash(password) if password else None
+            return True
+
+    def set_user_language(self, user_id: int, language: Optional[str]) -> bool:
+        """Set the account's UI language. Pass None/'' to clear the choice (the
+        locale selector then falls back to Accept-Language, then English).
+        Returns False when the account no longer exists."""
+        with self.get_session() as session:
+            user = session.query(User).filter(User.id == user_id).first()
+            if not user:
+                return False
+            user.language = (language or "").strip() or None
             return True
 
     def update_user_account(self, user_id: int, *, password: Optional[str] = None,
@@ -1606,6 +1623,84 @@ class DatabaseService:
             for book in books:
                 session.expunge(book)
             return books
+
+    @staticmethod
+    def _pending_alignment_order(books: list[Book]) -> list[Book]:
+        """Sort positioned books first, preserving original DB order for ties/NULLs."""
+        return sorted(books, key=lambda book: (
+            book.alignment_queue_position is None,
+            book.alignment_queue_position if book.alignment_queue_position is not None else 0.0,
+        ))
+
+    def get_pending_alignment_queue(self) -> list[Book]:
+        """Return all pending books in the order considered by the alignment worker.
+
+        Books without a position follow positioned rows in the same order as
+        the previous pending-book query. Reading does not assign positions.
+        """
+        with self.get_session() as session:
+            books = self._pending_alignment_order(
+                session.query(Book).filter(Book.status == 'pending').all()
+            )
+            for book in books:
+                session.expunge(book)
+            return books
+
+    def move_pending_alignment_book(self, user_id: int, abs_id: str,
+                                    direction: str) -> str:
+        """Move a claimed, user-owned pending book within that user's slots.
+
+        Initialize positions for every pending book in effective order before
+        moving, in one transaction. Foreign books retain their exact slots.
+        Return 'missing' for unclaimed/non-owned/nonpending/invalid requests.
+        """
+        if direction not in {'up', 'down', 'top'} or not abs_id or user_id is None:
+            return 'missing'
+        with self.get_session() as session:
+            pending = self._pending_alignment_order(
+                session.query(Book).filter(Book.status == 'pending').all()
+            )
+            if not any(book.abs_id == abs_id for book in pending):
+                return 'missing'
+            owned_ids = {
+                row[0] for row in session.query(UserBook.abs_id).filter(
+                    UserBook.user_id == user_id
+                ).all()
+            }
+            owned_slots = [
+                index for index, book in enumerate(pending)
+                if book.user_id == user_id and book.abs_id in owned_ids
+            ]
+            owned_positions = [
+                index for index in owned_slots if pending[index].abs_id == abs_id
+            ]
+            if not owned_positions:
+                return 'missing'
+            # Canonicalize the entire pending queue; subsequent moves preserve
+            # other users' positions, and new NULL entries always join the back.
+            for index, book in enumerate(pending):
+                book.alignment_queue_position = float(index + 1)
+            owner_index = owned_slots.index(owned_positions[0])
+            destination = {
+                'up': max(0, owner_index - 1),
+                'down': min(len(owned_slots) - 1, owner_index + 1),
+                'top': 0,
+            }[direction]
+            if owner_index == destination:
+                return 'unchanged'
+            owner_books = [pending[index] for index in owned_slots]
+            owner_books.insert(destination, owner_books.pop(owner_index))
+            for index, book in zip(owned_slots, owner_books):
+                book.alignment_queue_position = float(index + 1)
+            return 'moved'
+
+    def clear_alignment_queue_position(self, abs_id: str) -> None:
+        """Discard a selected book's queue position so requeueing joins the back."""
+        with self.get_session() as session:
+            session.query(Book).filter(Book.abs_id == abs_id).update(
+                {Book.alignment_queue_position: None},
+                synchronize_session=False,
+            )
 
     @staticmethod
     def ebook_input_recovery_identity(book: Book | dict) -> str:
@@ -2953,6 +3048,44 @@ class DatabaseService:
                 return True
             return False
 
+    def adopt_kosync_document_if_unowned(
+        self, document_hash: str, abs_id: str, expected_storyteller_uuid: Optional[str] = None,
+        owner_user_id: object = _ANY_USER,
+    ) -> bool:
+        """Atomically adopt an unowned hash for an existing, optionally UUID-matched book.
+
+        With ``owner_user_id``, an existing row is adopted only when it belongs to no
+        user or to that user, so another reader's document is never linked.
+        """
+        if not document_hash or not abs_id:
+            return False
+        from sqlalchemy import exists, literal, or_, select
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        target = select(Book.abs_id).where(Book.abs_id == abs_id)
+        if expected_storyteller_uuid is not None:
+            target = target.where(Book.storyteller_uuid == expected_storyteller_uuid)
+        foreign_primary = exists().where(Book.kosync_doc_id == document_hash, Book.abs_id != abs_id)
+        adoptable = KosyncDocument.linked_abs_id.is_(None)
+        if owner_user_id is not _ANY_USER:
+            adoptable = adoptable & or_(
+                KosyncDocument.user_id.is_(None), KosyncDocument.user_id == owner_user_id,
+            )
+        now = utcnow()
+        stmt = sqlite_insert(KosyncDocument).from_select(
+            ["document_hash", "linked_abs_id", "first_seen", "last_updated"],
+            select(literal(document_hash), literal(abs_id), literal(now), literal(now)).where(
+                target.exists(), ~foreign_primary,
+            ),
+        )
+        with self.get_session() as session:
+            result = session.execute(stmt.on_conflict_do_update(
+                index_elements=["document_hash"],
+                set_={"linked_abs_id": abs_id, "last_updated": now},
+                where=adoptable,
+            ))
+            return bool(result.rowcount)
+
     def ensure_linked_kosync_document(self, document_hash: str, abs_id: str) -> bool:
         """Ensure a KosyncDocument row exists for ``document_hash`` and is linked to ``abs_id``.
 
@@ -4252,6 +4385,11 @@ class DatabaseService:
         Returns ``[{md5, status, modified, source_device_key}]``. A device applies
         any entry whose status differs from its own sidecar; entries it already
         agrees with are a no-op there, so no per-device filtering happens here.
+
+        A hash linked to a book but with no status of its own (a copy the reader has
+        not opened yet) gets the book's winner. A copy that has its own status keeps
+        it: a status inferred from position must only fill a gap, never overrule a
+        decision made on another copy.
         """
         uid = self._resolve_uid(user_id)
         md5s = {str(m).strip() for m in (md5s or set()) if str(m).strip()}
@@ -4259,7 +4397,9 @@ class DatabaseService:
 
         # Select columns rather than ORM instances: the ranking below happens after
         # the session closes, and a detached instance would raise on attribute
-        # access the moment it needed a refresh.
+        # access the moment it needed a refresh. The md5 filter is applied to the
+        # result, not the query, because a requested copy can take its status from
+        # a sibling copy's row.
         with self.get_session() as session:
             query = session.query(
                 KOReaderBookStatus.md5,
@@ -4269,26 +4409,62 @@ class DatabaseService:
                 KOReaderBookStatus.received_at,
             )
             query = self._scope_koreader_user(query, KOReaderBookStatus, uid)
-            if md5s:
-                query = query.filter(KOReaderBookStatus.md5.in_(md5s))
             rows = query.all()
 
-        best: dict[str, tuple] = {}
-        for row in rows:
-            current = best.get(row.md5)
-            if current is None or self._koreader_status_sort_key(row) > self._koreader_status_sort_key(current):
-                best[row.md5] = row
+            best: dict[str, tuple] = {}
+            for row in rows:
+                current = best.get(row.md5)
+                if current is None or self._koreader_status_sort_key(row) > self._koreader_status_sort_key(current):
+                    best[row.md5] = row
 
-        winners = sorted(best.values(), key=lambda r: r.md5)[:limit]
+            hashes_by_book = self._linked_hashes_by_book(session, set(best))
+
+        for hashes in hashes_by_book.values():
+            book_best = max(
+                (best[h] for h in hashes if h in best), key=self._koreader_status_sort_key, default=None,
+            )
+            if book_best is not None:
+                for h in hashes:
+                    best.setdefault(h, book_best)
+
+        winners = sorted(
+            ((md5, row) for md5, row in best.items() if not md5s or md5 in md5s),
+            key=lambda item: item[0],
+        )[:limit]
         return [
             {
-                "md5": row.md5,
+                "md5": md5,
                 "status": row.status,
                 "modified": row.modified or "",
                 "source_device_key": row.device_key,
             }
-            for row in winners
+            for md5, row in winners
         ]
+
+    @staticmethod
+    def _linked_hashes_by_book(session, md5s: set[str]) -> dict[str, set[str]]:
+        """``{abs_id: every hash linked to it}`` for the books any of ``md5s`` belongs to."""
+        if not md5s:
+            return {}
+        abs_ids = {
+            abs_id for (abs_id,) in session.query(KosyncDocument.linked_abs_id).filter(
+                KosyncDocument.document_hash.in_(md5s), KosyncDocument.linked_abs_id.isnot(None),
+            )
+        } | {
+            abs_id for (abs_id,) in session.query(Book.abs_id).filter(Book.kosync_doc_id.in_(md5s))
+        }
+        if not abs_ids:
+            return {}
+        hashes_by_book: dict[str, set[str]] = defaultdict(set)
+        for doc_hash, abs_id in session.query(KosyncDocument.document_hash, KosyncDocument.linked_abs_id).filter(
+            KosyncDocument.linked_abs_id.in_(abs_ids)
+        ):
+            hashes_by_book[abs_id].add(doc_hash)
+        for kosync_doc_id, abs_id in session.query(Book.kosync_doc_id, Book.abs_id).filter(
+            Book.abs_id.in_(abs_ids), Book.kosync_doc_id.isnot(None)
+        ):
+            hashes_by_book[abs_id].add(kosync_doc_id)
+        return dict(hashes_by_book)
 
     # ------------------------------------------------------------------
     # KOReader annotation hub (highlights/notes sync between devices + web)
@@ -5272,15 +5448,13 @@ class DatabaseService:
             dates = self._get_koreader_activity_dates(session, md5s, tz_name)
             return [day.isoformat() for day in sorted(dates)]
 
-    def get_koreader_heatmap(self, year: int, tz_name: str) -> list[dict]:
-        """Get KOReader daily totals for one calendar year."""
+    def get_koreader_heatmap(self, start_date: date, end_date: date, tz_name: str) -> list[dict]:
+        """Get KOReader daily totals for each date from start_date through end_date."""
         with self.get_session() as session:
             md5s = self._get_all_koreader_active_md5s(session)
             if not md5s:
                 return []
 
-            start_date = datetime(year, 1, 1).date()
-            end_date = datetime(year, 12, 31).date()
             return self._build_koreader_daily_totals(
                 session,
                 md5s,
@@ -5836,7 +6010,8 @@ class DatabaseService:
                 finished_books.append({
                     "bookKey": book_key, "absId": ctx["absId"],
                     "title": ctx["title"], "author": ctx["author"],
-                    "finishedAt": int(last_end), "month": finished_dt.month,
+                    "finishedAt": int(last_end),
+                    "finishedDate": finished_dt.date().isoformat(), "month": finished_dt.month,
                 })
                 months[finished_dt.month - 1]["finished"] += 1
             finished_books.sort(key=lambda item: item["finishedAt"], reverse=True)
@@ -5877,6 +6052,15 @@ class DatabaseService:
                 ReadingSession.start_progress == start_progress,
                 ReadingSession.end_progress == end_progress,
                 ReadingSession.leader_client == leader_client,
+                ReadingSession.user_id == uid,
+            ).first() is not None
+
+    def has_reading_history(self, abs_id: str, user_id: int = None) -> bool:
+        """Whether the (ambient) user has any recorded session for abs_id."""
+        uid = self._resolve_uid(user_id)
+        with self.get_session() as session:
+            return session.query(ReadingSession.id).filter(
+                ReadingSession.abs_id == abs_id,
                 ReadingSession.user_id == uid,
             ).first() is not None
 
@@ -6112,6 +6296,11 @@ class DatabaseService:
                 book_title = db_session.query(
                     func.coalesce(func.nullif(Book.abs_title, ''), func.nullif(Book.audio_title, ''))
                 ).filter(Book.abs_id == abs_id).scalar()
+                if not book_title:
+                    # A removed book keeps the name its earlier sessions recorded.
+                    book_title = db_session.query(ReadingSession.book_title).filter(
+                        ReadingSession.abs_id == abs_id, func.nullif(ReadingSession.book_title, '').isnot(None),
+                    ).order_by(ReadingSession.end_time.desc()).limit(1).scalar()
             session = ReadingSession(
                 abs_id=abs_id,
                 session_type=session_type,
@@ -6146,6 +6335,8 @@ class DatabaseService:
                 func.count(ReadingSession.id).label('session_count'),
                 func.coalesce(func.sum(ReadingSession.duration_seconds), 0).label('total_duration'),
                 func.max(ReadingSession.end_time).label('last_session_time'),
+                # See get_all_reading_stats for why bare leader column matches max(end_time) row
+                ReadingSession.leader_client.label('last_leader'),
                 ReadingSession.book_title.label('book_title'),
             ).filter(ReadingSession.abs_id == abs_id)
             uid = self._resolve_uid(user_id)
@@ -6162,6 +6353,7 @@ class DatabaseService:
                 'session_count': int(row.session_count),
                 'avg_session_seconds': int(row.total_duration) // int(row.session_count),
                 'last_session_time': row.last_session_time,
+                'last_leader': row.last_leader,
                 'book_title': row.book_title,
             }
 
@@ -6176,6 +6368,10 @@ class DatabaseService:
                     (ReadingSession.session_type == 'AUDIOBOOK', ReadingSession.duration_seconds),
                     else_=0
                 )), 0).label('listen_seconds'),
+                func.coalesce(func.sum(case(
+                    (ReadingSession.session_type == 'AUDIOBOOK', 1),
+                    else_=0
+                )), 0).label('listen_session_count'),
                 func.coalesce(func.sum(case(
                     (ReadingSession.session_type != 'AUDIOBOOK', ReadingSession.duration_seconds),
                     else_=0
@@ -6203,6 +6399,7 @@ class DatabaseService:
                     continue
                 result[row.abs_id] = {
                     'listen_seconds': int(row.listen_seconds),
+                    'listen_session_count': int(row.listen_session_count),
                     'read_seconds': int(row.read_seconds),
                     'session_count': int(row.session_count),
                     'avg_session_seconds': int(row.total_duration) // int(row.session_count),
@@ -6223,6 +6420,32 @@ class DatabaseService:
         for start_time, duration in rows:
             days[self._local_date_from_epoch(start_time, tz_name)] += int(max(duration or 0, 0))
         return dict(days)
+
+    def get_listening_finished_books(self, tz_name: str) -> list[dict]:
+        """Audiobooks the ambient user's own sessions reached the end of, newest first,
+        each at its first finish, in the stats-page finished-book shape."""
+        from sqlalchemy import func
+        uid = self._resolve_uid(None)
+        tz = ZoneInfo(tz_name)
+        with self.get_session() as session:
+            rows = session.query(
+                ReadingSession.abs_id, func.min(ReadingSession.end_time),
+                func.max(Book.abs_title), func.max(Book.audio_title), func.max(ReadingSession.book_title),
+            ).outerjoin(Book, Book.abs_id == ReadingSession.abs_id).filter(
+                ReadingSession.session_type == 'AUDIOBOOK', ReadingSession.user_id == uid,
+                ReadingSession.end_progress >= _LISTENING_FINISHED_PROGRESS,
+            ).group_by(ReadingSession.abs_id).all()
+        books = []
+        for abs_id, finished_at, abs_title, audio_title, book_title in rows:
+            finished_dt = datetime.fromtimestamp(float(finished_at), tz)
+            books.append({
+                "bookKey": f"abs:{abs_id}", "absId": abs_id,
+                "title": abs_title or audio_title or book_title or "Unknown book", "author": None,
+                "finishedAt": int(finished_at),
+                "finishedDate": finished_dt.date().isoformat(), "month": finished_dt.month,
+            })
+        books.sort(key=lambda book: book["finishedAt"], reverse=True)
+        return books
 
     def get_recent_listening_sessions(self, limit: int = 10) -> list[dict]:
         """Newest-first AUDIOBOOK sessions of the ambient user, in the stats-page session shape."""
@@ -6245,6 +6468,34 @@ class DatabaseService:
                 "endedAt": int(rs.end_time),
                 "coverPath": None,
             } for rs, abs_title, audio_title in rows]
+
+    def get_book_listening_detail(self, abs_id: str, session_limit: int = 40) -> Optional[dict]:
+        """One book's AUDIOBOOK totals and newest-first sessions for the ambient user."""
+        uid = self._resolve_uid(None)
+        with self.get_session() as session:
+            rows = session.query(ReadingSession).filter(
+                ReadingSession.abs_id == abs_id,
+                ReadingSession.session_type == 'AUDIOBOOK', ReadingSession.user_id == uid,
+            ).order_by(ReadingSession.end_time.desc()).all()
+            if not rows:
+                return None
+            total_seconds = sum(int(rs.duration_seconds or 0) for rs in rows)
+            latest_progress = next((rs.end_progress for rs in rows if rs.end_progress is not None), None)
+            return {
+                "totalSeconds": total_seconds,
+                "sessionCount": len(rows),
+                "avgSessionSeconds": total_seconds // len(rows),
+                "progressPercent": round(min(latest_progress, 1.0) * 100, 1) if latest_progress is not None else None,
+                "lastReadAt": int(rows[0].end_time),
+                "bookTitle": rows[0].book_title,
+                "sessions": [{
+                    "startTime": int(rs.start_time),
+                    "endTime": int(rs.end_time),
+                    "durationSeconds": int(rs.duration_seconds or 0),
+                    "startProgress": rs.start_progress,
+                    "endProgress": rs.end_progress,
+                } for rs in rows[:session_limit]],
+            }
 
     def delete_recent_estimated_kosync_session(
         self,

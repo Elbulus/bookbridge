@@ -210,7 +210,9 @@ from src.utils.ebook_dom_map import (
 )
 from src.services.epub3_upgrade import _find_opf_path, upgrade_epub2_to_epub3
 from src.services.readalong_segments import SentenceClip, build_sentence_clips
+from src.utils.audio_duration import probe_duration_seconds as _probe_duration_seconds
 from src.utils.forced_aligner import container_timeline_filter
+from src.utils.smil_extractor import AUDIO_DURATIONS_ENTRY
 
 if TYPE_CHECKING:
     from src.services.alignment_service import AlignmentService
@@ -973,28 +975,6 @@ def _transcode_audio_for_embed(
             len(audio_paths), bitrate, e, exc_info=True,
         )
         return False
-
-
-def _probe_duration_seconds(path: Union[str, Path]) -> Optional[float]:
-    """The real duration, in seconds, of an audio file via ``ffprobe``.
-
-    Mirrors ``Transcriber.get_audio_duration``'s own ffprobe invocation
-    rather than importing it: that class's module pulls in the
-    transcription stack's heavier dependencies for what is, here, a single
-    stdlib subprocess call. Returns ``None`` -- never raises -- on any
-    failure, so the caller can degrade to leaving the book's final clip
-    un-extended instead of crashing the whole build.
-    """
-    cmd = [
-        "ffprobe", "-v", "error", "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1", str(path),
-    ]
-    try:
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
-        return float(result.stdout.strip())
-    except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as e:
-        logger.warning("Could not probe audio duration for '%s': %s", path, e, exc_info=True)
-        return None
 
 
 def _format_smil_clock(seconds: float) -> str:
@@ -2654,6 +2634,14 @@ def _build_readalong_epub_impl(
 
         modified_files: Dict[str, bytes] = {}
         new_bytes_files: Dict[str, bytes] = {}
+        # Each file's clip times start at 0s; an import places them by these lengths.
+        # The files partition the audiobook, so the lengths sum to each file's exact start.
+        if not single_audio_file:
+            audio_durations = {
+                archive_path: round(end - start, 3)
+                for archive_path, (start, end) in zip(audio_archive_paths, boundaries)
+            }
+            new_bytes_files[AUDIO_DURATIONS_ENTRY] = json.dumps(audio_durations, sort_keys=True).encode()
         overlays: List[SpineOverlayResult] = []
         zero_length_clips = 0
 
