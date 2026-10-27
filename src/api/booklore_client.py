@@ -2577,7 +2577,7 @@ class BookloreClient:
         book-wide percentage, which it measures on a different scale (the
         chapters' raw HTML sizes) and does not clamp. Observed live: a position
         34% into a chapter became "119%" and the Kobo was put on that chapter's
-        last span, five pages on. It is the same fraction 0003 reads back from
+        last span, five pages on. It is the same fraction the sync client reads back from
         contentSourceProgressPercent, so the round trip lands where it was written.
         """
         value = getattr(rich_locator, 'chapter_progress', None) if rich_locator else None

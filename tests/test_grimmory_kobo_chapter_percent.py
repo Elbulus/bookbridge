@@ -95,9 +95,22 @@ class TestNothingIsSentWithoutAChapter:
 
 class TestTheRoundTrip:
     def test_what_is_written_reads_back_as_the_same_position(self):
-        """0003 reads contentSourceProgressPercent back as the chapter fraction."""
+        """After a Kobo sync Grimmory reports the chapter href and this percentage
+        with no CFI; the sync client (upstream #537) reads it back as the same
+        chapter fraction."""
+        from src.db.models import Book
         from src.sync_clients.booklore_sync_client import BookloreSyncClient
         locator = LocatorResult(percentage=0.1803, cfi=CFI, href=HREF, chapter_progress=0.3413)
         sent = _written(_client(), locator)["contentSourceProgressPercent"]
-        read_back = BookloreSyncClient._chapter_progress_from_rich({"content_source_pct": sent})
-        assert read_back == pytest.approx(0.3413)
+
+        api = MagicMock(spec=BookloreClient)
+        api.is_configured = MagicMock(return_value=True)
+        api.get_progress_rich_by_book_id = MagicMock(return_value={
+            "pct": 0.1803, "percentage_present": True, "cfi": None, "href": HREF,
+            "book_type": "EPUB", "content_source_pct": sent,
+        })
+        book = Book(abs_id="c217ac83", abs_title="House of Earth and Blood",
+                    ebook_filename="heab.epub", original_ebook_filename="heab.epub",
+                    ebook_source="Grimmory", ebook_source_id="888", status="active")
+        state = BookloreSyncClient(api, MagicMock()).get_service_state(book, None)
+        assert state.current["chapter_progress"] == pytest.approx(0.3413)
