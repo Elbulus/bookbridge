@@ -225,16 +225,54 @@ class TestGrimmoryReadingWatch(unittest.TestCase):
         self.assertEqual(kwargs["booklore_ebook_id"], "5")
         client.move_between_shelves.assert_not_called()
 
-    def test_an_audiobook_match_is_only_ever_a_suggestion(self):
+    def test_a_unique_match_at_the_threshold_is_linked(self):
+        """7.12: a unique match at the "Up Next" shelf threshold (95) is linked
+        straight away; the book is being read, so no shelf moves."""
         svc, client, db, bms, _ss = _grimmory_service(
             suggestions_result={"matches": [_make_audio_match(score=100.0)]},
         )
         with patch.dict(os.environ, READING_WATCH_ON, clear=False):
             stats = svc._process_reading_watch(user_id=None)
+        self.assertEqual(stats["auto_matched"], 1)
+        kwargs = bms.create_audio_mapping_from_match.call_args.kwargs
+        self.assertEqual(kwargs["ebook_source"], "BookLore")
+        self.assertEqual(kwargs["ebook_source_id"], "5")
+        client.move_between_shelves.assert_not_called()
+        db.save_pending_suggestion.assert_not_called()
+
+    def test_a_weaker_match_is_a_suggestion(self):
+        svc, _client, db, bms, _ss = _grimmory_service(
+            suggestions_result={"matches": [_make_audio_match(score=80.0)]},
+        )
+        with patch.dict(os.environ, READING_WATCH_ON, clear=False):
+            stats = svc._process_reading_watch(user_id=None)
         self.assertEqual(stats["suggested"], 1)
         bms.create_audio_mapping_from_match.assert_not_called()
-        saved = db.save_pending_suggestion.call_args.args[0]
-        self.assertEqual(saved.origin, "reading_watch")
+        self.assertEqual(db.save_pending_suggestion.call_args.args[0].origin, "reading_watch")
+
+    def test_with_the_threshold_at_100_only_a_perfect_match_is_linked(self):
+        """Threshold raised to 100 to keep near-misses in Suggestions."""
+        for score, outcome in ((98.0, "suggested"), (100.0, "auto_matched")):
+            with self.subTest(score=score):
+                svc, _client, _db, _bms, _ss = _grimmory_service(
+                    suggestions_result={"matches": [_make_audio_match(score=score)]},
+                )
+                with patch.dict(os.environ, {**READING_WATCH_ON,
+                                             "BOOKLORE_SHELF_WATCH_THRESHOLD": "100"}, clear=False):
+                    stats = svc._process_reading_watch(user_id=None)
+                self.assertEqual(stats[outcome], 1)
+
+    def test_a_tie_is_always_a_suggestion(self):
+        svc, _client, db, bms, _ss = _grimmory_service(
+            suggestions_result={"matches": [
+                _make_audio_match(score=100.0, audio_source_id="abs-1"),
+                _make_audio_match(score=100.0, audio_source_id="abs-2"),
+            ]},
+        )
+        with patch.dict(os.environ, READING_WATCH_ON, clear=False):
+            stats = svc._process_reading_watch(user_id=None)
+        self.assertEqual(stats["suggested"], 1)
+        bms.create_audio_mapping_from_match.assert_not_called()
 
     def test_a_book_already_mapped_is_left_alone(self):
         svc, _client, _db, bms, ss = _grimmory_service(suggestions_result=None, already_mapped=True)
