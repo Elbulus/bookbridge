@@ -119,7 +119,7 @@
         </section>{% endfor %}
     </div>
     {% else %}<section class="empty-state"><div class="empty-state-icon">◇</div><h2>{{ _('No books syncing yet') }}</h2><p>{{ _('Start by adding your first audiobook mapping') }}</p><a class="btn" href="{{ url_for('suggestions', tab='search') }}">{{ _('Discover books') }}</a></section>{% endif %}
-    <footer class="library-footer"><span>{{ _('Build %(version)s', version=app_version) }}</span>{% if update_available %}<a href="https://github.com/cporcellijr/bookbridge/releases/latest" target="_blank" rel="noopener noreferrer">{{ _('v%(version)s Available', version=latest_version) }}</a>{% endif %}</footer>
+    <footer class="library-footer"><span>{{ _('Build %(version)s', version=app_version) }}{% if app_build_label %} &middot; {{ app_build_label }}{% endif %}</span>{% if update_available %}<a href="https://github.com/cporcellijr/bookbridge/releases/latest" target="_blank" rel="noopener noreferrer">{{ _('v%(version)s Available', version=latest_version) }}</a>{% endif %}</footer>
 </div>
 {% endblock %}
 {% block scripts %}{% include 'next/_book_scripts.html' %}{% include 'next/_library_scripts.html' %}<script src="/static/js/next/masonry.js" defer></script>{% endblock %}
